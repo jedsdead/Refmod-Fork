@@ -38,6 +38,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, storage
 from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches,
+                      set_pending_extract,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
                       is_minimax_h3_ref2va)
 
@@ -382,7 +383,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0"
+        self.version = "0.30.2"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -493,6 +494,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "button -- no separate submission needed.")
             mod_rows = self._build_mod_picker_rows()
             status = gr.Markdown("*No RefMods selected.*")
+            clear_btn = gr.Button("Clear armed RefMods", size="sm")
 
         widgets = [c for row in mod_rows for c in row]
 
@@ -504,15 +506,39 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 if mdd and mdd != NONE_CHOICE and strength > 0:
                     rows.append({"mod": mdd, "strength": float(strength)})
             payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}
+            try:
+                from . import patches as _h3p
+                if rows:
+                    _h3p.set_armed_selection(json.dumps(payload))
+                    print(f"[H3RefMod] inline panel: {len(rows)} RefMod(s) armed")
+            except Exception:
+                pass
             if not isinstance(state, dict):
                 return state, "⚠️ Could not access session state -- try reloading the page."
             if rows:
                 state[STASH_KEY] = json.dumps(payload)
                 msg = f"✅ {len(rows)} RefMod(s) armed for the next MiniMax H3 Ref2VA generation from this page."
             else:
-                state.pop(STASH_KEY, None)
-                msg = "*No RefMods selected.*"
+                # Do NOT drop the selection here: Wan2GP's own form refreshes
+                # fire these pickers with empty values, and treating that as a
+                # deselection is what made RefMods stop after window 1. Use the
+                # Clear button for a real deselection.
+                msg = ("*No RefMods picked right now. Any previously armed selection stays "
+                       "active -- press 'Clear armed RefMods' to drop it.*")
             return state, msg
+
+        def clear_selection(state):
+            try:
+                from . import patches as _h3p
+                _h3p.set_armed_selection(None, force=True)
+            except Exception:
+                pass
+            if isinstance(state, dict):
+                state.pop(STASH_KEY, None)
+            print("[H3RefMod] inline panel: armed RefMods cleared")
+            return state, "*No RefMods armed.*"
+
+        clear_btn.click(fn=clear_selection, inputs=[self.state], outputs=[self.state, status], queue=False)
 
         for w in widgets:
             w.change(fn=apply_selection, inputs=[self.state] + widgets, outputs=[self.state, status], queue=False)
@@ -568,27 +594,24 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             refresh_btn = gr.Button("🔄 Refresh mod list", size="sm", scale=1)
         counter = gr.Markdown(_format_ref_counter([]))
         mod_rows = []
-        gr.Markdown(f"**Image RefMods** (up to {IMAGE_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
-        for i in range(IMAGE_ROWS):
-            with gr.Row():
-                mdd = gr.Dropdown(choices=_mod_choices("image"), value=NONE_CHOICE,
-                                  label=f"Image Mod {i + 1}", scale=3)
-                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
-                mod_rows.append((mdd, strength))
-        gr.Markdown(f"**Video RefMods** (up to {VIDEO_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
-        for i in range(VIDEO_ROWS):
-            with gr.Row():
-                mdd = gr.Dropdown(choices=_mod_choices("video"), value=NONE_CHOICE,
-                                  label=f"Video Mod {i + 1}", scale=3)
-                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
-                mod_rows.append((mdd, strength))
-        gr.Markdown(f"**Audio RefMods** (up to {AUDIO_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
-        for i in range(AUDIO_ROWS):
-            with gr.Row():
-                mdd = gr.Dropdown(choices=_mod_choices("audio"), value=NONE_CHOICE,
-                                  label=f"Audio Mod {i + 1}", scale=3)
-                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
-                mod_rows.append((mdd, strength))
+        # One collapsible group per kind: with IMAGE_ROWS + VIDEO_ROWS +
+        # AUDIO_ROWS rows the flat list was a long scroll, especially in the
+        # inline panel on the generation page. Image is open by default so the
+        # panel isn't empty on arrival; the row order returned is unchanged
+        # (image, then video, then audio) because callers depend on it.
+        for kind, label, count, open_by_default in (
+                ("image", "Image RefMods", IMAGE_ROWS, True),
+                ("video", "Video RefMods", VIDEO_ROWS, False),
+                ("audio", "Audio RefMods", AUDIO_ROWS, False)):
+            with gr.Accordion(f"{label} (up to {count})", open=open_by_default):
+                gr.Markdown(f"Leave a row on `{NONE_CHOICE}` to skip it.")
+                for i in range(count):
+                    with gr.Row():
+                        mdd = gr.Dropdown(choices=_mod_choices(kind), value=NONE_CHOICE,
+                                          label=f"{kind.capitalize()} Mod {i + 1}", scale=3)
+                        strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01,
+                                             label="Strength", scale=2)
+                        mod_rows.append((mdd, strength))
 
         picker_outputs = [folder_dd] + [r[0] for r in mod_rows]
         # The current selections are passed in as well so switching folders
@@ -751,12 +774,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 def on_progress(self, update):
                     pass
 
+            spec_json = json.dumps(spec)
+            # Wan2GP strips unknown custom settings on the way to the queue in
+            # some setups, and an extract task that loses its payload renders a
+            # video instead. patched_generate picks this up only if the payload
+            # is missing, consumes it once, and expires it.
+            set_pending_extract(spec_json)
             try:
                 self._submit(api_session, model_type,
-                            {"video_length": 107, "custom_settings": {SETTING_EXTRACT: json.dumps(spec)}},
+                            {"video_length": 107, "custom_settings": {SETTING_EXTRACT: spec_json}},
                             ExtractCallbacks())
             except Exception as e:
+                set_pending_extract(None)
                 return f"Extraction task failed to run: {e!r}"
+            finally:
+                set_pending_extract(None)
             tail = "\n".join(log["lines"][-6:])
             ok = ("Done -- check the Library tab (Refresh) to see the saved mod." if any(
                     "saved" in l.lower() for l in log["lines"]) else
@@ -792,9 +824,14 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             headers=["name", "kind", "mode", "tokens", "size (MB)", "concept type", "description"],
             value=_library_rows(), interactive=False, wrap=True)
         with gr.Row():
-            delete_name = gr.Textbox(label="Mod name to delete (include its folder, e.g. characters/tanya)",
-                                     scale=2)
-            delete_btn = gr.Button("Delete", variant="stop")
+            delete_dd = gr.Dropdown(label="Mods to delete", choices=_library_mod_names(),
+                                    value=[], multiselect=True, scale=2,
+                                    info="Pick one or more from the list above. Follows the "
+                                         "Folder picker; deletion is permanent.")
+            delete_btn = gr.Button("Delete selected", variant="stop")
+        delete_confirm = gr.Checkbox(False, label="Yes, delete permanently",
+                                     info="Required, since deletion can't be undone. Resets "
+                                          "after each delete.")
         delete_status = gr.Textbox(label="", interactive=False, show_label=False)
         gr.Markdown(
             "Mods extracted purely from several still images (no video source) used to be "
@@ -837,31 +874,51 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         def do_refresh(folder, current):
             return (_library_rows(folder),
                     gr.update(choices=_folder_choices(), value=folder),
-                    gr.update(choices=_names_keeping(folder, current), value=current or None))
+                    gr.update(choices=_names_keeping(folder, current), value=current or None),
+                    gr.update(choices=_library_mod_names(folder), value=[]))
 
         refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
-                          outputs=[table, library_folder_dd, edit_name_dd], queue=False)
+                          outputs=[table, library_folder_dd, edit_name_dd, delete_dd], queue=False)
         library_folder_dd.change(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
-                                 outputs=[table, library_folder_dd, edit_name_dd], queue=False)
+                                 outputs=[table, library_folder_dd, edit_name_dd, delete_dd],
+                                 queue=False)
 
-        def do_delete(name, folder):
-            if not name:
-                return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), "Enter a mod name first."
-            ok = storage.delete_refmod(name)
-            return (_library_rows(folder), gr.update(choices=_library_mod_names(folder)),
-                   (f"Deleted '{name}'." if ok else f"No mod named '{name}' found."))
+        def do_delete(names, folder, confirmed):
+            names = [n for n in (names if isinstance(names, list) else [names]) if n]
+            if not names:
+                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
+                        "Pick at least one mod to delete.")
+            if not confirmed:
+                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
+                        f"Tick 'Yes, delete permanently' to delete {len(names)} mod(s).")
+            deleted = [n for n in names if storage.delete_refmod(n)]
+            missing = [n for n in names if n not in deleted]
+            remaining = _library_mod_names(folder)
+            parts = []
+            if deleted:
+                parts.append(f"Deleted {len(deleted)}: " + ", ".join(f"'{n}'" for n in deleted) + ".")
+            if missing:
+                parts.append("Not found: " + ", ".join(f"'{n}'" for n in missing) + ".")
+            return (_library_rows(folder),
+                    gr.update(choices=remaining, value=[]),          # delete picker
+                    gr.update(choices=remaining),                    # edit picker
+                    gr.update(value=False),                          # re-arm the confirmation
+                    " ".join(parts))
 
-        delete_btn.click(fn=do_delete, inputs=[delete_name, library_folder_dd],
-                         outputs=[table, edit_name_dd, delete_status], queue=False)
+        delete_btn.click(fn=do_delete, inputs=[delete_dd, library_folder_dd, delete_confirm],
+                         outputs=[table, delete_dd, edit_name_dd, delete_confirm, delete_status],
+                         queue=False)
 
         def do_fix(folder):
             fixed, checked = storage.reclassify_all_mods()
             msg = (f"Checked {checked} mod(s), fixed {fixed}." if fixed else
                   f"Checked {checked} mod(s), all already correctly classified.")
-            return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), msg
+            names = _library_mod_names(folder)
+            return (_library_rows(folder), gr.update(choices=names),
+                    gr.update(choices=names, value=[]), msg)
 
         fix_btn.click(fn=do_fix, inputs=[library_folder_dd],
-                      outputs=[table, edit_name_dd, fix_status], queue=False)
+                      outputs=[table, edit_name_dd, delete_dd, fix_status], queue=False)
 
         def do_load_for_edit(name):
             if not name:
@@ -879,20 +936,24 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         def do_save_edit(old_name, new_name, new_description, folder):
             if not old_name:
-                return _library_rows(folder), gr.update(), gr.update(), "Pick a mod first (use Load)."
+                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
+                        "Pick a mod first (use Load).")
             try:
                 final_name = storage.rename_and_update_mod(old_name, new_name=new_name,
                                                             new_description=new_description)
             except Exception as e:
-                return _library_rows(folder), gr.update(), gr.update(), f"Could not save: {e!r}"
+                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
+                        f"Could not save: {e!r}")
             msg = f"Saved as '{final_name}'." if final_name != old_name else "Saved."
             names = _library_mod_names(folder)
             return (_library_rows(folder), gr.update(choices=_folder_choices()),
-                    gr.update(choices=names, value=final_name if final_name in names else None), msg)
+                    gr.update(choices=names, value=final_name if final_name in names else None),
+                    gr.update(choices=names, value=[]), msg)
 
         edit_save_btn.click(fn=do_save_edit,
                             inputs=[edit_name_dd, edit_name_field, edit_description_field, library_folder_dd],
-                            outputs=[table, library_folder_dd, edit_name_dd, edit_status], queue=False)
+                            outputs=[table, library_folder_dd, edit_name_dd, delete_dd, edit_status],
+                            queue=False)
 
         gr.Markdown(
             "**Build prompt hint.** The `keyword - description` field you set at extraction is "

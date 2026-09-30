@@ -55,9 +55,12 @@ import functools
 import json
 import os
 import random
+import time
 import traceback
 from typing import Optional
 
+import collections
+import math
 import torch
 
 from . import core, storage
@@ -112,11 +115,13 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent", "hide_ref")
+    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key")
 
-    def __init__(self, latent: torch.Tensor):
+    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None):
         self.latent = latent
         self.hide_ref = False
+        self.preview_latent = latent if preview_latent is None else preview_latent
+        self.preview_key = preview_key
 
 
 class _RefModVideoSentinel:
@@ -134,11 +139,14 @@ class _RefModVideoSentinel:
     [C, T, H, W] shape derived from the latent's own dims (undoing the video
     VAE's causal 4:1 temporal compression and 16x spatial downsampling), not
     real pixel data (there is none for a RefMod)."""
-    __slots__ = ("latent", "hide_ref")
+    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "rescale_to")
 
-    def __init__(self, latent: torch.Tensor):
+    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None):
         self.latent = latent
         self.hide_ref = False
+        self.rescale_to = None
+        self.preview_latent = latent if preview_latent is None else preview_latent
+        self.preview_key = preview_key
 
     @property
     def shape(self):
@@ -147,28 +155,6 @@ class _RefModVideoSentinel:
         h_px = self.latent.shape[3] * 16
         w_px = self.latent.shape[4] * 16
         return (3, t_px, h_px, w_px)
-
-    def __getitem__(self, key):
-        """Support the one slicing shape Wan2GP applies to reference videos:
-        ``video[:, :max_frames]``, used to share the 15s reference budget
-        between several reference videos (only when "-" is in
-        video_prompt_type). A RefMod carries a latent rather than pixels, so
-        the pixel-frame count is converted back to latent frames -- undoing
-        the video VAE's causal 4:1 temporal compression -- and a trimmed
-        sentinel is returned. Any other indexing is refused loudly rather
-        than silently returning something wrong."""
-        if (isinstance(key, tuple) and len(key) == 2 and key[0] == slice(None)
-                and isinstance(key[1], slice) and key[1].start in (None, 0) and key[1].step is None):
-            stop_px = key[1].stop
-            if stop_px is None:
-                return self
-            keep_t = max(1, (int(stop_px) - 1) // 4 + 1)
-            if keep_t >= self.latent.shape[2]:
-                return self
-            trimmed = _RefModVideoSentinel(self.latent[:, :, :keep_t])
-            trimmed.hide_ref = self.hide_ref
-            return trimmed
-        raise TypeError(f"_RefModVideoSentinel supports only [:, :n] slicing, got {key!r}")
 
 
 class _RefModAudioSentinel:
@@ -200,13 +186,435 @@ def _log(msg: str) -> None:
     print(f"[H3RefMod] {msg}")
 
 
-# Which reference kwargs this Wan2GP build's generate() actually accepts.
-# Older builds expose two native reference-video slots (input_frames,
-# input_frames2) and two audio ones (audio_guide, audio_guide2); newer ones
-# add a third of each (input_frames3 / "*", audio_guide3 / "D"). Filled in by
-# install_patches() so injection uses whatever exists and falls back to
-# direct injection for the rest.
-_generate_params = set()
+# Wan2GP passes native image refs / reference videos to *every* sliding window
+# (src_ref_images is set once in window 1 and reused for the rest), so RefMods
+# must be injected in every window too.
+INJECT_ON_EVERY_WINDOW = True
+
+# In windows 2+ the frame carried over from the previous window is added to the
+# prompt as an image BEFORE any reference, so it takes <Picture 1> and pushes
+# every reference's label up by one -- a prompt written for window 1 then points
+# at the wrong picture. Set this to True to insert RefMod images ahead of that
+# carried-over frame instead, keeping their labels identical in every window.
+# Only applied when the generation has no live reference images of its own.
+STABLE_REFMOD_LABELS = False
+
+# Escape hatch, OFF by default: when True, generations that inject RefMods fall
+# back to normal attention instead of Sol-Attn (attention mode "sol").
+#
+# It is off because the evidence doesn't implicate RefMods. The reported crash
+# ("Triton Error [CUDA]: an illegal memory access was encountered") came from
+# reduce_quantize_k, which takes only K and V -- it never sees the sink range,
+# the reference list, or anything else a RefMod changes. Sink blocks go only to
+# the separate forward kernel, and are range-checked in Python first, so a bad
+# sink raises ValueError rather than corrupting memory. The fault also surfaced
+# inside Triton's _init_handles while loading a kernel, which is where an
+# *earlier* async fault gets reported, so the named kernel is probably a
+# bystander. Turning Sol-Attn off costs real speed for every step.
+#
+# The one honest RefMod connection is token count: references lengthen the
+# sequence, and Sol-Attn only engages at >= SOL_ATTN_MIN_TOKENS (8192), with a
+# different inline-Q path above 4096 tokens. So adding RefMods can *start*
+# using Sol-Attn, or switch which path runs, on a generation that stayed below
+# those thresholds before. That's worth knowing if the crash tracks with adding
+# mods, but it points at the kernels, not at what this plugin feeds them.
+DISABLE_SOL_WITH_REFMODS = False
+
+_REFMODS_ACTIVE = {"on": False, "logged": False}
+
+# Give RefMods a <Picture N> / <Video N> / <Audio N> entry in the prompt, the
+# same as a live reference gets, so the model has something binding the
+# reference to the prompt. This is the core fix for "RefMods have no effect",
+# but it is also the only change here that alters what the model sees on an
+# ordinary single-phase run. Set it to False to get the published plugin's
+# prompt behaviour back, for an A/B.
+PROMPT_LABELS_FOR_REFMODS = True
+
+# An extraction job waiting to be picked up, for when Wan2GP drops the
+# custom_settings payload that carries it. Without this the extract task falls
+# through to generate() as an ordinary render -- i.e. it produces a video
+# instead of a mod. Consume-once and time-limited, so a stale job can never
+# hijack a later render.
+_PENDING_EXTRACT = {"spec": None, "at": 0.0}
+_PENDING_EXTRACT_TTL_SECONDS = 600.0
+
+
+def set_pending_extract(spec_json):
+    _PENDING_EXTRACT["spec"] = spec_json or None
+    _PENDING_EXTRACT["at"] = time.time() if spec_json else 0.0
+
+
+def _take_pending_extract():
+    """Pop a pending extraction job if one is fresh enough to still be ours."""
+    spec = _PENDING_EXTRACT.get("spec")
+    if not spec:
+        return None
+    age = time.time() - float(_PENDING_EXTRACT.get("at") or 0.0)
+    set_pending_extract(None)
+    if age > _PENDING_EXTRACT_TTL_SECONDS:
+        _log(f"ignoring a pending extraction job that is {age:.0f}s old -- too late to be "
+             f"this task; nothing was extracted")
+        return None
+    return spec
+
+
+# The inline panel's current selection, kept at module level so generate() can
+# fall back to it when a task reaches the pipeline without its custom_settings
+# payload (Wan2GP's settings/validation round-trip dropped it).
+_ARMED = {"json": None}
+
+
+def set_armed_selection(state_json, force=False):
+    """Latching: a blank selection is ignored unless forced. Wan2GP rebuilds
+    and refreshes the generation form at various points (model switch, form
+    refresh, mid-generation updates), and that fires the panel's pickers with
+    empty values -- treating those as a deselection is what made RefMods stop
+    applying after the first sliding window. The panel's "Clear armed RefMods"
+    button passes force=True for a real deselection."""
+    if not state_json and not force:
+        return
+    _ARMED["json"] = state_json or None
+
+
+def _is_ref2va_pipeline(pipeline_self):
+    return bool(getattr(pipeline_self, "reference_mode", False)) and \
+        getattr(pipeline_self, "fixed_prompt", None) is None and \
+        not getattr(pipeline_self, "audio_only", False)
+
+
+_PREVIEW_CACHE = collections.OrderedDict()
+_PREVIEW_CACHE_MAX = 8
+# Caps on what is kept for the prompt encoder, per mod. Qwen3-VL resizes to its
+# own pixel budget anyway, so more than this is memory spent for nothing.
+_PREVIEW_MAX_PIXELS_IMAGE = 1 << 20   # ~1 MP for a single-frame mod
+_PREVIEW_MAX_PIXELS_VIDEO = 1 << 18   # ~0.26 MP per sampled video frame
+_PREVIEW_MAX_VIDEO_FRAMES = 8
+
+# Every sliding window is its own generate() call, so without these each window
+# re-read every mod off disk, re-ran the blur in weighted_latent(), and could
+# re-decode the prompt preview -- all of it identical work, and the decode also
+# made the offloader swap the VAE in and out again. Keyed by file mtime, so
+# re-extracting a mod under the same name still picks up the new file.
+# Two-phase generation renders phase 1 at a lower resolution, upscales the
+# latent, then runs phase 2 at the target resolution -- and it REBUILDS its
+# references for phase 2: every live image ref is re-prepared at the phase-2
+# size (_prepare_image_reference -> _encode_video) and every reference video is
+# re-resized to the target before being re-encoded. A RefMod is a stored latent,
+# so it alone stayed at its extraction resolution while keyframes and live refs
+# doubled, leaving it at the wrong spatial scale exactly when fine detail is
+# being added. With this True, RefMods are rebuilt for phase 2 the same way:
+# decode the stored latent, resize the pixels to the phase-2 reference size,
+# re-encode. Cached per mod per target size, so it costs one decode + one encode
+# per mod per session. Phase 1 is untouched -- its resolution is the token
+# budget you chose at extraction time.
+RESCALE_REFMODS_IN_PHASE_2 = False
+
+# (Kept as an opt-in experiment only -- see FIT_REFMODS_TO_PHASE_1_CANVAS
+# below, which is where the two-phase scale mismatch actually is.)
+#
+# Video mods are excluded by default. An image mod is one latent frame, so
+# rebuilding it costs a bounded amount. A video mod multiplies by every latent
+# frame: rebuilding a 68x38 mod to a 106x44 phase-2 size took it from ~10k to
+# ~19k reference tokens, on top of an already large phase-2 sequence -- and
+# attention cost grows with the square of the sequence, so phase 2 crawls. The
+# decode alone (every frame at full target resolution) is close to a gigabyte
+# of intermediates. A mod is supposed to have a fixed, small token cost; this
+# would throw that budget away. Turn it on only if you know the mod is short.
+RESCALE_REFMOD_VIDEOS_IN_PHASE_2 = False
+
+# Hard ceiling on a rebuild regardless of kind: if the phase-2 size would give
+# a mod more than this many times its stored token count, the rebuild is scaled
+# back to fit rather than skipped, so it still gains scale without the blowup.
+REFMOD_RESCALE_MAX_TOKEN_GROWTH = 2.0
+
+# The real two-phase mismatch is in phase 1, not phase 2. With two phases the
+# pipeline renders phase 1 at target / H3_TWO_PHASE_SCALE (half), and prepares
+# every live reference at that reduced size (pipeline.py: _add_image_reference
+# is called with the reduced width/height, and reference videos are resized to
+# it). A RefMod is a stored latent, so it alone stays at its extraction size --
+# oversized against a half-resolution canvas and against every live reference
+# next to it. Phase 2 then sees the mod at its stored scale, which is the same
+# configuration as a single-phase run at the target resolution, i.e. the case
+# that already works.
+#
+# So: shrink a mod to the phase-1 canvas when it is bigger than it, and never
+# grow one. Downscaling costs fewer reference tokens than the stored latent, so
+# phase 1 also gets slightly cheaper rather than more expensive.
+#
+# This applies ONLY when the run really has two phases (guide_phases > 1). A
+# single-phase run is also "phase 1" as far as the phase counter is concerned,
+# and mods must go in at their stored scale there -- that is the configuration
+# single-phase runs already work in.
+FIT_REFMODS_TO_PHASE_1_CANVAS = True
+
+_RESCALE_CACHE = collections.OrderedDict()
+_RESCALE_CACHE_MAX = 16
+
+_MOD_CACHE = collections.OrderedDict()
+_MOD_CACHE_MAX = 8
+_WEIGHTED_CACHE = collections.OrderedDict()
+_WEIGHTED_CACHE_MAX = 16
+
+
+def _cache_put(cache, key, value, limit):
+    cache[key] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
+    return value
+
+
+def _latent_stamp(latent):
+    """Fallback identity for a mod whose file mtime can't be read."""
+    try:
+        return (tuple(latent.shape), round(float(latent.float().sum()), 4))
+    except Exception:
+        return None
+
+
+def _load_refmod_cached(name):
+    try:
+        stamp = os.path.getmtime(storage.mod_path(name) + ".safetensors")
+    except Exception:
+        stamp = None
+    key = (name, stamp)
+    mod = _MOD_CACHE.get(key)
+    if mod is None:
+        mod = _cache_put(_MOD_CACHE, key, storage.load_refmod(name), _MOD_CACHE_MAX)
+    else:
+        _MOD_CACHE.move_to_end(key)
+    # A readable mtime makes the preview cache stable across windows; without
+    # one, fall back to the latent's own fingerprint rather than giving up on
+    # caching (which would re-decode the preview on every single window).
+    mod._h3_preview_key = key if stamp is not None else (name, _latent_stamp(mod.latent))
+    return mod
+
+
+def _weighted_latent_cached(mod, strength, curve):
+    key = (getattr(mod, "_h3_preview_key", None), round(float(strength), 6),
+           tuple(curve) if isinstance(curve, (list, tuple)) else curve)
+    if key[0] is not None and key in _WEIGHTED_CACHE:
+        _WEIGHTED_CACHE.move_to_end(key)
+        return _WEIGHTED_CACHE[key]
+    latent = mod.weighted_latent(strength, curve=curve)
+    if key[0] is not None and latent is not None:
+        _cache_put(_WEIGHTED_CACHE, key, latent, _WEIGHTED_CACHE_MAX)
+    # Clone on the way out: at strength 1.0 weighted_latent() returns the mod's
+    # own stored tensor, and the mod is itself cached for the session now, so a
+    # single in-place write anywhere downstream would quietly corrupt the mod
+    # for every later generation -- which would look exactly like a face slowly
+    # degrading run after run. Latents are a few MB; this is cheap insurance.
+    return None if latent is None else latent.clone()
+
+
+def _preview_key(mod, kind, index):
+    base = getattr(mod, "_h3_preview_key", None)
+    return None if base is None else tuple(base) + (kind, index)
+
+
+def _decode_preview(pipeline_self, sentinel, kind="image", fps=None):
+    """Prompt-side preview frames for a RefMod, ready for _qwen_frames, plus
+    their timestamps (video only). Cached per mod.
+
+    Only the handful of frames the prompt encoder actually consumes are kept,
+    downscaled first: caching the whole decoded video meant hundreds of MB of
+    float32 per video mod held for the session, which is what pushed phase 2
+    into swapping on later windows. The encoder resizes to its own pixel budget
+    anyway (_visual_patches), so the detail was never used."""
+    key = getattr(sentinel, "preview_key", None)
+    cache_key = None if key is None else (key, kind, round(float(fps or 0.0), 3))
+    if cache_key is not None and cache_key in _PREVIEW_CACHE:
+        _PREVIEW_CACHE.move_to_end(cache_key)
+        return _PREVIEW_CACHE[cache_key]
+    from models.minimax_h3 import pipeline as h3_pipeline
+    _log(f"decoding a RefMod preview for the prompt encoder (once per mod per session; "
+         f"key={'ok' if cache_key is not None else 'UNCACHEABLE -- this will repeat every window'})")
+    decoded = pipeline_self.vae.decode(
+        sentinel.preview_latent.to(device=pipeline_self.device, dtype=torch.float32))
+    video = decoded.float().clamp(-1.0, 1.0)[0].cpu()
+    decoded = None
+    if kind == "image":
+        frames, timestamps, budget = video[:, :1].clone(), None, _PREVIEW_MAX_PIXELS_IMAGE
+    else:
+        rate = float(fps or FPS_ASSUMED_FOR_DURATION_ESTIMATE)
+        indices, cursor = [], 0.0
+        while round(cursor) < video.shape[1]:
+            if not indices or round(cursor) > indices[-1]:
+                indices.append(round(cursor))
+            cursor += rate / 2
+        if len(indices) > _PREVIEW_MAX_VIDEO_FRAMES:  # thin out evenly, keep the ends
+            step = (len(indices) - 1) / (_PREVIEW_MAX_VIDEO_FRAMES - 1)
+            indices = [indices[round(i * step)] for i in range(_PREVIEW_MAX_VIDEO_FRAMES)]
+        frames = video[:, indices].clone()
+        timestamps = [i / rate for i in indices]
+        budget = _PREVIEW_MAX_PIXELS_VIDEO
+    video = None
+    height, width = int(frames.shape[-2]), int(frames.shape[-1])
+    if height * width > budget:
+        shrink = (budget / float(height * width)) ** 0.5
+        frames = h3_pipeline._resize_video(frames, max(32, int(height * shrink) // 2 * 2),
+                                           max(32, int(width * shrink) // 2 * 2))
+    result = (h3_pipeline._qwen_frames(frames.contiguous()), timestamps)
+    frames = None
+    if cache_key is not None:
+        _cache_put(_PREVIEW_CACHE, cache_key, result, _PREVIEW_CACHE_MAX)
+    return result
+
+
+_VAE_SPATIAL_FACTOR = 16  # pixels per latent cell, both axes
+
+
+def _would_shrink(sentinel, kind, pipeline_self, target_width, target_height, relative):
+    """Resolve the size a live reference would get here, and report it only if
+    it is SMALLER than the mod's stored latent (never upscale). Cheap: works
+    from shapes, so nothing is decoded unless a rebuild is actually happening."""
+    try:
+        lat_h, lat_w = int(sentinel.latent.shape[-2]), int(sentinel.latent.shape[-1])
+        if kind == "image":
+            from models.minimax_h3 import pipeline as h3_pipeline
+            stored_w, stored_h = lat_w * _VAE_SPATIAL_FACTOR, lat_h * _VAE_SPATIAL_FACTOR
+            ratio = stored_w / max(1, stored_h)
+            budget = int(target_width) * int(target_height) * float(relative or 100.0) / 100.0
+            new_h, new_w = h3_pipeline._resolve_canvas(
+                stored_w, stored_h, math.sqrt(budget / max(ratio, 1 / ratio)))
+        else:
+            new_h, new_w = int(target_height), int(target_width)
+        if (new_h // _VAE_SPATIAL_FACTOR) * (new_w // _VAE_SPATIAL_FACTOR) >= lat_h * lat_w:
+            return None, None  # same size or larger -- leave the stored latent alone
+        return int(new_w), int(new_h)
+    except Exception:
+        return None, None
+
+
+def _capped_rescale_size(sentinel, kind, target_width, target_height):
+    """Shrink the requested phase-2 size until the rebuilt mod costs at most
+    REFMOD_RESCALE_MAX_TOKEN_GROWTH times its stored token count. Returns
+    (None, None) if there is nothing worth rebuilding."""
+    try:
+        stored_h, stored_w = int(sentinel.latent.shape[-2]), int(sentinel.latent.shape[-1])
+        want_h = max(1, int(target_height) // _VAE_SPATIAL_FACTOR)
+        want_w = max(1, int(target_width) // _VAE_SPATIAL_FACTOR)
+        growth = (want_h * want_w) / float(max(1, stored_h * stored_w))
+        if growth <= 1.0:
+            return None, None  # already at or above the phase-2 scale
+        cap = float(REFMOD_RESCALE_MAX_TOKEN_GROWTH)
+        if cap > 0 and growth > cap:
+            shrink = (cap / growth) ** 0.5
+            target_height = max(_VAE_SPATIAL_FACTOR,
+                                int(round(int(target_height) * shrink / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
+            target_width = max(_VAE_SPATIAL_FACTOR,
+                               int(round(int(target_width) * shrink / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
+            _log(f"phase 2: capping the {kind}-kind RefMod rebuild at {cap:g}x its stored token "
+                 f"count -- {target_width}x{target_height} instead of the full phase-2 size "
+                 f"(see REFMOD_RESCALE_MAX_TOKEN_GROWTH)")
+        return int(target_width), int(target_height)
+    except Exception:
+        return None, None
+
+
+def _rescaled_refmod_latent(pipeline_self, sentinel, kind, target_width=None,
+                            target_height=None, relative=100.0, force=False):
+    """Rebuild a RefMod at a given reference size, the way the pipeline rebuilds
+    a live reference: decode the stored latent, resize the pixels, re-encode.
+    force=True is the phase-1 downscale-to-canvas path; without it this is the
+    opt-in phase-2 upscale. Returns None to keep the stored latent."""
+    if not target_width or not target_height:
+        return None
+    if not force:
+        # phase-2 upscale path (opt-in)
+        if not RESCALE_REFMODS_IN_PHASE_2:
+            return None
+        if kind != "image" and not RESCALE_REFMOD_VIDEOS_IN_PHASE_2:
+            return None
+        target_width, target_height = _capped_rescale_size(sentinel, kind, target_width, target_height)
+        if target_width is None:
+            return None
+    try:
+        base = getattr(sentinel, "preview_key", None)
+        # The stored latent already has strength/curve baked in, so decode that
+        # one (not the unweighted preview) and stamp the cache with it.
+        stamp = _latent_stamp(sentinel.latent)
+        key = None if (base is None or stamp is None) else \
+            (base, stamp, kind, int(target_width), int(target_height), round(float(relative or 100.0), 3))
+        if key is not None and key in _RESCALE_CACHE:
+            _RESCALE_CACHE.move_to_end(key)
+            return _RESCALE_CACHE[key]
+        from models.minimax_h3 import pipeline as h3_pipeline
+        decoded = pipeline_self.vae.decode(
+            sentinel.latent.to(device=pipeline_self.device, dtype=torch.float32))
+        video = decoded.float().clamp(-1.0, 1.0)[0].cpu()
+        decoded = None
+        if kind == "image":
+            # _prepare_image_reference -> _to_pil already takes a CTHW float
+            # tensor in [-1, 1] and does the byte conversion itself.
+            pixels = pipeline_self._prepare_image_reference(
+                video[:, :1].clone(), target_width, target_height, relative)
+        else:
+            pixels = h3_pipeline._resize_video(video.clone(), int(target_height), int(target_width))
+        if pixels is None:
+            return None
+        video = None
+        latent = pipeline_self._encode_video(pixels)
+        _log(f"phase {_gen_state(pipeline_self)['phase']}: rebuilt a {kind}-kind RefMod at "
+             f"{tuple(pixels.shape[-2:])} -> latent {tuple(latent.shape[-2:])} "
+             f"(was {tuple(sentinel.latent.shape[-2:])} in latent space)")
+        pixels = None
+        if key is not None:
+            _cache_put(_RESCALE_CACHE, key, latent, _RESCALE_CACHE_MAX)
+        return latent
+    except Exception:
+        _log("could not rebuild a RefMod at this size; using its stored latent as before:\n"
+             + traceback.format_exc())
+        return None
+
+
+def _log_label(pipeline_self, presentation, entry, label):
+    """Report which <Picture N> / <Video N> the prompt encoder will give this
+    RefMod, per window -- the numbering shifts between windows (see
+    STABLE_REFMOD_LABELS), so this is what to compare across windows."""
+    try:
+        seen = 0
+        for item in presentation:
+            if item.get("type") == entry["type"]:
+                seen += 1
+            if item is entry:
+                break
+        _log(f"window {int(getattr(pipeline_self, '_h3_window_no', 1) or 1)}: "
+             f"RefMod bound to <{label} {seen}>")
+    except Exception:
+        pass
+
+
+def _present_refmod(pipeline_self, presentation, kind, sentinel, fps=None):
+    """Give a RefMod the same text-side entry a live reference gets, so the
+    Qwen3-VL prompt contains '<Picture N>: [image]' / '<Video N>: ...' for it.
+    Without this the latent sits in the sequence with no label binding it to
+    the prompt, and the model largely ignores it."""
+    if presentation is None or not PROMPT_LABELS_FOR_REFMODS \
+            or getattr(pipeline_self, "fixed_prompt", None) is not None:
+        return
+    try:
+        frames, timestamps = _decode_preview(pipeline_self, sentinel, kind, fps)
+        if kind == "image":
+            entry = {"type": "image", "frames": frames}
+            window_no = int(getattr(pipeline_self, "_h3_window_no", 1) or 1)
+            live_refs = int(getattr(pipeline_self, "_h3_live_image_refs", 0) or 0)
+            at = None
+            if STABLE_REFMOD_LABELS and window_no > 1 and live_refs == 0:
+                # put it ahead of the carried-over frame added by the keyframes
+                at = next((i for i, item in enumerate(presentation)
+                           if item.get("type") == "image"), None)
+            if at is None:
+                presentation.append(entry)
+            else:
+                presentation.insert(at, entry)
+            _log_label(pipeline_self, presentation, entry, "Picture")
+            return
+        entry = {"type": "video", "frames": frames, "timestamps": timestamps}
+        presentation.append(entry)
+        _log_label(pipeline_self, presentation, entry, "Video")
+    except Exception:
+        _log(f"could not build the prompt-side preview for a {kind}-kind RefMod; it is still "
+             f"injected, but without a label the model may ignore it:\n" + traceback.format_exc())
 
 
 _STATE_ATTR = "_h3refmod_gen_state"
@@ -217,7 +625,7 @@ _STATE_ATTR = "_h3refmod_gen_state"
 # computed at runtime, an unbounded reference loop, and free-running
 # <Picture N> labels, and the ComfyUI community verified 15 image refs
 # working. RefMods are kept out of this check -- live references are not.
-_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 3, 3
+_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 2, 2
 
 
 def _reset_gen_state(pipeline_self) -> dict:
@@ -428,6 +836,15 @@ def _install_model_def_patch() -> None:
     @staticmethod
     def patched_validate_generative_settings(base_model_type, model_def, inputs):
         error = _orig_validate(base_model_type, model_def, inputs)
+        try:
+            if _ARMED["json"] and is_minimax_h3_ref2va(base_model_type):
+                cs = inputs.get("custom_settings")
+                attached = isinstance(cs, dict) and bool(cs.get(SETTING_GENERATE))
+                _log("task submission: RefMod selection " + ("attached to the task." if attached else
+                     "NOT in the task's custom_settings -- generate() will re-apply the inline "
+                     "panel's selection."))
+        except Exception:
+            pass
         # Wan2GP's own pre-flight check (called before pipeline.generate() ever
         # runs) only counts *native* image_refs/video_guide fields -- it has no
         # visibility into RefMods, which only turn into visual references much
@@ -439,6 +856,7 @@ def _install_model_def_patch() -> None:
         if error and _INSUFFICIENT_VISUAL_MARKER in error:
             custom_settings = inputs.get("custom_settings")
             state_json = custom_settings.get(SETTING_GENERATE) if isinstance(custom_settings, dict) else None
+            state_json = state_json or _ARMED["json"]
             if state_json:
                 refmod_visual_count = _count_refmod_visual_refs(state_json)
                 if refmod_visual_count > 0:
@@ -486,12 +904,6 @@ def install_patches() -> Optional[str]:
     _orig_add_audio_reference = getattr(Pipeline, "_add_audio_reference", None)
     _orig_load_audio_reference = getattr(Pipeline, "_load_audio_reference", None)
     _orig_generate = Pipeline.generate
-    try:
-        import inspect as _inspect
-        _generate_params.clear()
-        _generate_params.update(_inspect.signature(_orig_generate).parameters)
-    except Exception:
-        pass
     _orig_as_video = getattr(h3_pipeline, "_as_video", None)
 
     @functools.wraps(_orig_add_image_reference)
@@ -499,9 +911,33 @@ def install_patches() -> Optional[str]:
                                      image_refs_relative_size, presentation, visual_latents, refs):
         if isinstance(image, _RefModImageSentinel):
             latent = image.latent
+            if _gen_state(self)["phase"] == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS \
+                    and getattr(self, "_h3_two_phase", False):
+                fit_w, fit_h = _would_shrink(image, "image", self, target_width, target_height,
+                                             image_refs_relative_size)
+                if fit_w is not None:
+                    # relative=100 on purpose: _would_shrink already applied
+                    # image_refs_relative_size when resolving fit_w/fit_h, and
+                    # _prepare_image_reference would otherwise apply it a
+                    # second time and shrink the mod twice.
+                    rebuilt = _rescaled_refmod_latent(self, image, "image", target_width=fit_w,
+                                                      target_height=fit_h, relative=100.0,
+                                                      force=True)
+                    if rebuilt is not None:
+                        latent = rebuilt
+            if _gen_state(self)["phase"] == 2:
+                # NB: explicit "is not None" -- `rebuilt or latent` calls bool()
+                # on a tensor, which raises "Boolean value of Tensor with more
+                # than one value is ambiguous".
+                rebuilt = _rescaled_refmod_latent(self, image, "image", target_width=target_width,
+                                                  target_height=target_height,
+                                                  relative=image_refs_relative_size)
+                if rebuilt is not None:
+                    latent = rebuilt
             visual_latents.append(latent)
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+            _present_refmod(self, presentation, "image", image)
             return
         _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
@@ -511,10 +947,27 @@ def install_patches() -> Optional[str]:
     def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
         if isinstance(video, _RefModVideoSentinel):
             latent = video.latent
+            if _gen_state(self)["phase"] == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS \
+                    and getattr(self, "_h3_two_phase", False) \
+                    and getattr(video, "rescale_to", None):
+                height, width = video.rescale_to
+                fit_w, fit_h = _would_shrink(video, "video", self, width, height, None)
+                if fit_w is not None:
+                    rebuilt = _rescaled_refmod_latent(self, video, "video", target_width=fit_w,
+                                                      target_height=fit_h, force=True)
+                    if rebuilt is not None:
+                        latent = rebuilt
+            if _gen_state(self)["phase"] == 2 and getattr(video, "rescale_to", None):
+                height, width = video.rescale_to
+                rebuilt = _rescaled_refmod_latent(self, video, "video", target_width=width,
+                                                  target_height=height)
+                if rebuilt is not None:
+                    latent = rebuilt
             visual_latents.append(latent)
             _place_refmod_ref(self, video, refs,
                               {"kind": "video", "latent_t": latent.shape[2],
                                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
+            _present_refmod(self, presentation, "video", video, fps)
             return
         _note_refs(self, refs)
         return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs)
@@ -539,6 +992,8 @@ def install_patches() -> Optional[str]:
                 audio_latents.append(latent)
                 _place_refmod_ref(self, waveform, refs,
                                   {"kind": "audio", "ref_audio_t": latent.shape[-1]})
+                if PROMPT_LABELS_FOR_REFMODS:
+                    presentation.append({"type": "audio"})
                 return
             _note_refs(self, refs)
             return _orig_add_audio_reference(self, waveform, presentation, audio_latents, refs)
@@ -651,6 +1106,10 @@ def install_patches() -> Optional[str]:
             # latent goes into the packed sequence at its own saved
             # resolution, exactly as it did before this step existed.
             if isinstance(video, _RefModVideoSentinel):
+                # Remember the size that was asked for: in phase 2 this is the
+                # target resolution, and _add_video_reference uses it to rebuild
+                # the mod at that scale (see RESCALE_REFMODS_IN_PHASE_2).
+                video.rescale_to = (height, width)
                 return video
             return _orig_resize_video(video, height, width)
         h3_pipeline._resize_video = patched_resize_video
@@ -665,6 +1124,14 @@ def install_patches() -> Optional[str]:
         custom_settings = custom_settings if isinstance(custom_settings, dict) else {}
 
         extract_job = custom_settings.get(SETTING_EXTRACT)
+        if not extract_job:
+            extract_job = _take_pending_extract()
+            if extract_job:
+                _log("this task reached generate() without its extraction job (Wan2GP dropped the "
+                     "custom_settings payload); running the extraction that was just submitted. "
+                     "Without this it would render a video instead of extracting a mod.")
+        else:
+            set_pending_extract(None)   # arrived normally; don't leave a duplicate staged
         if extract_job:
             set_progress_status = kwargs.get("set_progress_status")
             try:
@@ -683,17 +1150,43 @@ def install_patches() -> Optional[str]:
         _reset_gen_state(self)
 
         state_json = custom_settings.get(SETTING_GENERATE)
+        _REFMODS_ACTIVE.update({"on": False, "logged": False})
+        first_window = int(kwargs.get("window_no") or 1) <= 1
+        setattr(self, "_h3_window_no", int(kwargs.get("window_no") or 1))
+        setattr(self, "_h3_live_image_refs", len(kwargs.get("input_ref_images") or []))
+        # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None.
+        # A single-phase run is *also* "phase 1", so the phase-1 canvas fit must
+        # check this and not just the phase counter -- otherwise it shrinks mods
+        # on ordinary single-phase generations and costs detail (faces first).
+        setattr(self, "_h3_two_phase",
+                int(kwargs.get("guide_phases") or 1) > 1
+                and kwargs.get("frozen_control_video") is None)
+        if _is_ref2va_pipeline(self):
+            _log(f"generate(): window {int(kwargs.get('window_no') or 1)}, "
+                 f"task payload={'yes' if state_json else 'no'}, "
+                 f"armed={'yes' if _ARMED['json'] else 'no'}")
+        if not state_json and _ARMED["json"] and _is_ref2va_pipeline(self) \
+                and not kwargs.get("refinement_mode"):
+            state_json = _ARMED["json"]
+            if first_window:
+                _log("this task reached generate() without its RefMod selection (Wan2GP dropped it "
+                     "between the form and the queue); using the selection armed in the inline panel.")
         if state_json:
             try:
                 kwargs = _inject_refmods(self, kwargs, state_json)
             except Exception:
                 _log("could not inject RefMods, continuing without them:\n" + traceback.format_exc())
+        elif _is_ref2va_pipeline(self) and first_window and not kwargs.get("refinement_mode"):
+            _log("no RefMod selection for this task, and none armed in the inline panel -- if you "
+                 "picked mods there, re-select them once after restarting Wan2GP.")
 
         return _orig_generate(self, *args, **kwargs)
 
     Pipeline._add_image_reference = patched_add_image_reference
     Pipeline._add_video_reference = patched_add_video_reference
     Pipeline.generate = patched_generate
+    _install_sol_attn_guard()
+
     setattr(Pipeline, _PATCH_MARKER, True)
     _log("patches installed on MiniMaxH3Pipeline (RefMod extraction + injection enabled)")
     return None
@@ -836,9 +1329,42 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # Generation-time injection
 # ═══════════════════════════════════════════════════════════════════════════
 
+_SOL_PATCH_MARKER = "_h3refmod_sol_patched"
+
+
+def _install_sol_attn_guard() -> None:
+    """Route RefMod generations around Sol-Attn's INT8 Triton kernels.
+    See DISABLE_SOL_WITH_REFMODS. No effect when the attention mode isn't
+    "sol", and none on generations without RefMods."""
+    try:
+        from models.minimax_h3 import sol_attention as h3_sol
+    except Exception as e:
+        _log(f"could not import models.minimax_h3.sol_attention ({e!r}); "
+             f"the Sol-Attn guard is not installed")
+        return
+    SolCls = getattr(h3_sol, "MiniMaxH3SolAttention", None)
+    if SolCls is None or getattr(SolCls, _SOL_PATCH_MARKER, False):
+        return
+    _orig_use_for_layer = SolCls.use_for_layer
+
+    @functools.wraps(_orig_use_for_layer)
+    def patched_use_for_layer(self, tokens):
+        if DISABLE_SOL_WITH_REFMODS and _REFMODS_ACTIVE["on"] and getattr(self, "enabled", False):
+            if not _REFMODS_ACTIVE["logged"]:
+                _REFMODS_ACTIVE["logged"] = True
+                _log("Sol-Attn bypassed for this generation because RefMods are injected "
+                     "(its INT8 Triton path can hit an illegal memory access as the condition "
+                     "rows grow). Set DISABLE_SOL_WITH_REFMODS = False in patches.py to re-enable.")
+            return False
+        return _orig_use_for_layer(self, tokens)
+
+    SolCls.use_for_layer = patched_use_for_layer
+    setattr(SolCls, _SOL_PATCH_MARKER, True)
+
+
 def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     window_no = kwargs.get("window_no")
-    if isinstance(window_no, int) and window_no > 1:
+    if not INJECT_ON_EVERY_WINDOW and isinstance(window_no, int) and window_no > 1:
         # Wan2GP's own sliding-window loop (also used by "Continue Video")
         # only feeds its *native* references (image_refs, prefix_video, a
         # reference video's own frames, etc.) into window_no==1 -- every
@@ -876,7 +1402,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         if not name or strength <= 0.0:
             continue
         try:
-            mod = storage.load_refmod(name)
+            mod = _load_refmod_cached(name)
         except Exception as e:
             _log(f"could not load mod {name!r}, skipping ({e!r})")
             continue
@@ -896,7 +1422,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     total_tokens = 0
     for mod, strength, copies in loaded_rows:
         eff = max(0.0, min(2.0, strength * retention))
-        latent = mod.weighted_latent(eff, curve=curve)
+        latent = _weighted_latent_cached(mod, eff, curve)
         if latent is None:
             continue
         total_tokens += mod.token_count
@@ -911,7 +1437,8 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             t = latent.shape[2]
             for _ in range(copies):
                 for j in range(t):
-                    image_sentinels.append(_RefModImageSentinel(latent[:, :, j:j + 1]))
+                    image_sentinels.append(_RefModImageSentinel(
+                        latent[:, :, j:j + 1], mod.latent[:, :, j:j + 1], _preview_key(mod, "image", j)))
         elif mod.kind == "video":
             # Video-kind mods go through Wan2GP's own native reference-video
             # slots directly -- the exact same mechanism "Use Two Reference
@@ -922,7 +1449,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             # since MiniMax H3 only exposes 2 such slots in total.
             if copies > 1:
                 latent = latent.repeat(1, 1, copies, 1, 1)
-            video_sentinels.append(_RefModVideoSentinel(latent))
+            video_sentinels.append(_RefModVideoSentinel(latent, mod.latent, _preview_key(mod, "video", 0)))
         else:  # "audio"
             # Same pattern as video-kind mods, one slot per mod (2 native
             # audio-reference slots total); "copies" repeats this mod's own
@@ -944,14 +1471,13 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     audio_prompt_type = str(kwargs.get("audio_prompt_type") or "")
     live_img = len(kwargs.get("input_ref_images") or [])
     live_vid = ((kwargs.get("input_frames") is not None and "V" in video_prompt_type)
-                + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type)
-                + (kwargs.get("input_frames3") is not None and "*" in video_prompt_type))
+                + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type))
     live_aud = ((kwargs.get("audio_guide") is not None and "A" in audio_prompt_type)
-                + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type)
-                + (kwargs.get("audio_guide3") is not None and "D" in audio_prompt_type))
+                + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type))
 
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
+        setattr(pipeline_self, "_h3_live_image_refs", len(existing))
         kwargs["input_ref_images"] = list(existing) + image_sentinels
 
     native_videos = []
@@ -969,18 +1495,6 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 video_prompt_type += "V"
             if "+" not in video_prompt_type:
                 video_prompt_type += "+"
-        # Newer Wan2GP builds expose a third native reference-video slot
-        # (input_frames3, enabled by "*"). Use it when it exists, so a third
-        # video RefMod travels the native path -- including through the
-        # phase-2 refinement pass, which re-reads video_sources -- instead of
-        # being appended directly.
-        if remaining and "input_frames3" in _generate_params and kwargs.get("input_frames3") is None:
-            kwargs["input_frames3"] = remaining.pop(0)
-            native_videos.append(kwargs["input_frames3"])
-            if "V" not in video_prompt_type:
-                video_prompt_type += "V"
-            if "*" not in video_prompt_type:
-                video_prompt_type += "*"
         # Wan2GP's generate() only reads two video kwargs; the rest are added
         # straight into refs/visual_latents after the cap check instead.
         for sentinel in remaining:
@@ -1014,12 +1528,6 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 native_audios.append(kwargs["audio_guide2"])
                 if "B" not in audio_prompt_type:
                     audio_prompt_type += "B"
-            # Third native audio slot on newer builds (audio_guide3, flag "D").
-            if remaining_audio and "audio_guide3" in _generate_params and kwargs.get("audio_guide3") is None:
-                kwargs["audio_guide3"] = remaining_audio.pop(0)
-                native_audios.append(kwargs["audio_guide3"])
-                if "D" not in audio_prompt_type:
-                    audio_prompt_type += "D"
             for sentinel in remaining_audio:
                 latent = sentinel.latent
                 state["overflow_audio"].append((latent, {"kind": "audio", "ref_audio_t": latent.shape[-1]}))
@@ -1051,6 +1559,8 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                     visible_audio += 1
                 else:
                     visible_visual += 1
+
+    _REFMODS_ACTIVE["on"] = True
 
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
