@@ -682,3 +682,5 @@ This plugin's `core.py` is a close port of `core.py` from
 [ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod)
 by Luisa (luisacaotica), MIT License, (c) 2026. The rest of this plugin
 (`storage.py`, `patches.py`, `plugin.py`) is new code written for Wan2GP.
+Original port by *https://github.com/g3n3rativ3**
+Forked from: https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP
