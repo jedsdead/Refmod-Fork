@@ -1,3 +1,5 @@
+This is a fork that attempts to fix being able to use mods across sliding windows. I also added the ability to select mods for deletion and put Video, Image and Audio mods on the generation page in accordions to minimise the need for scrolling. 
+
 # MiniMax H3 RefMods -- a Wan2GP plugin
 
 No-training "reference mods" for MiniMax H3 **Ref2VA**: compress an image or
