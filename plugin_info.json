@@ -1,10 +1,12 @@
 {
-  "name": "MiniMax H3 RefMods",
-  "author": "ported for Wan2GP by community, original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
-  "version": "0.30.2",
-  "description": "No-training 'reference mods' for MiniMax H3 Ref2VA: compress an image/video reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation.",
-  "type": ["app"],
-  "date": "2026-08-19",
+  "name": "MiniMax H3 RefMods (jedsdead fork)",
+  "author": "fork by jedsdead; original Wan2GP port by g3n3rativ3; original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
+  "version": "0.30.2-fork.1",
+  "description": "No-training 'reference mods' for MiniMax H3 Ref2VA and FL2VA: compress an image/video/audio reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation. Fork with sliding-window, two-phase and FL2VA support.",
+  "type": [
+    "app"
+  ],
+  "date": "2026-10-01",
   "wan2gp_version": "",
-  "url": "https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP"
+  "url": "https://github.com/jedsdead/Refmod-Fork"
 }

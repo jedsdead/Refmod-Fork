@@ -1,4 +1,91 @@
-This is a fork that attempts to fix being able to use mods across sliding windows. I also added the ability to select mods for deletion and put Video, Image and Audio mods on the generation page in accordions to minimise the need for scrolling. 
+# MiniMax H3 RefMods for Wan2GP — jedsdead fork
+
+**Version 0.30.2-fork.1** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+
+This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
+of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
+It fixes several problems that stopped RefMods working reliably in Wan2GP, adds
+FL2VA support, and makes a few quality-of-life changes. Mod files are unchanged,
+so mods are still interchangeable with the original port and with ComfyUI.
+
+The original port's documentation follows below the line; this section lists
+what's different.
+
+## What this fork changes
+
+### Fixes
+
+- **RefMods now reach the prompt.** In the original, a mod's latent went to the
+  model with nothing in the prompt tying it to your text, so mods often had
+  little visible effect. Each mod now gets its own `<Picture N>`, `<Video N>` or
+  `<Audio N>` entry in the prompt, the same as a live reference does.
+- **Mods apply on every sliding window**, matching how Wan2GP treats its own
+  references. The original injected them into the first window only, so
+  anything longer than one window lost them.
+- **Your mod selection is no longer lost before generation.** Wan2GP can drop
+  the plugin's custom setting between the form and the queue. The inline
+  panel's selection is now kept and re-applied when that happens, and Wan2GP's
+  own form refreshes no longer wipe it. A **Clear armed RefMods** button
+  replaces "pick nothing" as the way to turn mods off.
+- **Extract no longer renders a video by mistake.** The same dropped setting
+  could turn an extraction into an ordinary generation; the job is now
+  re-applied the same way.
+- **Two-phase generation.** Phase 1 renders at half resolution, and live
+  references are shrunk to match; mods weren't. They're now fitted to the
+  phase-1 canvas — only ever shrunk, never enlarged — and single-phase runs
+  are untouched.
+- **Newer Wan2GP's reference-video time budget.** When several reference
+  videos together run over Wan2GP's 15-second budget, it trims each one. Mods
+  are now trimmed to match instead of crashing the generation.
+- **Less repeated work at window boundaries.** Mod files, strength-weighted
+  latents and prompt previews are cached instead of being rebuilt every window.
+
+### New
+
+- **FL2VA support**, including FL2VA finetunes such as VDN. In FL2VA the mods
+  go straight into the transformer's reference list, the same mechanism the
+  ComfyUI original's Apply node uses. As in ComfyUI, FL2VA prompts carry no
+  `<Picture N>` labels. Control, Viggle and TTS models are excluded. The FL2VA
+  checkpoint wasn't trained with references, so expect results to vary more
+  than in Ref2VA.
+- **Three reference-video and three audio slots** on Wan2GP builds that have
+  them, detected automatically at startup. Older builds keep two.
+
+### Quality of life
+
+- Image, video and audio pickers sit in collapsible accordions, in both the
+  inline panel and the plugin's own tab.
+- Delete mods by picking them from a list (several at once if you like), with
+  a confirmation tick, instead of typing their paths.
+- Every generation logs what happened to your mods, e.g.
+  `[H3RefMod] generate(): Ref2VA, window 2, task payload=no, armed=yes`.
+
+### Settings
+
+These live at the top of `patches.py`. The defaults are what this fork ships with.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `PROMPT_LABELS_FOR_REFMODS` | `True` | Give each mod a `<Picture N>`/`<Video N>`/`<Audio N>` prompt entry. `False` reproduces the original port's behaviour. |
+| `INJECT_ON_EVERY_WINDOW` | `True` | Apply mods to every sliding window rather than only the first. |
+| `FIT_REFMODS_TO_PHASE_1_CANVAS` | `True` | In two-phase runs, shrink mods to phase 1's half-resolution canvas. |
+| `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. |
+| `STABLE_REFMOD_LABELS` | `False` | In windows 2+, number mods ahead of the carried-over frame so their `<Picture N>` stays the same as in window 1. |
+| `RESCALE_REFMODS_IN_PHASE_2` | `False` | Experimental: rebuild image mods at phase 2's full resolution. |
+| `RESCALE_REFMOD_VIDEOS_IN_PHASE_2` | `False` | Same for video mods. Expensive: token cost grows with every latent frame. |
+| `REFMOD_RESCALE_MAX_TOKEN_GROWTH` | `2.0` | Cap on how much a phase-2 rebuild may grow a mod's token count. |
+| `DISABLE_SOL_WITH_REFMODS` | `False` | Fall back from Sol-Attn to normal attention when mods are in use. |
+
+### Versioning
+
+Fork versions take the form `<original port version>-fork.<fork release>`, so
+`0.30.2-fork.1` is this fork's first release built on the original's 0.30.2.
+Wan2GP's plugin manager sorts it above 0.30.2 and below the next original
+release, and compares fork releases numerically, so `fork.10` is newer than
+`fork.9`.
+
+---
+
 
 # MiniMax H3 RefMods -- a Wan2GP plugin
 
@@ -682,5 +769,9 @@ This plugin's `core.py` is a close port of `core.py` from
 [ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod)
 by Luisa (luisacaotica), MIT License, (c) 2026. The rest of this plugin
 (`storage.py`, `patches.py`, `plugin.py`) is new code written for Wan2GP.
-Original port by *https://github.com/g3n3rativ3**
+
+Original Wan2GP port by [g3n3rativ3](https://github.com/g3n3rativ3).
+
 Forked from: https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP
+
+Fork maintained by [jedsdead](https://github.com/jedsdead): https://github.com/jedsdead/Refmod-Fork

@@ -40,7 +40,7 @@ from . import core, storage
 from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches,
                       set_pending_extract,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
-                      is_minimax_h3_ref2va)
+                      is_minimax_h3_ref2va, is_minimax_h3_refmod_capable)
 
 PlugIn_Name = "MiniMax H3 RefMods"
 PlugIn_Id = "H3RefMods"
@@ -548,7 +548,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
             def update_visibility(target_value):
                 model_type = str(target_value or "").split("|", 1)[0].strip()
-                return gr.update(visible=is_minimax_h3_ref2va(model_type, get_base_mt))
+                return gr.update(visible=is_minimax_h3_refmod_capable(model_type, get_base_mt))
 
             target.change(fn=update_visibility, inputs=[target], outputs=[accordion], queue=False)
         else:
