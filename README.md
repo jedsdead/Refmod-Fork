@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.30.2-fork.1.1** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -44,8 +44,10 @@ what's different.
 
 - **FL2VA support**, including FL2VA finetunes such as VDN. In FL2VA the mods
   go straight into the transformer's reference list, the same mechanism the
-  ComfyUI original's Apply node uses. As in ComfyUI, FL2VA prompts carry no
-  `<Picture N>` labels. Control, Viggle and TTS models are excluded. The FL2VA
+  ComfyUI original's Apply node uses. Visual mods carry no `<Picture N>` label,
+  as in ComfyUI; audio mods are labelled `<Audio N>` (see
+  `FL2VA_PROMPT_LABELS`) because a voice reference has little to anchor it
+  otherwise. Control, Viggle and TTS models are excluded. The FL2VA
   checkpoint wasn't trained with references, so expect results to vary more
   than in Ref2VA.
 - **Three reference-video and three audio slots** on Wan2GP builds that have
@@ -70,11 +72,20 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 | `INJECT_ON_EVERY_WINDOW` | `True` | Apply mods to every sliding window rather than only the first. |
 | `FIT_REFMODS_TO_PHASE_1_CANVAS` | `True` | In two-phase runs, shrink mods to phase 1's half-resolution canvas. |
 | `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. |
+| `FL2VA_PROMPT_LABELS` | `"audio"` | Which mods get a prompt label in FL2VA. `"audio"` labels audio mods as `<Audio N>`; `"none"` matches the ComfyUI original. |
 | `STABLE_REFMOD_LABELS` | `False` | In windows 2+, number mods ahead of the carried-over frame so their `<Picture N>` stays the same as in window 1. |
 | `RESCALE_REFMODS_IN_PHASE_2` | `False` | Experimental: rebuild image mods at phase 2's full resolution. |
 | `RESCALE_REFMOD_VIDEOS_IN_PHASE_2` | `False` | Same for video mods. Expensive: token cost grows with every latent frame. |
 | `REFMOD_RESCALE_MAX_TOKEN_GROWTH` | `2.0` | Cap on how much a phase-2 rebuild may grow a mod's token count. |
 | `DISABLE_SOL_WITH_REFMODS` | `False` | Fall back from Sol-Attn to normal attention when mods are in use. |
+
+### Release history
+
+- **0.30.2-fork.1.1** — audio mods are labelled `<Audio N>` in FL2VA, so the
+  model is told what the reference audio is for; the staging log reports audio
+  row counts.
+- **0.30.2-fork.1** — first fork release: the fixes and quality-of-life changes
+  above, FL2VA support, and three reference-video/audio slots.
 
 ### Versioning
 

@@ -1074,6 +1074,20 @@ def install_patches() -> Optional[str]:
              "to patch; audio-kind RefMods will not be available (image and video RefMods are "
              "unaffected). This Wan2GP build may not support direct audio references yet.")
 
+    _orig_encode_prompt = getattr(Pipeline, "_encode_prompt", None)
+    if _orig_encode_prompt is not None:
+        @functools.wraps(_orig_encode_prompt)
+        def patched_encode_prompt(self, prompt, presentation, *args, **kwargs):
+            # FL2VA builds its presentation from keyframes only. Append the
+            # staged RefMod labels so an audio mod arrives as "<Audio 1>: "
+            # rather than as an unannounced block of audio rows.
+            if _FL2VA["active"] and _FL2VA.get("presentation") and isinstance(presentation, list):
+                presentation.extend(_FL2VA["presentation"])
+                _log(f"FL2VA: added {len(_FL2VA['presentation'])} RefMod label(s) to the prompt "
+                     f"(FL2VA_PROMPT_LABELS={FL2VA_PROMPT_LABELS!r})")
+            return _orig_encode_prompt(self, prompt, presentation, *args, **kwargs)
+        Pipeline._encode_prompt = patched_encode_prompt
+
     _orig_prepare_condition_rows = getattr(Pipeline, "_prepare_condition_rows", None)
     if _orig_prepare_condition_rows is not None:
         @functools.wraps(_orig_prepare_condition_rows)
@@ -1609,11 +1623,25 @@ def _build_refmod_sentinels(state_json: str):
 # FL2VA prompts carry no reference labels.
 FL2VA_REFMODS = True
 
-_FL2VA = {"active": False, "visual": [], "audio": [], "entries": [], "announced": False}
+# Which RefMods get a prompt label in FL2VA.
+#   "audio" - label audio mods only (default)
+#   "all"   - label every mod, as Ref2VA does
+#   "none"  - no labels, exactly like the ComfyUI original's Apply node
+#
+# FL2VA presents its own start/end frames to the prompt encoder as <Picture N>,
+# so it understands labels; it simply isn't given any for references. A visual
+# reference can still bias the picture unlabelled, but a voice reference has
+# much less to grab onto -- "use this voice" has to come from somewhere. Audio
+# mods are labelled by default for that reason. Labels are appended after the
+# keyframes, so a start frame stays <Picture 1>.
+FL2VA_PROMPT_LABELS = "audio"
+
+_FL2VA = {"active": False, "visual": [], "audio": [], "entries": [], "announced": False,
+          "presentation": []}
 
 
 def _clear_fl2va() -> None:
-    _FL2VA.update(active=False, visual=[], audio=[], entries=[], announced=False)
+    _FL2VA.update(active=False, visual=[], audio=[], entries=[], announced=False, presentation=[])
 
 
 def _transformer_has_control(transformer) -> bool:
@@ -1656,10 +1684,24 @@ def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
         latent = sentinel.latent
         audio.append(latent)
         entries.append({"kind": "audio", "ref_audio_t": latent.shape[-1]})
-    _FL2VA.update(active=True, visual=visual, audio=audio, entries=entries, announced=False)
+    labelled = []
+    mode = str(FL2VA_PROMPT_LABELS or "none").lower()
+    if mode in ("all", "audio"):
+        for entry in entries:
+            if entry["kind"] == "audio":
+                labelled.append({"type": "audio"})
+            elif mode == "all":
+                # No frames to show (nothing is decoded on this path), so a
+                # visual entry can only be a label -- which the encoder has no
+                # way to render. Skip it rather than emit a broken block.
+                continue
+    _FL2VA.update(active=True, visual=visual, audio=audio, entries=entries, announced=False,
+                  presentation=labelled)
+    audio_rows = sum(e["ref_audio_t"] * 2 for e in entries if e["kind"] == "audio")
     _log(f"FL2VA: staging {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), retention={retention:.2f} "
-         f"(~{total_tokens} tokens). No prompt labels in FL2VA, as in the ComfyUI original.")
+         f"(~{total_tokens} tokens"
+         + (f", {audio_rows} audio rows" if audio_rows else "") + ")")
     return True
 
 
