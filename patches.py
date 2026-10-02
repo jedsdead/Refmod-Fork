@@ -1093,20 +1093,24 @@ def install_patches() -> Optional[str]:
             # and its presentation entry BEFORE the video ones, and the packer
             # lays each reference's audio rows out ahead of its video rows.
             attached_audio = getattr(video, "audio_latent", None)
-            if attached_audio is not None and isinstance(audio_latents, list):
+            merged = (attached_audio is not None and not ATTACHED_AUDIO_AS_SEPARATE_REF
+                      and isinstance(audio_latents, list))
+            if merged:
+                # H3's own shape for a reference video's soundtrack: the audio
+                # latent and its label go in BEFORE the video's, and the packer
+                # lays each reference's audio rows ahead of its video rows.
                 audio_latents.append(attached_audio)
                 if PROMPT_LABELS_FOR_REFMODS and presentation is not None:
                     presentation.append({"type": "audio"})
                 _log(f"video RefMod carries its own soundtrack "
-                     f"({attached_audio.shape[-1]} audio latents)")
-            else:
-                attached_audio = None
+                     f"({attached_audio.shape[-1]} audio latents), merged as a video_audio "
+                     f"reference")
             visual_latents.append(latent)
             _place_refmod_ref(self, video, refs,
-                              {"kind": "video_audio" if attached_audio is not None else "video",
+                              {"kind": "video_audio" if merged else "video",
                                "latent_t": latent.shape[2],
                                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1],
-                               "ref_audio_t": 0 if attached_audio is None else attached_audio.shape[-1]})
+                               "ref_audio_t": attached_audio.shape[-1] if merged else 0})
             _present_refmod(self, presentation, "video", video, fps)
             return
         _note_refs(self, refs)
@@ -1671,6 +1675,19 @@ def _build_refmod_sentinels(state_json: str):
                 latent = latent.repeat(1, 1, 1, copies)
             audio_sentinels.append(_RefModAudioSentinel(latent))
 
+        # A visual mod may also carry a soundtrack. Treat it exactly as a
+        # standalone audio mod: it takes a native audio slot, so it gets its
+        # <Audio N> label, its place in the reference order and the cap
+        # handling -- none of which the direct-injection path provides, and
+        # that label is what a prompt refers to for voice reuse.
+        if (mod.kind in ("image", "video") and mod.audio_latent is not None
+                and ATTACHED_AUDIO_AS_SEPARATE_REF):
+            audio_sentinels.append(_RefModAudioSentinel(mod.audio_latent, mod.description))
+            _log(f"{mod.kind} RefMod '{mod.name}' carries a soundtrack "
+                 f"({mod.audio_latent.shape[-1]} audio latents, "
+                 f"~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s) -- injected as "
+                 f"its own <Audio N> reference; refer to it as <Audio N>, not <Video N>.")
+
     if not image_sentinels and not video_sentinels and not audio_sentinels:
         return None
     return image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention
@@ -1698,6 +1715,18 @@ def _build_refmod_sentinels(state_json: str):
 #     both phase-2 paths reset it to None.
 # Like the ComfyUI Apply node, nothing is presented to the text encoder:
 # FL2VA prompts carry no reference labels.
+# How a mod's attached soundtrack is injected.
+#   True  - as its own <Audio N> reference, exactly like a standalone audio
+#           mod. Voice reuse from an audio reference is a trained Ref2VA
+#           capability, so this is the one to use for vocal timbre.
+#   False - merged into the visual reference as H3's "video_audio" kind, which
+#           is the shape used for a reference video's OWN soundtrack: it tells
+#           the model the audio belongs to that footage rather than offering it
+#           as a voice to reuse.
+# Image mods always use the separate form -- the packer's image branch has no
+# audio rows at all.
+ATTACHED_AUDIO_AS_SEPARATE_REF = True
+
 FL2VA_REFMODS = True
 
 # Which RefMods get a prompt label in FL2VA.
@@ -1759,13 +1788,14 @@ def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
     for sentinel in video_sentinels:
         latent = sentinel.latent
         attached = getattr(sentinel, "audio_latent", None)
-        if attached is not None:
+        merged = attached is not None and not ATTACHED_AUDIO_AS_SEPARATE_REF
+        if merged:
             audio.append(attached)
         visual.append(latent)
-        entries.append({"kind": "video_audio" if attached is not None else "video",
+        entries.append({"kind": "video_audio" if merged else "video",
                         "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
                         "latent_w": latent.shape[-1],
-                        "ref_audio_t": 0 if attached is None else attached.shape[-1]})
+                        "ref_audio_t": attached.shape[-1] if merged else 0})
     for sentinel in audio_sentinels:
         latent = sentinel.latent
         audio.append(latent)
@@ -1835,18 +1865,6 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         existing = kwargs.get("input_ref_images") or []
         setattr(pipeline_self, "_h3_live_image_refs", len(existing))
         kwargs["input_ref_images"] = list(existing) + image_sentinels
-        # An image mod may carry a soundtrack. Image references have no audio
-        # rows of their own, so it goes in as a separate audio reference
-        # through the same path as any reference past a native slot: its
-        # latent and its ref entry are appended together, so the packer's
-        # audio ordering stays consistent.
-        for sentinel in image_sentinels:
-            attached = getattr(sentinel, "audio_latent", None)
-            if attached is not None:
-                state["overflow_audio"].append(
-                    (attached, {"kind": "audio", "ref_audio_t": attached.shape[-1]}))
-                _log(f"image RefMod carries its own soundtrack "
-                     f"({attached.shape[-1]} audio latents), added as a paired audio reference")
 
     native_videos = []
     if video_sentinels:
