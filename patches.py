@@ -176,11 +176,13 @@ def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> boo
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key")
+    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "audio_latent")
 
-    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None):
+    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None,
+                 audio_latent=None):
         self.latent = latent
         self.hide_ref = False
+        self.audio_latent = audio_latent
         self.preview_latent = latent if preview_latent is None else preview_latent
         self.preview_key = preview_key
 
@@ -200,12 +202,15 @@ class _RefModVideoSentinel:
     [C, T, H, W] shape derived from the latent's own dims (undoing the video
     VAE's causal 4:1 temporal compression and 16x spatial downsampling), not
     real pixel data (there is none for a RefMod)."""
-    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "rescale_to")
+    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "rescale_to",
+                 "audio_latent")
 
-    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None):
+    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None,
+                 audio_latent=None):
         self.latent = latent
         self.hide_ref = False
         self.rescale_to = None
+        self.audio_latent = audio_latent
         self.preview_latent = latent if preview_latent is None else preview_latent
         self.preview_key = preview_key
 
@@ -1052,6 +1057,10 @@ def install_patches() -> Optional[str]:
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
             _present_refmod(self, presentation, "image", image)
+            # An image mod's soundtrack is handled in _inject_refmods via the
+            # overflow-audio path: the packer's image branch has no audio rows
+            # (unlike its video branch), and _add_image_reference isn't even
+            # given audio_latents to append to.
             return
         _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
@@ -1077,10 +1086,27 @@ def install_patches() -> Optional[str]:
                                                   target_height=height)
                 if rebuilt is not None:
                     latent = rebuilt
+            # A mod can carry its own soundtrack. H3 handles this natively:
+            # a reference video with audio is tagged "video_audio" with
+            # ref_audio_t set, and the packer gives it audio rows as well as
+            # video rows. Order matters -- upstream appends the audio latent
+            # and its presentation entry BEFORE the video ones, and the packer
+            # lays each reference's audio rows out ahead of its video rows.
+            attached_audio = getattr(video, "audio_latent", None)
+            if attached_audio is not None and isinstance(audio_latents, list):
+                audio_latents.append(attached_audio)
+                if PROMPT_LABELS_FOR_REFMODS and presentation is not None:
+                    presentation.append({"type": "audio"})
+                _log(f"video RefMod carries its own soundtrack "
+                     f"({attached_audio.shape[-1]} audio latents)")
+            else:
+                attached_audio = None
             visual_latents.append(latent)
             _place_refmod_ref(self, video, refs,
-                              {"kind": "video", "latent_t": latent.shape[2],
-                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
+                              {"kind": "video_audio" if attached_audio is not None else "video",
+                               "latent_t": latent.shape[2],
+                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1],
+                               "ref_audio_t": 0 if attached_audio is None else attached_audio.shape[-1]})
             _present_refmod(self, presentation, "video", video, fps)
             return
         _note_refs(self, refs)
@@ -1619,8 +1645,11 @@ def _build_refmod_sentinels(state_json: str):
             t = latent.shape[2]
             for _ in range(copies):
                 for j in range(t):
+                    # Attached audio rides on the FIRST still only: it is one
+                    # soundtrack for the mod, not one per stacked image.
                     image_sentinels.append(_RefModImageSentinel(
-                        latent[:, :, j:j + 1], mod.latent[:, :, j:j + 1], _preview_key(mod, "image", j)))
+                        latent[:, :, j:j + 1], mod.latent[:, :, j:j + 1], _preview_key(mod, "image", j),
+                        audio_latent=mod.audio_latent if j == 0 else None))
         elif mod.kind == "video":
             # Video-kind mods go through Wan2GP's own native reference-video
             # slots directly -- the exact same mechanism "Use Two Reference
@@ -1631,7 +1660,8 @@ def _build_refmod_sentinels(state_json: str):
             # since MiniMax H3 only exposes 2 such slots in total.
             if copies > 1:
                 latent = latent.repeat(1, 1, copies, 1, 1)
-            video_sentinels.append(_RefModVideoSentinel(latent, mod.latent, _preview_key(mod, "video", 0)))
+            video_sentinels.append(_RefModVideoSentinel(latent, mod.latent, _preview_key(mod, "video", 0),
+                                                        audio_latent=mod.audio_latent))
         else:  # "audio"
             # Same pattern as video-kind mods, one slot per mod (2 native
             # audio-reference slots total); "copies" repeats this mod's own
@@ -1722,11 +1752,20 @@ def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
         latent = sentinel.latent
         visual.append(latent)
         entries.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+        attached = getattr(sentinel, "audio_latent", None)
+        if attached is not None:   # image refs have no audio rows: pair one alongside
+            audio.append(attached)
+            entries.append({"kind": "audio", "ref_audio_t": attached.shape[-1]})
     for sentinel in video_sentinels:
         latent = sentinel.latent
+        attached = getattr(sentinel, "audio_latent", None)
+        if attached is not None:
+            audio.append(attached)
         visual.append(latent)
-        entries.append({"kind": "video", "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
-                        "latent_w": latent.shape[-1], "ref_audio_t": 0})
+        entries.append({"kind": "video_audio" if attached is not None else "video",
+                        "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
+                        "latent_w": latent.shape[-1],
+                        "ref_audio_t": 0 if attached is None else attached.shape[-1]})
     for sentinel in audio_sentinels:
         latent = sentinel.latent
         audio.append(latent)
@@ -1796,6 +1835,18 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         existing = kwargs.get("input_ref_images") or []
         setattr(pipeline_self, "_h3_live_image_refs", len(existing))
         kwargs["input_ref_images"] = list(existing) + image_sentinels
+        # An image mod may carry a soundtrack. Image references have no audio
+        # rows of their own, so it goes in as a separate audio reference
+        # through the same path as any reference past a native slot: its
+        # latent and its ref entry are appended together, so the packer's
+        # audio ordering stays consistent.
+        for sentinel in image_sentinels:
+            attached = getattr(sentinel, "audio_latent", None)
+            if attached is not None:
+                state["overflow_audio"].append(
+                    (attached, {"kind": "audio", "ref_audio_t": attached.shape[-1]}))
+                _log(f"image RefMod carries its own soundtrack "
+                     f"({attached.shape[-1]} audio latents), added as a paired audio reference")
 
     native_videos = []
     if video_sentinels:
@@ -2009,6 +2060,57 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
         status(f"H3 RefMod '{name}' extracted ({mod.token_count} tokens) but not saved (save=false)")
 
 
+def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
+    """Add, replace or remove the soundtrack on mods that already exist, so a
+    visual mod doesn't have to be rebuilt from its sources to gain one.
+    Encoding needs the audio VAE, hence a task rather than a plain UI action."""
+    names = [n for n in (spec.get("names") or []) if n]
+    audio_path = spec.get("audio_path") or None
+    remove = bool(spec.get("remove"))
+    seconds = float(spec.get("seconds") or 0.0)
+    if not names:
+        status("Attach audio: nothing selected.")
+        return
+    if not audio_path and not remove:
+        status("Attach audio: pick an audio file, or tick Remove.")
+        return
+
+    latent = None
+    if not remove:
+        waveform = storage.load_audio_waveform(audio_path, max_seconds=max(0.5, seconds or 4.0))
+        latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
+        if latent.dim() != 4 or latent.shape[1] != 32 or latent.shape[2] != 2:
+            raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(latent.shape)}.")
+        status(f"Attach audio: encoded {latent.shape[-1]} audio latents "
+               f"(~{latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s, "
+               f"+{latent.shape[-1] * 2} tokens per mod)")
+
+    done = skipped = failed = 0
+    for index, name in enumerate(names, 1):
+        try:
+            mod = storage.load_refmod(name)
+            if mod.kind == "audio":
+                skipped += 1
+                status(f"[{index}/{len(names)}] '{name}' is an audio mod -- nothing to attach to")
+                continue
+            if remove and mod.audio_latent is None:
+                skipped += 1
+                status(f"[{index}/{len(names)}] '{name}' has no soundtrack")
+                continue
+            mod.audio_latent = None if remove else latent.clone()
+            mod.audio_t = 0 if remove else int(latent.shape[-1])
+            mod.save(storage.mod_path(name))
+            done += 1
+            status(f"[{index}/{len(names)}] '{name}': "
+                   + ("soundtrack removed" if remove else
+                      f"soundtrack attached, mod is now {mod.token_count} tokens"))
+        except Exception:
+            failed += 1
+            _log(f"could not update {name!r}:\n" + traceback.format_exc())
+            status(f"[{index}/{len(names)}] '{name}': failed -- see the console")
+    status(f"Attach audio finished: {done} updated, {skipped} skipped, {failed} failed.")
+
+
 def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> None:
     if isinstance(spec, str):
         spec = json.loads(spec)
@@ -2020,6 +2122,10 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
                 set_progress_status(msg)
             except Exception:
                 pass
+
+    if spec.get("op") == "attach_audio":
+        _run_attach_audio_job(pipeline_self, spec, status)
+        return
 
     name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")
     mode = core.normalize_mode(spec.get("mode", "training"))
@@ -2043,12 +2149,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     save = bool(spec.get("save", True))
     remove_background_images_ref = int(spec.get("remove_background_images_ref", 0) or 0)
 
-    if audio_path:
-        if image_paths or video_paths:
-            raise ValueError(
-                "RefMod extraction: audio can't be combined with image/video sources in the same "
-                "mod -- an audio VAE latent [1,32,2,T] and a visual latent [1,24,T,H,W] are "
-                "structurally incompatible to stack together. Extract them as separate mods.")
+    if audio_path and not image_paths and not video_paths:
         _run_extract_audio_job(pipeline_self, spec, status)
         return
 
@@ -2158,6 +2259,24 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
               f"~{req_sec:.1f}s worth of frames ({requested_t}), saved ~{got_sec:.1f}s "
               f"({total_t}). Raise 'Max tokens' (Advanced) or lower the ref resolution/pool "
               f"grid to keep more of the requested duration.")
+    # Optional soundtrack for a visual mod. The two latents are structurally
+    # different ([1,32,2,T] vs [1,24,T,H,W]) so they can't be stacked, but they
+    # can be stored side by side and injected as one reference: H3 tags a
+    # reference video carrying audio "video_audio" and gives it audio rows.
+    audio_latent = None
+    if audio_path:
+        target_seconds = (((total_t - 1) * 4 + 1 if total_t > 1 else 1)
+                          / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
+        status(f"H3 RefMod: encoding the attached soundtrack (up to ~{target_seconds:.1f}s, "
+               f"matching this mod's visual duration)")
+        waveform = storage.load_audio_waveform(audio_path, max_seconds=max(0.5, target_seconds))
+        audio_latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
+        if audio_latent.dim() != 4 or audio_latent.shape[1] != 32 or audio_latent.shape[2] != 2:
+            raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(audio_latent.shape)}.")
+        status(f"H3 RefMod: soundtrack attached ({audio_latent.shape[-1]} audio latents, "
+               f"~{audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s, "
+               f"+{audio_latent.shape[-1] * 2} tokens)")
+
     kind = "video" if n_vid > 0 else "image"  # NOT total_t > 1: several still images
                                               # stacked together (n_vid==0) still form
                                               # multiple independent *image* references,
@@ -2173,12 +2292,16 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
               else f"{total_t}x{gh}x{gw}"),
         optimize_steps=identity if mode == "training" else 0,
         tags=[f"{n_img} img, {n_vid} vid"] + ([f"x{multiplier} repeat"] if multiplier > 1 else [])
-             + (["background removed"] if remove_background_images_ref else []),
+             + (["background removed"] if remove_background_images_ref else [])
+             + (["with soundtrack"] if audio_path else []),
         description=description, concept_type=concept_type,
+        audio_latent=audio_latent,
+        audio_t=0 if audio_latent is None else int(audio_latent.shape[-1]),
     )
 
     if save:
         path = mod.save(storage.mod_path(name))
-        status(f"H3 RefMod '{name}' saved: {mod.token_count} tokens, {kind}/{mode} -> {path}")
+        status(f"H3 RefMod '{name}' saved: {mod.token_count} tokens, {kind}/{mode}"
+               + (" + soundtrack" if audio_latent is not None else "") + f" -> {path}")
     else:
         status(f"H3 RefMod '{name}' extracted ({mod.token_count} tokens) but not saved (save=false)")

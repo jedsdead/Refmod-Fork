@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1.2** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.30.2-fork.1.3** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -52,6 +52,12 @@ what's different.
   otherwise. Control, Viggle and TTS models are excluded. The FL2VA
   checkpoint wasn't trained with references, so expect results to vary more
   than in Ref2VA.
+- **Mods with both visuals and audio.** A video mod's soundtrack rides along
+  as one reference — H3 tags that `video_audio` and gives it audio rows as
+  well as video rows — and an image mod's audio is injected as a paired audio
+  reference. Attach one at extraction time, or from the Library tab's
+  **Soundtrack** section for mods you already built. The extra audio counts
+  toward the mod's token total (2 tokens per audio latent, ~80 per second).
 - **Three reference-video and three audio slots** on Wan2GP builds that have
   them, detected automatically at startup. Older builds keep two.
 
@@ -83,6 +89,9 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.30.2-fork.1.3** — a mod can carry a soundtrack as well as a look:
+  extraction accepts audio alongside image/video sources, and the Library
+  tab can add, replace or remove a soundtrack on mods you already have.
 - **0.30.2-fork.1.2** — root-cause fix for the plugin's settings being
   dropped: both payloads now travel in a single `h3_refmod` custom setting.
   Wan2GP keeps only the first 5 settings a model declares and Ref2VA already

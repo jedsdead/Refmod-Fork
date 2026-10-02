@@ -157,6 +157,9 @@ def infer_kind_from_tags(tags, fallback: str) -> str:
     return fallback
 
 
+AUDIO_LATENT_KEY = "audio_latent"
+
+
 def read_refmod_meta(path_no_ext: str) -> Optional[Dict]:
     """Read the metadata block from a mod file without loading its tensors."""
     try:
@@ -445,6 +448,14 @@ class H3RefMod:
     time), always a full-resolution encode -- there is no spatial grid to
     pool for audio, so "training" mode's compression concept doesn't apply
     and audio mods are always extracted at full VAE fidelity.
+
+    ``audio_latent`` is an OPTIONAL second latent on an image/video mod, so
+    one mod can carry both a look and a voice. H3 supports this natively: a
+    reference video may carry a soundtrack, which the pipeline tags
+    ``kind: "video_audio"`` with ``ref_audio_t`` set, and the packer gives
+    that reference audio rows as well as video rows. Stored under its own
+    key in the same file; a reader that doesn't know about it still loads
+    the visual latent unchanged.
     ``kind`` is "video" if any real video source was included when the mod
     was extracted, "image" otherwise -- an "image" mod can still have
     ``latent_t > 1`` if several still images were stacked into it (each
@@ -461,6 +472,8 @@ class H3RefMod:
     latent_w: int = 4
     latent_t: int = 1
     mode: str = "training"
+    audio_latent: Optional[torch.Tensor] = None
+    audio_t: int = 0
     source: str = ""
     source_shape: str = ""
     pool: str = ""
@@ -490,7 +503,10 @@ class H3RefMod:
             # formula visual refs use; audio has no spatial grid to patchify.
             return self.latent_t * 2
         per_frame = (self.latent_h // 2) * (self.latent_w // 2)
-        return self.latent_t * per_frame
+        total = self.latent_t * per_frame
+        if self.audio_latent is not None:   # the attached soundtrack costs rows too
+            total += int(self.audio_latent.shape[-1]) * 2
+        return total
 
     def weighted_latent(self, strength: float = 1.0, curve=None) -> Optional[torch.Tensor]:
         """The latent to inject, blended with a blurred copy of itself by
@@ -534,7 +550,13 @@ class H3RefMod:
             "description": self.description, "concept_type": self.concept_type,
             "_format_version": 2, "_produced_by": "wan2gp-minimax-h3-refmod",
         }
-        save_file({"latent": self.latent.contiguous()}, path_no_ext + ".safetensors",
+        tensors = {"latent": self.latent.contiguous()}
+        if self.audio_latent is not None:
+            # Own key, so a reader that only wants ["latent"] is unaffected.
+            tensors[AUDIO_LATENT_KEY] = self.audio_latent.contiguous()
+            meta["audio_t"] = int(self.audio_latent.shape[-1])
+            meta["has_audio"] = True
+        save_file(tensors, path_no_ext + ".safetensors",
                   metadata={META_KEY: json.dumps(meta)})
         return path_no_ext + ".safetensors"
 
@@ -543,7 +565,10 @@ class H3RefMod:
         meta = read_refmod_meta(path_no_ext)
         if meta is None:
             raise ValueError(f"{path_no_ext}.safetensors has no RefMod metadata.")
-        latent = load_file(path_no_ext + ".safetensors", device=device)["latent"].clone()
+        tensors = load_file(path_no_ext + ".safetensors", device=device)
+        latent = tensors["latent"].clone()
+        audio_latent = tensors.get(AUDIO_LATENT_KEY)
+        audio_latent = audio_latent.clone() if audio_latent is not None else None
         # NOTE: dict.get(key, fallback) always evaluates `fallback` eagerly, even
         # when `key` is present and the fallback goes unused -- so the fallback
         # expression itself must never index a dimension that might not exist.
@@ -569,4 +594,6 @@ class H3RefMod:
             tags=list(meta.get("tags", [])),
             description=str(meta.get("description", "") or ""),
             concept_type=str(meta.get("concept_type", "generic") or "generic"),
+            audio_latent=audio_latent,
+            audio_t=int(meta.get("audio_t", 0) or 0) if audio_latent is not None else 0,
         )

@@ -811,7 +811,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     # ── Library ─────────────────────────────────────────────────────────
 
-    def _build_library_section(self):
+    def _build_library_section(self, api_session=None, model_dd=None):
         gr.Markdown("### Saved RefMods\n"
                     "Mods live in `loras/refmods_plugin/minimax_h3/`. "
                     "Mods produced by the ComfyUI-MiniMaxH3Mod pack use the same file format and "
@@ -838,6 +838,26 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                      info="Required, since deletion can't be undone. Resets "
                                           "after each delete.")
         delete_status = gr.Textbox(label="", interactive=False, show_label=False)
+
+        gr.Markdown("#### Soundtrack (add / replace / remove)\\n"
+                    "Give an existing image or video mod its own audio, without rebuilding it "
+                    "from the original sources. H3 supports this natively: a reference video "
+                    "carrying a soundtrack becomes one reference with both video and audio, so "
+                    "one mod can hold a look and a voice. An image mod's audio is injected as a "
+                    "paired audio reference alongside its picture. Audio-only mods are skipped. "
+                    "Encoding needs the audio VAE, so this briefly runs a task on the model "
+                    "selected at the top of this tab, as extraction does.")
+        with gr.Row():
+            audio_target_dd = gr.Dropdown(label="Mods to update", choices=_library_mod_names(),
+                                          value=[], multiselect=True, scale=2,
+                                          info="Pick one or more image/video mods.")
+            attach_btn = gr.Button("Apply soundtrack", variant="primary")
+        with gr.Row():
+            audio_file = gr.Audio(label="Audio file", type="filepath", scale=2)
+            audio_seconds = gr.Slider(0.5, 15.0, value=4.0, step=0.5,
+                                      label="Seconds to use", scale=1)
+            audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")
+        audio_status = gr.Textbox(label="", interactive=False, show_label=False)
         gr.Markdown(
             "Mods extracted purely from several still images (no video source) used to be "
             "wrongly saved as `video` kind if more than one image was stacked together -- the "
@@ -876,16 +896,62 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 names = names + [current]
             return names
 
+        def do_attach_audio(names, audio_path, seconds, remove, folder, model_type=None):
+            names = [n for n in (names if isinstance(names, list) else [names]) if n]
+            if not names:
+                return gr.update(), "Pick at least one mod first."
+            if not audio_path and not remove:
+                return gr.update(), "Choose an audio file, or tick 'Remove existing soundtrack'."
+            if api_session is None or not model_type:
+                return gr.update(), ("Pick a model at the top of this tab first -- encoding audio "
+                                     "needs the model's audio VAE, so this runs as a task.")
+            spec = {"op": "attach_audio", "names": names, "audio_path": audio_path,
+                    "seconds": float(seconds), "remove": bool(remove)}
+            log = {"lines": []}
+
+            class AttachCallbacks:
+                def on_status(self, message):
+                    log["lines"].append(str(message))
+                def on_error(self, message):
+                    log["lines"].append(f"error: {message}")
+
+            spec_json = json.dumps(spec)
+            set_pending_extract(spec_json)   # same payload-loss guard extraction uses
+            try:
+                self._submit(api_session, model_type,
+                             {"video_length": 107,
+                              "custom_settings": {SETTING_COMBINED:
+                                                  pack_refmod_setting(extract_json=spec_json)}},
+                             AttachCallbacks())
+            except Exception as e:
+                return gr.update(), f"Soundtrack update failed to run: {e!r}"
+            finally:
+                set_pending_extract(None)
+            tail = [line for line in log["lines"] if "Attach audio finished" in line]
+            return (gr.update(choices=_library_mod_names(folder), value=[]),
+                    tail[-1] if tail else (log["lines"][-1] if log["lines"]
+                                           else "Finished -- see the console for details."))
+
+        attach_btn.click(fn=do_attach_audio,
+                         inputs=([audio_target_dd, audio_file, audio_seconds, audio_remove,
+                                  library_folder_dd, model_dd] if model_dd is not None else
+                                 [audio_target_dd, audio_file, audio_seconds, audio_remove,
+                                  library_folder_dd]),
+                         outputs=[audio_target_dd, audio_status], queue=False)
+
         def do_refresh(folder, current):
             return (_library_rows(folder),
                     gr.update(choices=_folder_choices(), value=folder),
                     gr.update(choices=_names_keeping(folder, current), value=current or None),
+                    gr.update(choices=_library_mod_names(folder), value=[]),
                     gr.update(choices=_library_mod_names(folder), value=[]))
 
         refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
-                          outputs=[table, library_folder_dd, edit_name_dd, delete_dd], queue=False)
+                          outputs=[table, library_folder_dd, edit_name_dd, delete_dd,
+                                   audio_target_dd], queue=False)
         library_folder_dd.change(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
-                                 outputs=[table, library_folder_dd, edit_name_dd, delete_dd],
+                                 outputs=[table, library_folder_dd, edit_name_dd, delete_dd,
+                                          audio_target_dd],
                                  queue=False)
 
         def do_delete(names, folder, confirmed):
@@ -1193,7 +1259,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 with gr.Tab("Extract"):
                     self._build_extract_section(api_session, model_dd)
                 with gr.Tab("Library"):
-                    self._build_library_section()
+                    self._build_library_section(api_session, model_dd)
                 with gr.Tab("Generate"):
                     self._build_generate_section(api_session, model_dd)
         return root
