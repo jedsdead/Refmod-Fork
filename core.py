@@ -460,9 +460,11 @@ class H3RefMod:
     was extracted, "image" otherwise -- an "image" mod can still have
     ``latent_t > 1`` if several still images were stacked into it (each
     occupies its own image-reference slot at injection time, matching
-    Wan2GP's own ``refs`` payload kinds). "audio" mods are always extracted
-    from a single audio file, never combined with image/video sources (the
-    latent shapes are structurally incompatible to stack together).
+    Wan2GP's own ``refs`` payload kinds). An "audio" mod is extracted from a
+    single audio file on its own; an image/video mod may additionally carry a
+    soundtrack in ``audio_latent`` (stored beside the visual latent, never
+    stacked with it -- the shapes are incompatible -- and injected as its own
+    audio reference).
     """
 
     name: str

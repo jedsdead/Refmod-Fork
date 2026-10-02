@@ -662,10 +662,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                    "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
                    "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
         ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath")
-        gr.Markdown("*Audio can't be combined with image/video sources in the same mod (their "
-                   "encoded shapes are structurally different) -- providing audio here along "
-                   "with images/video is refused with a clear error rather than mixed. Always "
-                   "extracted at full fidelity; 'Mode' above doesn't apply to audio.*")
+        gr.Markdown("*Audio on its own makes an audio-only mod. Audio **together with** images "
+                   "or video gives that mod a soundtrack as well as a look: the two latents are "
+                   "stored side by side (they can't be stacked -- their shapes differ) and the "
+                   "audio is injected as its own `<Audio N>` reference, so refer to it that way "
+                   "in prompts while `<Picture N>`/`<Video N>` stays the picture. The soundtrack "
+                   "is trimmed to the mod's visual duration and adds 2 tokens per audio latent "
+                   "(~80/second). Audio is always extracted at full fidelity; 'Mode' above "
+                   "doesn't apply to it. You can also add or replace a soundtrack later from the "
+                   "Library tab.*")
         audio_duration_warning = gr.Markdown("")
         remove_background_images_ref = gr.Dropdown(
             choices=[("Keep Backgrounds behind all Reference Images", 0),
@@ -753,10 +758,6 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             video_paths = [f.name if hasattr(f, "name") else f for f in (ref_videos or [])]
             if not image_paths and not video_paths and not ref_audio:
                 return "Add at least one reference image, video, or audio file."
-            if ref_audio and (image_paths or video_paths):
-                return ("Audio can't be combined with image/video sources in the same mod -- "
-                       "clear the image/video fields to extract an audio-only mod, or clear "
-                       "the audio field to extract an image/video mod.")
             spec = {
                 "name": name, "mode": mode, "concept_type": concept_type,
                 "image_paths": image_paths, "video_paths": video_paths,

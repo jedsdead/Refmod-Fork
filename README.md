@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1.7** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.30.2-fork.1.8** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -98,6 +98,9 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.30.2-fork.1.8** — the extractor form accepts audio together with image or
+  video sources. The backend had supported it since fork.1.3, but a leftover
+  check in the form still refused the combination before submitting.
 - **0.30.2-fork.1.7** — clearing the pickers clears the selection again. It used
   to be sticky (from when the task payload was being dropped), so an empty panel
   kept injecting the last selection into every generation — taking reference

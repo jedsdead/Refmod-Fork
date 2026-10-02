@@ -2017,11 +2017,14 @@ def _encode_ref_audio(pipeline_self, waveform: torch.Tensor) -> torch.Tensor:
 
 
 def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
-    """Audio-mod extraction -- entirely separate from the image/video path
-    above, since an audio VAE latent [1, 32, 2, T] (channels x stereo x
-    time) is structurally incompatible to stack alongside a visual latent
-    [1, 24, T, H, W]. Audio mods are always full-fidelity ("encode"-only --
-    there's no spatial grid to pool for audio, so "training" mode's
+    """Audio-ONLY mod extraction (no image/video sources given).
+
+    Audio given ALONGSIDE images or video doesn't come here: it is encoded by
+    the visual path and stored as that mod's soundtrack. The two latents are
+    never stacked -- an audio latent [1, 32, 2, T] and a visual one
+    [1, 24, T, H, W] have incompatible shapes -- they are stored side by side
+    and injected as separate references. Audio is always full-fidelity
+    ("encode"-only -- there's no spatial grid to pool, so "training" mode's
     compression concept doesn't apply)."""
     name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")
     concept_type = spec.get("concept_type", "generic")
