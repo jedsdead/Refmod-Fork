@@ -37,8 +37,8 @@ import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, storage
-from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches,
-                      set_pending_extract,
+from .patches import (SETTING_COMBINED, SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY,
+                      install_patches, pack_refmod_setting, set_pending_extract,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
                       is_minimax_h3_ref2va, is_minimax_h3_refmod_capable)
 
@@ -96,7 +96,10 @@ def _diagnose(api_session, model_type, patch_error):
     try:
         model_def = api_session.get_model_def(model_type) or {}
         declared_ids = {s.get("id") for s in (model_def.get("custom_settings") or []) if isinstance(s, dict)}
-        missing = [sid for sid in (SETTING_GENERATE, SETTING_EXTRACT) if sid not in declared_ids]
+        missing = [] if SETTING_COMBINED in declared_ids else [SETTING_COMBINED]
+        if not missing and len(declared_ids) > 5:
+            lines.append(f"⚠️ This model declares {len(declared_ids)} custom settings; Wan2GP keeps only "
+                         f"the first 5, so '{SETTING_COMBINED}' may still be dropped at task time.")
         if missing:
             lines.append(f"❌ This model does NOT declare {missing} under custom_settings -- RefMods will "
                          f"silently no-op for it (a real generation will run instead of an extraction, or "
@@ -782,7 +785,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             set_pending_extract(spec_json)
             try:
                 self._submit(api_session, model_type,
-                            {"video_length": 107, "custom_settings": {SETTING_EXTRACT: spec_json}},
+                            {"video_length": 107,
+                             "custom_settings": {SETTING_COMBINED:
+                                                 pack_refmod_setting(extract_json=spec_json)}},
                             ExtractCallbacks())
             except Exception as e:
                 set_pending_extract(None)
@@ -1113,7 +1118,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "skip_steps_start_step_perc": int(skip_steps_start_step_perc),
                 "sliding_window_size": int(sliding_window_size), "sliding_window_overlap": int(sliding_window_overlap),
                 "override_attention": override_attention, "attention_sparsity": float(attention_sparsity),
-                "custom_settings": {SETTING_GENERATE: json.dumps(state_payload)},
+                "custom_settings": {SETTING_COMBINED:
+                                    pack_refmod_setting(state_json=json.dumps(state_payload))},
             })
 
             log = {"lines": []}

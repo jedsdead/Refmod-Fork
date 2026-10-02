@@ -67,6 +67,46 @@ from . import core, storage
 
 SETTING_GENERATE = "h3_refmod_state"     # custom_settings key: mods to inject into a real render
 SETTING_EXTRACT = "h3_refmod_extract"    # custom_settings key: "run an extraction, not a render"
+
+# Both payloads now travel in ONE custom setting, because Wan2GP only keeps the
+# first CUSTOM_SETTINGS_MAX (5) settings a model declares:
+# get_model_custom_settings() slices custom_settings[:5], and the strict
+# collection that builds a task's custom_settings iterates that truncated list.
+# Ref2VA already declares 4 of its own (mask mode, audio refinement, and the
+# two excerpt-position settings), so the plugin's two made 6 and the last was
+# silently dropped -- which is why extraction ran as an ordinary render and why
+# the mod selection could vanish on the way to the queue. One setting fits.
+SETTING_COMBINED = "h3_refmod"           # {"state": <selection json>, "extract": <job json>}
+CUSTOM_SETTINGS_MAX_ASSUMED = 5
+
+
+def pack_refmod_setting(state_json=None, extract_json=None) -> str:
+    payload = {}
+    if state_json:
+        payload["state"] = state_json
+    if extract_json:
+        payload["extract"] = extract_json
+    return json.dumps(payload) if payload else ""
+
+
+def unpack_refmod_setting(custom_settings):
+    """(selection json, extraction job json) from a task's custom_settings.
+    Reads the combined key, and still honours the two legacy keys so tasks
+    queued by an older build -- or settings saved from one -- keep working."""
+    if not isinstance(custom_settings, dict):
+        return None, None
+    state = custom_settings.get(SETTING_GENERATE) or None
+    extract = custom_settings.get(SETTING_EXTRACT) or None
+    blob = custom_settings.get(SETTING_COMBINED)
+    if blob:
+        try:
+            parsed = json.loads(blob) if isinstance(blob, str) else blob
+            if isinstance(parsed, dict):
+                state = parsed.get("state") or state
+                extract = parsed.get("extract") or extract
+        except Exception:
+            _log(f"could not parse {SETTING_COMBINED}; ignoring it:\n" + traceback.format_exc())
+    return state, extract
 STASH_KEY = "_h3refmod_selection"        # key inside the session `state` dict for the inline panel
 FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24   # matches plugin.py's own constant of the same name --
                                          # MiniMax H3's own default fps, used only to turn a
@@ -875,11 +915,8 @@ def _install_model_def_patch() -> None:
     _orig_query_model_def = FamilyHandler.query_model_def
 
     extra_settings = [
-        {"id": SETTING_GENERATE, "name": "H3RefModState",
-         "label": "RefMods selection (managed by the MiniMax H3 RefMods plugin -- leave blank)",
-         "type": "text", "default": ""},
-        {"id": SETTING_EXTRACT, "name": "H3RefModExtract",
-         "label": "RefMod extraction job (managed by the MiniMax H3 RefMods plugin -- leave blank)",
+        {"id": SETTING_COMBINED, "name": "H3RefMod",
+         "label": "RefMods (managed by the MiniMax H3 RefMods plugin -- leave blank)",
          "type": "text", "default": ""},
     ]
 
@@ -890,12 +927,19 @@ def _install_model_def_patch() -> None:
             existing = result.get("custom_settings")
             existing = list(existing) if isinstance(existing, list) else []
             existing_ids = {e.get("id") for e in existing if isinstance(e, dict)}
-            result["custom_settings"] = existing + [s for s in extra_settings if s["id"] not in existing_ids]
+            merged = existing + [s for s in extra_settings if s["id"] not in existing_ids]
+            if len(merged) > CUSTOM_SETTINGS_MAX_ASSUMED:
+                _log(f"WARNING: {base_model_type} declares {len(existing)} custom settings and "
+                     f"Wan2GP keeps only the first {CUSTOM_SETTINGS_MAX_ASSUMED}, so the plugin's "
+                     f"setting is being dropped. RefMods will rely on the in-memory fallbacks; "
+                     f"extraction and mod selection may be unreliable.")
+            result["custom_settings"] = merged
         return result
 
     FamilyHandler.query_model_def = patched_query_model_def
     setattr(FamilyHandler, _MODEL_DEF_PATCH_MARKER, True)
-    _log("declared h3_refmod_state / h3_refmod_extract custom settings on MiniMax H3's model definition")
+    _log(f"declared the {SETTING_COMBINED} custom setting on MiniMax H3's model definition "
+         f"(one slot, so it fits inside Wan2GP's limit of {CUSTOM_SETTINGS_MAX_ASSUMED})")
 
     if getattr(FamilyHandler, _VALIDATE_PATCH_MARKER, False):
         return
@@ -908,8 +952,7 @@ def _install_model_def_patch() -> None:
         error = _orig_validate(base_model_type, model_def, inputs)
         try:
             if _ARMED["json"] and is_minimax_h3_refmod_capable(base_model_type):
-                cs = inputs.get("custom_settings")
-                attached = isinstance(cs, dict) and bool(cs.get(SETTING_GENERATE))
+                attached = bool(unpack_refmod_setting(inputs.get("custom_settings"))[0])
                 _log("task submission: RefMod selection " + ("attached to the task." if attached else
                      "NOT in the task's custom_settings -- generate() will re-apply the inline "
                      "panel's selection."))
@@ -1218,7 +1261,7 @@ def install_patches() -> Optional[str]:
         custom_settings = kwargs.get("custom_settings")
         custom_settings = custom_settings if isinstance(custom_settings, dict) else {}
 
-        extract_job = custom_settings.get(SETTING_EXTRACT)
+        state_from_task, extract_job = unpack_refmod_setting(custom_settings)
         if not extract_job:
             extract_job = _take_pending_extract()
             if extract_job:
@@ -1244,7 +1287,7 @@ def install_patches() -> Optional[str]:
         # sliding window, each of which is its own call) starts at phase 1.
         _reset_gen_state(self)
 
-        state_json = custom_settings.get(SETTING_GENERATE)
+        state_json = state_from_task
         _REFMODS_ACTIVE.update({"on": False, "logged": False})
         first_window = int(kwargs.get("window_no") or 1) <= 1
         setattr(self, "_h3_window_no", int(kwargs.get("window_no") or 1))
@@ -1350,9 +1393,11 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
                     stash = state.get(STASH_KEY)
                     existing = dict(result.get("custom_settings") or {})
                     if stash:
-                        existing[SETTING_GENERATE] = stash
+                        existing[SETTING_COMBINED] = pack_refmod_setting(state_json=stash)
+                        existing.pop(SETTING_GENERATE, None)   # legacy key, no longer declared
                         result["custom_settings"] = existing
-                    elif SETTING_GENERATE in existing:
+                    elif SETTING_COMBINED in existing or SETTING_GENERATE in existing:
+                        existing.pop(SETTING_COMBINED, None)
                         existing.pop(SETTING_GENERATE, None)
                         result["custom_settings"] = existing or None
         except Exception:
@@ -1410,10 +1455,12 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
                 stash = state.get(STASH_KEY)
                 existing = dict(settings.get("custom_settings") or {})
                 if stash:
-                    existing[SETTING_GENERATE] = stash
+                    existing[SETTING_COMBINED] = pack_refmod_setting(state_json=stash)
+                    existing.pop(SETTING_GENERATE, None)   # legacy key, no longer declared
                     settings = dict(settings)
                     settings["custom_settings"] = existing
-                elif SETTING_GENERATE in existing:
+                elif SETTING_COMBINED in existing or SETTING_GENERATE in existing:
+                    existing.pop(SETTING_COMBINED, None)
                     existing.pop(SETTING_GENERATE, None)
                     settings = dict(settings)
                     settings["custom_settings"] = existing or None

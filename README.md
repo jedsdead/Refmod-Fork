@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1.1** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.30.2-fork.1.2** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -27,9 +27,11 @@ what's different.
   panel's selection is now kept and re-applied when that happens, and Wan2GP's
   own form refreshes no longer wipe it. A **Clear armed RefMods** button
   replaces "pick nothing" as the way to turn mods off.
-- **Extract no longer renders a video by mistake.** The same dropped setting
-  could turn an extraction into an ordinary generation; the job is now
-  re-applied the same way.
+- **Extract no longer renders a video by mistake.** Root cause: Wan2GP keeps
+  only the first 5 custom settings a model declares, Ref2VA declares 4, and
+  the plugin added 2 — so the extraction key was silently dropped and the
+  task ran as a normal render. Both payloads now share one setting, and the
+  job is also staged in memory as a backstop.
 - **Two-phase generation.** Phase 1 renders at half resolution, and live
   references are shrunk to match; mods weren't. They're now fitted to the
   phase-1 canvas — only ever shrunk, never enlarged — and single-phase runs
@@ -81,6 +83,11 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.30.2-fork.1.2** — root-cause fix for the plugin's settings being
+  dropped: both payloads now travel in a single `h3_refmod` custom setting.
+  Wan2GP keeps only the first 5 settings a model declares and Ref2VA already
+  declares 4, so the plugin's second setting was silently truncated — which
+  is why extraction could run as an ordinary render.
 - **0.30.2-fork.1.1** — audio mods are labelled `<Audio N>` in FL2VA, so the
   model is told what the reference audio is for; the staging log reports audio
   row counts.
