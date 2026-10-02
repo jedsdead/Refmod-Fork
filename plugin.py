@@ -511,9 +511,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}
             try:
                 from . import patches as _h3p
-                if rows:
-                    _h3p.set_armed_selection(json.dumps(payload))
-                    print(f"[H3RefMod] inline panel: {len(rows)} RefMod(s) armed")
+                _h3p.set_armed_selection(json.dumps(payload) if rows else None)
+                print(f"[H3RefMod] inline panel: {len(rows)} RefMod(s) armed"
+                      if rows else "[H3RefMod] inline panel: selection cleared")
             except Exception:
                 pass
             if not isinstance(state, dict):
@@ -522,12 +522,12 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 state[STASH_KEY] = json.dumps(payload)
                 msg = f"✅ {len(rows)} RefMod(s) armed for the next MiniMax H3 Ref2VA generation from this page."
             else:
-                # Do NOT drop the selection here: Wan2GP's own form refreshes
-                # fire these pickers with empty values, and treating that as a
-                # deselection is what made RefMods stop after window 1. Use the
-                # Clear button for a real deselection.
-                msg = ("*No RefMods picked right now. Any previously armed selection stays "
-                       "active -- press 'Clear armed RefMods' to drop it.*")
+                # Clearing the pickers clears the selection. (This used to hold
+                # on to the last selection, from when the task payload was
+                # being dropped and this was the only path that worked -- an
+                # empty panel then kept injecting mods into every generation.)
+                state.pop(STASH_KEY, None)
+                msg = "*No RefMods selected.*"
             return state, msg
 
         def clear_selection(state):

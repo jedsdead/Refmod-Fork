@@ -359,14 +359,18 @@ _ARMED = {"json": None}
 
 
 def set_armed_selection(state_json, force=False):
-    """Latching: a blank selection is ignored unless forced. Wan2GP rebuilds
-    and refreshes the generation form at various points (model switch, form
-    refresh, mid-generation updates), and that fires the panel's pickers with
-    empty values -- treating those as a deselection is what made RefMods stop
-    applying after the first sliding window. The panel's "Clear armed RefMods"
-    button passes force=True for a real deselection."""
-    if not state_json and not force:
-        return
+    """Remember the panel's selection as a fallback for a task that arrives
+    without its payload.
+
+    This used to LATCH -- a blank selection was ignored -- because Wan2GP's
+    form refreshes fire the pickers with empty values and would wipe it, and
+    at the time the fallback was the only thing making RefMods work at all.
+    That is no longer true: the payload is dropped only when the plugin's
+    custom setting doesn't fit Wan2GP's 5-setting limit, fixed by merging both
+    payloads into one key. Latching outlived its purpose and became a trap --
+    an empty panel kept injecting whatever was last selected, silently taking
+    reference slots from the generation's own references. Clearing the pickers
+    clears the selection again; `force` is kept for the explicit Clear button."""
     _ARMED["json"] = state_json or None
 
 
@@ -1341,8 +1345,11 @@ def install_patches() -> Optional[str]:
                 and not kwargs.get("refinement_mode"):
             state_json = _ARMED["json"]
             if first_window:
-                _log("this task reached generate() without its RefMod selection (Wan2GP dropped it "
-                     "between the form and the queue); using the selection armed in the inline panel.")
+                _log("NOTE: this task reached generate() without its RefMod selection, so the "
+                     "inline panel's current selection is being used instead. If you did not "
+                     "expect mods in this generation, clear the panel (or press 'Clear armed "
+                     "RefMods') -- an unexpected mod takes a reference slot from your own "
+                     "references.")
         if state_json and fl2va:
             if not kwargs.get("refinement_mode"):
                 try:
@@ -1967,6 +1974,19 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
          f"retention={retention:.2f} (~{total_tokens} tokens)")
+    # Exactly what the pipeline is being handed, so a reference that "went in"
+    # but had no effect can be told apart from one that never reached a slot.
+    filled = [name for name in ("input_frames", "input_frames2", "input_frames3",
+                                "audio_guide", "audio_guide2", "audio_guide3")
+              if kwargs.get(name) is not None]
+    _log(f"  slots filled: {', '.join(filled) or 'none'} | "
+         f"video_prompt_type={kwargs.get('video_prompt_type')!r} "
+         f"audio_prompt_type={kwargs.get('audio_prompt_type')!r} | "
+         f"hidden from the cap check: "
+         f"{sum(1 for s in image_sentinels + native_videos + native_audios if s.hide_ref)} "
+         f"of {len(image_sentinels) + len(native_videos) + len(native_audios)} | "
+         f"direct-injected: {len(state['overflow_visual'])} visual, "
+         f"{len(state['overflow_audio'])} audio")
     return kwargs
 
 

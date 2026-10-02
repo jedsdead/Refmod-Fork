@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1.5** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.30.2-fork.1.7** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -22,7 +22,12 @@ what's different.
 - **Mods apply on every sliding window**, matching how Wan2GP treats its own
   references. The original injected them into the first window only, so
   anything longer than one window lost them.
-- **Your mod selection is no longer lost before generation.** Wan2GP can drop
+- **Your mod selection is no longer lost before generation.** Root cause: Wan2GP
+  keeps only the first 5 custom settings a model declares and Ref2VA declares 4,
+  so the plugin's second setting was truncated away. Both payloads now share one
+  setting. An in-memory fallback remains as a backstop, used only when a task
+  genuinely arrives without its payload, and it follows the panel exactly —
+  clearing the pickers clears it. Wan2GP can drop
   the plugin's custom setting between the form and the queue. The inline
   panel's selection is now kept and re-applied when that happens, and Wan2GP's
   own form refreshes no longer wipe it. A **Clear armed RefMods** button
@@ -93,6 +98,13 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.30.2-fork.1.7** — clearing the pickers clears the selection again. It used
+  to be sticky (from when the task payload was being dropped), so an empty panel
+  kept injecting the last selection into every generation — taking reference
+  slots from the generation's own references and making them appear broken.
+- **0.30.2-fork.1.6** — the injection log now reports which reference slots
+  were filled and the final video/audio prompt-type flags, so a reference
+  that reached a slot can be told apart from one that didn't.
 - **0.30.2-fork.1.5** — fixes a crash when injecting a mod that carries a
   soundtrack (`_RefModAudioSentinel() takes 2 positional arguments but 3 were
   given`).
