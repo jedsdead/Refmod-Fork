@@ -214,34 +214,6 @@ class _RefModVideoSentinel:
         self.preview_latent = latent if preview_latent is None else preview_latent
         self.preview_key = preview_key
 
-    def __getitem__(self, index):
-        """Honour upstream's reference-video budget trim.
-
-        Newer Wan2GP shares a 15 s budget across reference videos and, when
-        several together run over it, trims each with video[:, :max_frames].
-        A RefMod has no pixels to trim, so trim the latent to the matching
-        length instead (4 pixel frames per latent frame on the VAE's causal
-        grid). Without this the sentinel isn't subscriptable and generation
-        fails as soon as the budget kicks in -- which three video mods make
-        much more likely."""
-        if (isinstance(index, tuple) and len(index) == 2 and index[0] == slice(None)
-                and isinstance(index[1], slice) and index[1].start in (None, 0)
-                and index[1].step in (None, 1) and index[1].stop is not None):
-            keep = max(1, (max(1, int(index[1].stop)) - 1) // 4 + 1)
-            if keep >= self.latent.shape[2]:
-                return self
-            same_length = self.preview_latent.shape[2] == self.latent.shape[2]
-            trimmed = _RefModVideoSentinel(
-                self.latent[:, :, :keep],
-                self.preview_latent[:, :, :keep] if same_length else self.preview_latent,
-                None if self.preview_key is None else tuple(self.preview_key) + ("trim", keep))
-            trimmed.hide_ref = self.hide_ref
-            trimmed.rescale_to = self.rescale_to
-            _log(f"reference-video budget: trimmed a video RefMod to {keep} of "
-                 f"{self.latent.shape[2]} latent frames to share Wan2GP's time budget")
-            return trimmed
-        raise TypeError(f"unsupported index on a RefMod video sentinel: {index!r}")
-
     @property
     def shape(self):
         t = self.latent.shape[2]
@@ -249,6 +221,41 @@ class _RefModVideoSentinel:
         h_px = self.latent.shape[3] * 16
         w_px = self.latent.shape[4] * 16
         return (3, t_px, h_px, w_px)
+
+    def __getitem__(self, key):
+        """Support the one slicing shape Wan2GP applies to reference videos:
+        ``video[:, :max_frames]``, used to share the 15s reference budget
+        between several reference videos (only when "-" is in
+        video_prompt_type). A RefMod carries a latent rather than pixels, so
+        the pixel-frame count is converted back to latent frames -- undoing
+        the video VAE's causal 4:1 temporal compression -- and a trimmed
+        sentinel is returned. Any other indexing is refused loudly rather
+        than silently returning something wrong."""
+        if (isinstance(key, tuple) and len(key) == 2 and key[0] == slice(None)
+                and isinstance(key[1], slice) and key[1].start in (None, 0) and key[1].step is None):
+            stop_px = key[1].stop
+            if stop_px is None:
+                return self
+            keep_t = max(1, (int(stop_px) - 1) // 4 + 1)
+            if keep_t >= self.latent.shape[2]:
+                return self
+            # Carry this fork's extra fields across the trim: the preview
+            # latent/key, the attached soundtrack and any phase-2 rescale
+            # target would otherwise be dropped, silently losing a mod's
+            # audio the moment the budget kicks in.
+            same_length = (self.preview_latent is not None
+                           and self.preview_latent.shape[2] == self.latent.shape[2])
+            trimmed = _RefModVideoSentinel(
+                self.latent[:, :, :keep_t],
+                self.preview_latent[:, :, :keep_t] if same_length else self.preview_latent,
+                None if self.preview_key is None else tuple(self.preview_key) + ("trim", keep_t),
+                audio_latent=self.audio_latent)
+            trimmed.hide_ref = self.hide_ref
+            trimmed.rescale_to = self.rescale_to
+            _log(f"reference-video budget: trimmed a video RefMod to {keep_t} of "
+                 f"{self.latent.shape[2]} latent frames to share Wan2GP's time budget")
+            return trimmed
+        raise TypeError(f"_RefModVideoSentinel supports only [:, :n] slicing, got {key!r}")
 
 
 class _RefModAudioSentinel:
@@ -280,6 +287,13 @@ def _log(msg: str) -> None:
     print(f"[H3RefMod] {msg}")
 
 
+# Which reference kwargs this Wan2GP build's generate() actually accepts.
+# Older builds expose two native reference-video slots (input_frames,
+# input_frames2) and two audio ones (audio_guide, audio_guide2); newer ones
+# add a third of each (input_frames3 / "*", audio_guide3 / "D"). Filled in by
+# install_patches() so injection uses whatever exists and falls back to
+# direct injection for the rest.
+_generate_params = set()
 # Wan2GP passes native image refs / reference videos to *every* sliding window
 # (src_ref_images is set once in window 1 and reused for the rest), so RefMods
 # must be injected in every window too.
@@ -723,29 +737,7 @@ _STATE_ATTR = "_h3refmod_gen_state"
 # computed at runtime, an unbounded reference loop, and free-running
 # <Picture N> labels, and the ComfyUI community verified 15 image refs
 # working. RefMods are kept out of this check -- live references are not.
-_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 2, 2
-
-# Newer Wan2GP builds added a third reference-video slot (input_frames3, read
-# when "*" is in video_prompt_type) and a third audio slot (audio_guide3, read
-# when "D" is in audio_prompt_type), and raised the inline cap to 12/9/3/3.
-# Detected from generate()'s signature at install time, so the plugin uses the
-# third slots where they exist and still runs unchanged on older builds.
-_THIRD_SLOTS = False
-
-
-def _detect_third_slots(Pipeline) -> None:
-    global _THIRD_SLOTS, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO
-    try:
-        import inspect
-        params = inspect.signature(Pipeline.generate).parameters
-        _THIRD_SLOTS = "input_frames3" in params and "audio_guide3" in params
-    except Exception:
-        _THIRD_SLOTS = False
-    if _THIRD_SLOTS:
-        _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 3, 3
-    _log(f"Wan2GP reference slots: {_NATIVE_CAP_VIDEO} video / {_NATIVE_CAP_AUDIO} audio"
-         f"{' (third slots detected)' if _THIRD_SLOTS else ''}")
-
+_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 3, 3
 
 def _reset_gen_state(pipeline_self) -> dict:
     """Fresh per-generate() bookkeeping. Called at the top of every
@@ -1025,8 +1017,16 @@ def install_patches() -> Optional[str]:
     _orig_add_video_reference = Pipeline._add_video_reference
     _orig_add_audio_reference = getattr(Pipeline, "_add_audio_reference", None)
     _orig_load_audio_reference = getattr(Pipeline, "_load_audio_reference", None)
-    _detect_third_slots(Pipeline)
     _orig_generate = Pipeline.generate
+    try:
+        import inspect as _inspect
+        _generate_params.clear()
+        _generate_params.update(_inspect.signature(_orig_generate).parameters)
+    except Exception:
+        pass
+    _log(f"Wan2GP reference slots: "
+         f"{3 if 'input_frames3' in _generate_params else 2} video / "
+         f"{3 if 'audio_guide3' in _generate_params else 2} audio")
     _orig_as_video = getattr(h3_pipeline, "_as_video", None)
 
     @functools.wraps(_orig_add_image_reference)
@@ -1861,12 +1861,10 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     live_img = len(kwargs.get("input_ref_images") or [])
     live_vid = ((kwargs.get("input_frames") is not None and "V" in video_prompt_type)
                 + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type)
-                + (_THIRD_SLOTS and kwargs.get("input_frames3") is not None
-                   and "*" in video_prompt_type))
+                + (kwargs.get("input_frames3") is not None and "*" in video_prompt_type))
     live_aud = ((kwargs.get("audio_guide") is not None and "A" in audio_prompt_type)
                 + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type)
-                + (_THIRD_SLOTS and kwargs.get("audio_guide3") is not None
-                   and "D" in audio_prompt_type))
+                + (kwargs.get("audio_guide3") is not None and "D" in audio_prompt_type))
 
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
@@ -1888,18 +1886,20 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 video_prompt_type += "V"
             if "+" not in video_prompt_type:
                 video_prompt_type += "+"
-        if _THIRD_SLOTS and remaining and kwargs.get("input_frames3") is None:
-            # Third native slot: goes through _add_video_reference like the
-            # first two, so it gets its <Video N> label and its natural place
-            # in the reference order -- the overflow path gives it neither.
+        # Newer Wan2GP builds expose a third native reference-video slot
+        # (input_frames3, enabled by "*"). Use it when it exists, so a third
+        # video RefMod travels the native path -- including through the
+        # phase-2 refinement pass, which re-reads video_sources -- instead of
+        # being appended directly.
+        if remaining and "input_frames3" in _generate_params and kwargs.get("input_frames3") is None:
             kwargs["input_frames3"] = remaining.pop(0)
             native_videos.append(kwargs["input_frames3"])
             if "V" not in video_prompt_type:
                 video_prompt_type += "V"
             if "*" not in video_prompt_type:
                 video_prompt_type += "*"
-        # Anything past the native video kwargs is added straight into
-        # refs/visual_latents after the cap check instead.
+        # Wan2GP's generate() only reads two video kwargs; the rest are added
+        # straight into refs/visual_latents after the cap check instead.
         for sentinel in remaining:
             latent = sentinel.latent
             state["overflow_visual"].append((latent, {
@@ -1932,7 +1932,8 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 native_audios.append(kwargs["audio_guide2"])
                 if "B" not in audio_prompt_type:
                     audio_prompt_type += "B"
-            if _THIRD_SLOTS and remaining_audio and kwargs.get("audio_guide3") is None:
+            # Third native audio slot on newer builds (audio_guide3, flag "D").
+            if remaining_audio and "audio_guide3" in _generate_params and kwargs.get("audio_guide3") is None:
                 kwargs["audio_guide3"] = remaining_audio.pop(0)
                 native_audios.append(kwargs["audio_guide3"])
                 if "D" not in audio_prompt_type:

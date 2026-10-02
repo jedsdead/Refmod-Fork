@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1.8** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.2** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -66,8 +66,21 @@ what's different.
   extraction time, or from the Library tab's
   **Soundtrack** section for mods you already built. The extra audio counts
   toward the mod's token total (2 tokens per audio latent, ~80 per second).
-- **Three reference-video and three audio slots** on Wan2GP builds that have
-  them, detected automatically at startup. Older builds keep two.
+
+### Stacked still images: one reference per image
+
+A mod extracted from several stills becomes one image reference *per still*, so
+a 3-image mod gets `<Picture 1>`, `<Picture 2>` and `<Picture 3>` and uses three
+of the nine image slots. That is the original port's deliberate design, and this
+fork keeps it. MiniMax H3's packer gives every "image" reference a single-frame
+position grid, so a multi-frame image reference either fails outright or leaves
+every frame at the same position, indistinguishable to the model.
+
+ComfyUI behaves differently — there a refmod is one latent block with one tag —
+so prompts written for ComfyUI need adjusting. To refer to a stacked mod, name
+its pictures together: `<Subject 1> is the man in <Picture 1>, <Picture 2> and
+<Picture 3>.` Video mods are already a single `<Video N>`, because the packer's
+video branch is built for multi-frame references.
 
 ### Quality of life
 
@@ -97,6 +110,16 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 | `DISABLE_SOL_WITH_REFMODS` | `False` | Fall back from Sol-Attn to normal attention when mods are in use. |
 
 ### Release history
+
+- **0.31.0-fork.2** — rebased onto the original port's 0.31.0. Two things this
+  fork had added independently are now upstream and the upstream versions are
+  used instead: the third reference-video/audio slots (detected from
+  `generate()`'s signature) and the reference-video budget trim on a video mod.
+  The trim is extended to carry this fork's extra fields, so a trimmed mod keeps
+  its attached soundtrack. Stacked still images keep upstream's behaviour of one
+  image reference per still (see below).
+
+Releases below were based on the original port's 0.30.2.
 
 - **0.30.2-fork.1.8** — the extractor form accepts audio together with image or
   video sources. The backend had supported it since fork.1.3, but a leftover
@@ -722,6 +745,22 @@ load time:
    when a live audio clip relies on RefMod visuals. Video/audio RefMods
    beyond Wan2GP's two native kwargs each are added directly, in both
    phases. Live (non-RefMod) references are still counted normally.
+
+15. Newer Wan2GP builds expose a **third** native reference-video slot
+   (`input_frames3`, flag `*`) and a third audio one (`audio_guide3`, flag
+   `D`), and raised their own caps to 9 images / 3 videos / 3 audio. The
+   plugin detects which of these kwargs `generate()` actually accepts and
+   fills them before falling back to direct injection, so it works on
+   builds with either two or three native slots.
+16. Those builds also share a 15-second budget between reference videos by
+   trimming them (`video[:, :max_frames]`, when `-` is in
+   `video_prompt_type` -- a flag older settings get migrated to
+   automatically). A RefMod carries a latent, not pixels, so the video
+   sentinel implements that one slicing form: the pixel-frame count is
+   converted back to latent frames (undoing the causal 4:1 temporal
+   compression) and a trimmed sentinel is returned. Without it, two or more
+   long video RefMods raise "'_RefModVideoSentinel' object is not
+   subscriptable".
 
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
