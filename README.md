@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.30.2-fork.1.4** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.30.2-fork.1.5** · based on the original port's 0.30.2 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -93,6 +93,9 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.30.2-fork.1.5** — fixes a crash when injecting a mod that carries a
+  soundtrack (`_RefModAudioSentinel() takes 2 positional arguments but 3 were
+  given`).
 - **0.30.2-fork.1.4** — a mod's attached soundtrack is injected as its own
   `<Audio N>` reference (the trained voice-reuse path in Ref2VA) rather than
   merged into the visual reference as H3's `video_audio` kind, which says the

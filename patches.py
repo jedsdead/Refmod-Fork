@@ -1682,7 +1682,7 @@ def _build_refmod_sentinels(state_json: str):
         # that label is what a prompt refers to for voice reuse.
         if (mod.kind in ("image", "video") and mod.audio_latent is not None
                 and ATTACHED_AUDIO_AS_SEPARATE_REF):
-            audio_sentinels.append(_RefModAudioSentinel(mod.audio_latent, mod.description))
+            audio_sentinels.append(_RefModAudioSentinel(mod.audio_latent))
             _log(f"{mod.kind} RefMod '{mod.name}' carries a soundtrack "
                  f"({mod.audio_latent.shape[-1]} audio latents, "
                  f"~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s) -- injected as "
