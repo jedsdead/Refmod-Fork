@@ -31,6 +31,7 @@ missing, even ones this panel doesn't have a dedicated widget for.
 from __future__ import annotations
 
 import json
+import os
 
 import gradio as gr
 
@@ -56,6 +57,11 @@ PlugIn_Id = "H3RefMods"
 IMAGE_ROWS = 20
 VIDEO_ROWS = 6
 AUDIO_ROWS = 4
+try:
+    from gradio_rangeslider import RangeSlider          # shipped with Wan2GP
+except Exception:                                        # pragma: no cover
+    RangeSlider = None
+
 NONE_CHOICE = "(none)"
 
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
@@ -243,6 +249,13 @@ def _source_file_count(meta, which):
         if m:
             return int(m.group(1) if which == "img" else m.group(2))
     return 1
+
+
+def _trim_summary(trims, names):
+    if not trims:
+        return "*No trims set - every video is used from its start.*"
+    parts = [f"`{n}` {trims[n][0]:g}-{trims[n][1]:g}s" for n in names if n in trims]
+    return "Trimmed: " + ", ".join(parts) if parts else ""
 
 
 def _format_ref_counter(row_pairs):
@@ -658,6 +671,25 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Row():
             ref_images = gr.Files(label="Reference image(s)", file_types=["image"], file_count="multiple")
             ref_videos = gr.Files(label="Reference video(s)", file_types=["video"], file_count="multiple")
+        with gr.Accordion("Preview / trim reference videos", open=False):
+            gr.Markdown("Pick an uploaded video to watch it, and trim the span this mod is built "
+                        "from. Trims are per video and remembered while the page stays open; "
+                        "untrimmed videos are used from their start as before. A trim also "
+                        "limits the soundtrack taken by *Use the clip's own audio*.")
+            with gr.Row():
+                video_pick = gr.Dropdown(label="Video", choices=[], value=None, scale=2)
+                video_duration = gr.Markdown("")
+            video_preview = gr.Video(label="Preview", height=260)
+            if RangeSlider is not None:
+                video_trim = RangeSlider(minimum=0.0, maximum=15.0, value=(0.0, 15.0), step=0.1,
+                                         label="Trim (seconds)", info="Start - End")
+            else:
+                video_trim = gr.Slider(0.0, 15.0, value=0.0, step=0.1,
+                                       label="Trim start (seconds)",
+                                       info="gradio_rangeslider isn't installed, so only a start "
+                                            "offset is available here.")
+            trim_state = gr.State({})
+            trim_status = gr.Markdown("")
         gr.Markdown("*Add as many reference images and videos as you like -- every one is encoded "
                    "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
                    "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
@@ -755,9 +787,51 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             w.change(fn=update_audio_duration_warning, inputs=[ref_audio, latent_frames],
                     outputs=[audio_duration_warning], queue=False)
 
+        def on_videos_uploaded(paths, trims):
+            """Populate the picker when files are uploaded and select the first."""
+            paths = [p for p in (paths or []) if p]
+            names = [os.path.basename(str(p)) for p in paths]
+            trims = {k: v for k, v in (trims or {}).items() if k in names}   # forget removed files
+            if not names:
+                return (gr.update(choices=[], value=None), None, "", trims, "")
+            first_path, first_name = str(paths[0]), names[0]
+            seconds = storage.video_duration_seconds(first_path) or 15.0
+            start, end = trims.get(first_name, (0.0, seconds))
+            return (gr.update(choices=names, value=first_name), first_path,
+                    f"**{seconds:.2f}s**", trims,
+                    _trim_summary(trims, names))
+
+        def on_video_picked(selected, paths, trims):
+            paths = [p for p in (paths or []) if p]
+            lookup = {os.path.basename(str(p)): str(p) for p in paths}
+            path = lookup.get(selected)
+            if path is None:
+                return None, "", gr.update()
+            seconds = storage.video_duration_seconds(path) or 15.0
+            start, end = (trims or {}).get(selected, (0.0, seconds))
+            value = (float(start), float(min(end, seconds))) if RangeSlider is not None else float(start)
+            return path, f"**{seconds:.2f}s**", gr.update(maximum=round(seconds, 2), value=value)
+
+        def on_trim_changed(value, selected, paths, trims):
+            if not selected:
+                return trims or {}, ""
+            trims = dict(trims or {})
+            lookup = {os.path.basename(str(p)): str(p) for p in (paths or []) if p}
+            seconds = storage.video_duration_seconds(lookup.get(selected, "")) or 0.0
+            if RangeSlider is not None and isinstance(value, (tuple, list)) and len(value) == 2:
+                start, end = float(value[0]), float(value[1])
+            else:                                  # start-only fallback
+                start, end = float(value or 0.0), seconds
+            if start <= 0.0 and (not seconds or end >= seconds - 0.05):
+                trims.pop(selected, None)          # whole clip -> no trim recorded
+            else:
+                trims[selected] = (round(start, 2), round(end, 2))
+            return trims, _trim_summary(trims, list(lookup))
+
         def do_extract(model_type, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                        remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                       identity, multiplier, max_tokens, use_clip_audio, description, save):
+                       identity, multiplier, max_tokens, use_clip_audio, description, save,
+                       trims=None):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
@@ -773,6 +847,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "latent_frames": seconds_to_latent_frames(latent_frames), "identity": int(identity),
                 "multiplier": int(multiplier), "max_tokens": int(max_tokens),
                 "use_clip_audio": bool(use_clip_audio),
+                "video_trims": {k: list(v) for k, v in (trims or {}).items()},
                 "description": description or "", "save": bool(save),
             }
             log = {"lines": []}
@@ -808,11 +883,19 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                   "Task finished, but no confirmation line was captured -- check the terminal log.")
             return (tail + ("\n" if tail else "") + ok) if tail else ok
 
+        ref_videos.change(fn=on_videos_uploaded, inputs=[ref_videos, trim_state],
+                          outputs=[video_pick, video_preview, video_duration, trim_state,
+                                   trim_status], queue=False)
+        video_pick.change(fn=on_video_picked, inputs=[video_pick, ref_videos, trim_state],
+                          outputs=[video_preview, video_duration, video_trim], queue=False)
+        video_trim.change(fn=on_trim_changed, inputs=[video_trim, video_pick, ref_videos, trim_state],
+                          outputs=[trim_state, trim_status], queue=False)
+
         extract_btn.click(
             fn=do_extract,
             inputs=[model_dd, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                    remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                   identity, multiplier, max_tokens, use_clip_audio, description, save],
+                   identity, multiplier, max_tokens, use_clip_audio, description, save, trim_state],
             outputs=[extract_status],
             queue=False,
         )

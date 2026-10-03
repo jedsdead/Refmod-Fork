@@ -304,22 +304,64 @@ def gradio_image_to_cthw(value) -> Optional[torch.Tensor]:
     raise ValueError(f"Unsupported image input type: {type(value)!r}")
 
 
-def load_video_cthw(path: str, max_frames: int = 240) -> torch.Tensor:
+def video_duration_seconds(path: str) -> float:
+    """A video's duration in seconds, 0.0 if it can't be determined. Used to
+    size the trim control when a file is uploaded."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        total = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        cap.release()
+        if fps > 0 and total > 0:
+            return round(total / fps, 2)
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", path], capture_output=True, text=True, timeout=30)
+        return round(float((out.stdout or "0").strip() or 0.0), 2)
+    except Exception:
+        return 0.0
+
+
+def load_video_cthw(path: str, max_frames: int = 240, start_seconds: float = 0.0,
+                    duration_seconds: Optional[float] = None) -> torch.Tensor:
     """Load a video file -> [C, T, H, W] float32 in [-1, 1]. Uses opencv if
-    available, else imageio (same fallback chain as the ComfyUI RefMod pack)."""
+    available, else imageio (same fallback chain as the ComfyUI RefMod pack).
+
+    start_seconds / duration_seconds trim the clip before any frame picking,
+    so a mod can be built from a chosen span of a longer video rather than
+    always from its beginning."""
     frames = None
+    first = 0
+    last = None
     try:
         import cv2
         cap = cv2.VideoCapture(path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps > 0 and (start_seconds or duration_seconds):
+            first = max(0, int(round(float(start_seconds or 0.0) * fps)))
+            if duration_seconds:
+                last = first + max(1, int(round(float(duration_seconds) * fps)))
+            if total:
+                first = min(first, max(0, total - 1))
+                last = min(last, total) if last is not None else None
+        window = (last if last is not None else (total or 0)) - first
         targets = None
-        if total > max_frames:
-            targets = set(np.linspace(0, total - 1, max_frames).round().astype(int).tolist())
+        if window > max_frames > 0:
+            targets = set((np.linspace(0, window - 1, max_frames).round().astype(int)
+                           + first).tolist())
         out, idx = [], 0
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+            if idx < first or (last is not None and idx >= last):
+                idx += 1
+                continue
             if targets is not None and idx not in targets:
                 idx += 1
                 continue
@@ -335,9 +377,21 @@ def load_video_cthw(path: str, max_frames: int = 240) -> torch.Tensor:
         try:
             import imageio.v2 as imageio
             reader = imageio.get_reader(path)
+            fps = 0.0
+            try:
+                fps = float(reader.get_meta_data().get("fps") or 0.0)
+            except Exception:
+                fps = 0.0
+            skip = int(round(float(start_seconds or 0.0) * fps)) if fps > 0 else 0
+            take = (int(round(float(duration_seconds) * fps))
+                    if (duration_seconds and fps > 0) else None)
             out = []
             for i, frame in enumerate(reader):
-                if max_frames and i >= max_frames:
+                if i < skip:
+                    continue
+                if take is not None and len(out) >= take:
+                    break
+                if max_frames and len(out) >= max_frames:
                     break
                 out.append(np.asarray(frame)[..., :3])
             reader.close()
@@ -405,7 +459,8 @@ def video_has_audio(path: str) -> bool:
         return False
 
 
-def extract_audio_from_video(path: str, max_seconds: Optional[float] = None) -> Optional[torch.Tensor]:
+def extract_audio_from_video(path: str, max_seconds: Optional[float] = None,
+                             start_seconds: float = 0.0) -> Optional[torch.Tensor]:
     """A video file's own soundtrack -> the same [1, 2, samples] 32kHz tensor
     load_audio_waveform returns, or None when the file has no audio.
 
@@ -413,10 +468,11 @@ def extract_audio_from_video(path: str, max_seconds: Optional[float] = None) -> 
     ffmpeg decodes the audio stream to a temporary wav. Either way the result
     goes through load_audio_waveform so resampling and channel handling stay
     identical to every other audio path."""
-    try:
-        return load_audio_waveform(path, max_seconds)
-    except Exception:
-        pass
+    if not start_seconds:
+        try:
+            return load_audio_waveform(path, max_seconds)
+        except Exception:
+            pass
     import os
     import subprocess
     import tempfile
@@ -424,8 +480,11 @@ def extract_audio_from_video(path: str, max_seconds: Optional[float] = None) -> 
     try:
         handle, temp_wav = tempfile.mkstemp(suffix=".wav")
         os.close(handle)
-        command = ["ffmpeg", "-y", "-v", "error", "-i", path, "-vn",
-                   "-acodec", "pcm_s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "2"]
+        command = ["ffmpeg", "-y", "-v", "error"]
+        if start_seconds:
+            command += ["-ss", f"{float(start_seconds):.3f}"]
+        command += ["-i", path, "-vn",
+                    "-acodec", "pcm_s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "2"]
         if max_seconds:
             command += ["-t", f"{float(max_seconds):.3f}"]
         command.append(temp_wav)

@@ -2232,7 +2232,15 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             img = storage.remove_background_from_image(img, session=rembg_session)
         sources.append((storage.pil_to_cthw(img), False))
     for vp in video_paths:
-        video = storage.load_video_cthw(vp, max_frames=max(64, latent_frames * 8))
+        # Per-video trim chosen in the extractor's preview, keyed by file name.
+        trim = (spec.get("video_trims") or {}).get(os.path.basename(str(vp)))
+        start_s = float(trim[0]) if trim else 0.0
+        dur_s = max(0.1, float(trim[1]) - float(trim[0])) if trim else None
+        if trim:
+            status(f"H3 RefMod: using {start_s:g}-{float(trim[1]):g}s of "
+                   f"{os.path.basename(str(vp))}")
+        video = storage.load_video_cthw(vp, max_frames=max(64, latent_frames * 8),
+                                        start_seconds=start_s, duration_seconds=dur_s)
         # Take a CONTIGUOUS prefix matching the requested duration, for both modes -- not a
         # sparse sample spread across the whole clip. The old encode-mode behavior picked
         # `latent_frames` frames evenly spaced across the *entire* source video, then handed
@@ -2332,7 +2340,10 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
                           / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
         status(f"H3 RefMod: encoding the attached soundtrack (up to ~{target_seconds:.1f}s, "
                f"matching this mod's visual duration)")
-        waveform = storage.extract_audio_from_video(audio_path, max_seconds=max(0.5, target_seconds))
+        clip_trim = (spec.get("video_trims") or {}).get(os.path.basename(str(audio_path)))
+        waveform = storage.extract_audio_from_video(
+            audio_path, max_seconds=max(0.5, target_seconds),
+            start_seconds=float(clip_trim[0]) if clip_trim else 0.0)
         if waveform is None:
             raise ValueError(f"No audio could be read from {os.path.basename(audio_path)}.")
         audio_latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)

@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.3** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.4** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -84,6 +84,10 @@ video branch is built for multi-frame references.
 
 ### Quality of life
 
+- Reference videos have a preview and a trim range in the extractor. With one
+  video uploaded it is selected automatically; with several, a picker chooses
+  which to preview. A trim limits both the frames encoded and the audio taken
+  from that clip, and leaving the range at the full span records no trim.
 - Image, video and audio pickers sit in collapsible accordions, in both the
   inline panel and the plugin's own tab.
 - Delete mods by picking them from a list (several at once if you like), with
@@ -111,6 +115,10 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.4** — reference videos can be previewed and trimmed in the
+  extractor: pick an uploaded clip to watch it, and set the span the mod is
+  built from. Trims are per video, and also limit the soundtrack taken by
+  *Use the clip's own audio*.
 - **0.31.0-fork.3** — **Use the clip's own audio** when extracting a video mod:
   one clip of someone talking gives the mod both the look and the voice. The
   Library's Soundtrack section now accepts a video file too, so an existing mod
