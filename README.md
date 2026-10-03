@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.6** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.7** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -119,6 +119,10 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.7** — fixes `"Value: X is not in the list of choices"` after
+  moving, renaming or deleting a mod that was selected in the Library tab: the
+  pickers kept a value that no longer existed. Every picker now drops a stale
+  selection and keeps one that survived.
 - **0.31.0-fork.6** — folders can be created, filled and removed from the
   Library tab: make a folder (nested with `/`), select any number of mods and
   move them into it or back to the top level, and delete folders once empty.

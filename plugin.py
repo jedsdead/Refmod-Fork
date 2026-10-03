@@ -186,7 +186,7 @@ def _refresh_mod_dropdown_updates(folder=ALL_FOLDERS_CHOICE, *current_values):
             choices = choices + [current]
         return gr.update(choices=choices, value=current if current else NONE_CHOICE)
 
-    updates = [gr.update(choices=_folder_choices(), value=folder)]
+    updates = [_safe_choice_update(_folder_choices(), folder)]
     i = 0
     for _ in range(IMAGE_ROWS):
         updates.append(row_update("image", i)); i += 1
@@ -250,6 +250,18 @@ def _source_file_count(meta, which):
         if m:
             return int(m.group(1) if which == "img" else m.group(2))
     return 1
+
+
+def _safe_choice_update(choices, keep=None):
+    """gr.update for a single-select dropdown whose options just changed.
+
+    Gradio raises "Value: X is not in the list of choices" the next time a
+    dropdown is read if its value no longer appears in its choices -- which
+    happens whenever a mod is moved, renamed or deleted while it is selected.
+    Keeping the value only when it survived avoids that.
+    """
+    choices = list(choices or [])
+    return gr.update(choices=choices, value=keep if keep in choices else None)
 
 
 def _trim_summary(trims, names):
@@ -1059,13 +1071,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             folders = storage.list_mod_folders()
             names = _library_mod_names(folder)
             return (_library_rows(folder),
-                    gr.update(choices=_folder_choices(), value=folder),
-                    gr.update(choices=[ROOT_FOLDER_CHOICE] + folders),
+                    _safe_choice_update(_folder_choices(), folder),
+                    _safe_choice_update([ROOT_FOLDER_CHOICE] + folders, ROOT_FOLDER_CHOICE),
                     gr.update(choices=folders, value=None),
                     gr.update(choices=names, value=[]),
                     gr.update(choices=names, value=[]),
                     gr.update(choices=names, value=[]),
-                    gr.update(choices=_names_keeping(folder, None)),
+                    _safe_choice_update(_names_keeping(folder, None)),
                     message)
 
         def do_create_folder(name, folder):
@@ -1100,8 +1112,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         def do_refresh(folder, current):
             return (_library_rows(folder),
-                    gr.update(choices=_folder_choices(), value=folder),
-                    gr.update(choices=_names_keeping(folder, current), value=current or None),
+                    _safe_choice_update(_folder_choices(), folder),
+                    _safe_choice_update(_names_keeping(folder, current), current),
                     gr.update(choices=_library_mod_names(folder), value=[]),
                     gr.update(choices=_library_mod_names(folder), value=[]))
 
@@ -1138,7 +1150,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 parts.append("Not found: " + ", ".join(f"'{n}'" for n in missing) + ".")
             return (_library_rows(folder),
                     gr.update(choices=remaining, value=[]),          # delete picker
-                    gr.update(choices=remaining),                    # edit picker
+                    _safe_choice_update(remaining),                  # edit picker
                     gr.update(value=False),                          # re-arm the confirmation
                     " ".join(parts))
 
@@ -1151,7 +1163,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             msg = (f"Checked {checked} mod(s), fixed {fixed}." if fixed else
                   f"Checked {checked} mod(s), all already correctly classified.")
             names = _library_mod_names(folder)
-            return (_library_rows(folder), gr.update(choices=names),
+            return (_library_rows(folder), _safe_choice_update(names),
                     gr.update(choices=names, value=[]), msg)
 
         fix_btn.click(fn=do_fix, inputs=[library_folder_dd],
@@ -1183,7 +1195,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                         f"Could not save: {e!r}")
             msg = f"Saved as '{final_name}'." if final_name != old_name else "Saved."
             names = _library_mod_names(folder)
-            return (_library_rows(folder), gr.update(choices=_folder_choices()),
+            return (_library_rows(folder), _safe_choice_update(_folder_choices(), folder),
                     gr.update(choices=names, value=final_name if final_name in names else None),
                     gr.update(choices=names, value=[]), msg)
 
