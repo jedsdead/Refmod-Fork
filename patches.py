@@ -2119,7 +2119,15 @@ def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
 
     latent = None
     if not remove:
-        waveform = storage.load_audio_waveform(audio_path, max_seconds=max(0.5, seconds or 4.0))
+        # Accepts a video file as well as an audio one: its soundtrack is
+        # pulled out first, so an existing mod can be given the voice from the
+        # very clip it was built from -- provided you still have that file,
+        # since a mod records no source paths.
+        waveform = storage.extract_audio_from_video(audio_path, max_seconds=max(0.5, seconds or 4.0))
+        if waveform is None:
+            status(f"Attach audio: no audio track could be read from "
+                   f"{os.path.basename(str(audio_path))}.")
+            return
         latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
         if latent.dim() != 4 or latent.shape[1] != 32 or latent.shape[2] != 2:
             raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(latent.shape)}.")
@@ -2306,12 +2314,27 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     # can be stored side by side and injected as one reference: H3 tags a
     # reference video carrying audio "video_audio" and gives it audio rows.
     audio_latent = None
+    # "Use the clip's own audio": take the soundtrack from the first video
+    # source, so one clip of someone talking yields both the look and the
+    # voice. A separately chosen audio file always wins if both are given.
+    if not audio_path and spec.get("use_clip_audio") and video_paths:
+        for candidate in video_paths:
+            if storage.video_has_audio(candidate):
+                audio_path = candidate
+                status(f"H3 RefMod: using the clip's own audio from "
+                       f"{os.path.basename(candidate)}")
+                break
+        else:
+            status("H3 RefMod: 'use the clip's own audio' was set, but no video source has "
+                   "an audio track -- extracting without a soundtrack")
     if audio_path:
         target_seconds = (((total_t - 1) * 4 + 1 if total_t > 1 else 1)
                           / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
         status(f"H3 RefMod: encoding the attached soundtrack (up to ~{target_seconds:.1f}s, "
                f"matching this mod's visual duration)")
-        waveform = storage.load_audio_waveform(audio_path, max_seconds=max(0.5, target_seconds))
+        waveform = storage.extract_audio_from_video(audio_path, max_seconds=max(0.5, target_seconds))
+        if waveform is None:
+            raise ValueError(f"No audio could be read from {os.path.basename(audio_path)}.")
         audio_latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
         if audio_latent.dim() != 4 or audio_latent.shape[1] != 32 or audio_latent.shape[2] != 2:
             raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(audio_latent.shape)}.")

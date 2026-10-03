@@ -662,6 +662,12 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                    "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
                    "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
         ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath")
+        use_clip_audio = gr.Checkbox(False, label="Use the clip's own audio",
+                                     info="Take the soundtrack from the first reference video "
+                                          "that has one, so a single clip of someone talking "
+                                          "gives this mod both the look and the voice. Ignored "
+                                          "if you choose an audio file above, or if no video "
+                                          "source has an audio track.")
         gr.Markdown("*Audio on its own makes an audio-only mod. Audio **together with** images "
                    "or video gives that mod a soundtrack as well as a look: the two latents are "
                    "stored side by side (they can't be stacked -- their shapes differ) and the "
@@ -751,7 +757,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         def do_extract(model_type, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                        remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                       identity, multiplier, max_tokens, description, save):
+                       identity, multiplier, max_tokens, use_clip_audio, description, save):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
@@ -766,6 +772,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "ref_resolution": int(ref_resolution), "pool_h": int(pool_h), "pool_w": int(pool_w),
                 "latent_frames": seconds_to_latent_frames(latent_frames), "identity": int(identity),
                 "multiplier": int(multiplier), "max_tokens": int(max_tokens),
+                "use_clip_audio": bool(use_clip_audio),
                 "description": description or "", "save": bool(save),
             }
             log = {"lines": []}
@@ -805,7 +812,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             fn=do_extract,
             inputs=[model_dd, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                    remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                   identity, multiplier, max_tokens, description, save],
+                   identity, multiplier, max_tokens, use_clip_audio, description, save],
             outputs=[extract_status],
             queue=False,
         )
@@ -854,7 +861,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                           info="Pick one or more image/video mods.")
             attach_btn = gr.Button("Apply soundtrack", variant="primary")
         with gr.Row():
-            audio_file = gr.Audio(label="Audio file", type="filepath", scale=2)
+            audio_file = gr.File(label="Audio or video file (a video's soundtrack is used)",
+                                 file_types=["audio", "video"], type="filepath", scale=2)
             audio_seconds = gr.Slider(0.5, 15.0, value=4.0, step=0.5,
                                       label="Seconds to use", scale=1)
             audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")

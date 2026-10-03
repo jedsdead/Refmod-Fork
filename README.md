@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.2** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.3** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -111,6 +111,11 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.3** — **Use the clip's own audio** when extracting a video mod:
+  one clip of someone talking gives the mod both the look and the voice. The
+  Library's Soundtrack section now accepts a video file too, so an existing mod
+  can be given the voice from the clip it was built from — if you still have
+  that file, since a mod records no source paths.
 - **0.31.0-fork.2** — rebased onto the original port's 0.31.0. Two things this
   fork had added independently are now upstream and the upstream versions are
   used instead: the third reference-video/audio slots (detected from

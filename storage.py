@@ -386,6 +386,63 @@ def ensure_min_size(video: torch.Tensor, min_edge: int = 32) -> torch.Tensor:
 AUDIO_SAMPLE_RATE = 32000  # MiniMax H3's own audio VAE sample rate (models/minimax_h3/pipeline.py)
 
 
+def video_has_audio(path: str) -> bool:
+    """True if a container looks like it carries an audio stream."""
+    try:
+        import soundfile as sf
+        with sf.SoundFile(path):
+            return True
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30)
+        return "audio" in (out.stdout or "")
+    except Exception:
+        return False
+
+
+def extract_audio_from_video(path: str, max_seconds: Optional[float] = None) -> Optional[torch.Tensor]:
+    """A video file's own soundtrack -> the same [1, 2, samples] 32kHz tensor
+    load_audio_waveform returns, or None when the file has no audio.
+
+    soundfile reads a container directly when the build supports it; otherwise
+    ffmpeg decodes the audio stream to a temporary wav. Either way the result
+    goes through load_audio_waveform so resampling and channel handling stay
+    identical to every other audio path."""
+    try:
+        return load_audio_waveform(path, max_seconds)
+    except Exception:
+        pass
+    import os
+    import subprocess
+    import tempfile
+    temp_wav = None
+    try:
+        handle, temp_wav = tempfile.mkstemp(suffix=".wav")
+        os.close(handle)
+        command = ["ffmpeg", "-y", "-v", "error", "-i", path, "-vn",
+                   "-acodec", "pcm_s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "2"]
+        if max_seconds:
+            command += ["-t", f"{float(max_seconds):.3f}"]
+        command.append(temp_wav)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0 or not os.path.getsize(temp_wav):
+            return None
+        return load_audio_waveform(temp_wav, max_seconds)
+    except Exception:
+        return None
+    finally:
+        if temp_wav and os.path.exists(temp_wav):
+            try:
+                os.remove(temp_wav)
+            except OSError:
+                pass
+
+
 def load_audio_waveform(path: str, max_seconds: Optional[float] = None) -> torch.Tensor:
     """Load an audio file -> [1, 2, samples] float32 at 32kHz stereo --
     exactly Wan2GP's own pipeline.py ``_waveform()``/``_load_audio_reference()``
