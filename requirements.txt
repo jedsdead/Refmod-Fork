@@ -1,14 +1,16 @@
-# safetensors, torch, numpy and Pillow are already required by Wan2GP itself,
-# so they are not repeated here.
+# No extra packages are needed: everything this plugin uses is already part of
+# a working Wan2GP install.
 #
-# opencv-python is an optional video-loading backend used only when
-# extracting a RefMod from an uploaded *video* file. Wan2GP already ships
-# imageio for its own video I/O, so this plugin falls back to imageio
-# automatically if opencv is not present -- this line is a nice-to-have,
-# not a hard requirement.
-opencv-python-headless
-
-# soundfile and torchaudio (used for audio-kind RefMod extraction) are not
-# listed here because MiniMax H3's own native "Use one/two audio
-# references" feature already requires both -- any Wan2GP install that can
-# run MiniMax H3 at all already has them.
+#   opencv (video loading)     -> Wan2GP requires opencv-python>=4.12.0.88
+#   imageio / imageio-ffmpeg   -> Wan2GP requires both (video fallback)
+#   soundfile                  -> Wan2GP requires it (audio RefMods)
+#   torchaudio                 -> comes with Wan2GP's torch install (resampling)
+#   safetensors, torch, numpy, Pillow -> required by Wan2GP itself
+#
+# Earlier versions listed opencv-python-headless here. That is the SAME library
+# as opencv-python packaged differently, and the two are not meant to share an
+# environment -- they install into the same cv2 namespace. Asking for it could
+# make the dependency step fail outright ("Failed to install dependencies for
+# MiniMaxH3Mod-for-WanGP"), taking the whole plugin install down with it, and it
+# was never needed: storage.py tries cv2 first and falls back to imageio, and
+# Wan2GP ships both.

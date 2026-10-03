@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.4** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.5** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -115,6 +115,12 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.5** — `requirements.txt` no longer asks for
+  `opencv-python-headless`. Wan2GP already requires `opencv-python`, and the two
+  are the same library packaged differently and not meant to share an
+  environment; on some installs pip failed on it and took the whole plugin
+  install down ("Failed to install dependencies"). Nothing else was in the file,
+  so the dependency step is now a no-op.
 - **0.31.0-fork.4** — reference videos can be previewed and trimmed in the
   extractor: pick an uploaded clip to watch it, and set the span the mod is
   built from. Trims are per video, and also limit the soundtrack taken by
