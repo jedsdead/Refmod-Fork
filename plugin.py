@@ -63,6 +63,7 @@ except Exception:                                        # pragma: no cover
     RangeSlider = None
 
 NONE_CHOICE = "(none)"
+ROOT_FOLDER_CHOICE = "(top level)"
 
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
 # so this UI doesn't need a live import of Wan2GP internals just to draw a
@@ -930,6 +931,28 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                           "after each delete.")
         delete_status = gr.Textbox(label="", interactive=False, show_label=False)
 
+        gr.Markdown("#### Folders\n"
+                    "Organise the library without leaving Wan2GP. Folders are ordinary "
+                    "subfolders of the plugin's mods directory, and a move rewrites the mod "
+                    "file in place -- latent, description and any attached soundtrack are "
+                    "preserved, and an existing mod of the same name is never overwritten.")
+        with gr.Row():
+            new_folder_name = gr.Textbox(label="New folder", scale=2,
+                                         placeholder="characters, or characters/female to nest")
+            create_folder_btn = gr.Button("Create folder")
+        with gr.Row():
+            move_dd = gr.Dropdown(label="Mods to move", choices=_library_mod_names(),
+                                  value=[], multiselect=True, scale=2)
+            move_target = gr.Dropdown(label="Destination",
+                                      choices=[ROOT_FOLDER_CHOICE] + storage.list_mod_folders(),
+                                      value=ROOT_FOLDER_CHOICE, scale=1)
+            move_btn = gr.Button("Move", variant="primary")
+        with gr.Row():
+            delete_folder_dd = gr.Dropdown(label="Delete an empty folder",
+                                           choices=storage.list_mod_folders(), value=None, scale=2)
+            delete_folder_btn = gr.Button("Delete folder", variant="stop")
+        folder_status = gr.Textbox(label="", interactive=False, show_label=False)
+
         gr.Markdown("#### Soundtrack (add / replace / remove)\\n"
                     "Give an existing image or video mod its own audio, without rebuilding it "
                     "from the original sources. H3 supports this natively: a reference video "
@@ -1031,12 +1054,63 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                   library_folder_dd]),
                          outputs=[audio_target_dd, audio_status], queue=False)
 
+        def _folder_refresh(message, folder):
+            """Everything that depends on the folder list or the mod list."""
+            folders = storage.list_mod_folders()
+            names = _library_mod_names(folder)
+            return (_library_rows(folder),
+                    gr.update(choices=_folder_choices(), value=folder),
+                    gr.update(choices=[ROOT_FOLDER_CHOICE] + folders),
+                    gr.update(choices=folders, value=None),
+                    gr.update(choices=names, value=[]),
+                    gr.update(choices=names, value=[]),
+                    gr.update(choices=names, value=[]),
+                    gr.update(choices=_names_keeping(folder, None)),
+                    message)
+
+        def do_create_folder(name, folder):
+            try:
+                created = storage.create_mod_folder(name)
+            except Exception as e:
+                return _folder_refresh(f"Could not create the folder: {e}", folder)
+            return _folder_refresh(f"Created '{created}'.", folder)
+
+        def do_move_mods(names, destination, folder):
+            names = [n for n in (names if isinstance(names, list) else [names]) if n]
+            if not names:
+                return _folder_refresh("Pick at least one mod to move.", folder)
+            target = "" if destination in (None, ROOT_FOLDER_CHOICE) else destination
+            moved, skipped = storage.move_mods(names, target)
+            where = "the top level" if not target else f"'{target}'"
+            parts = []
+            if moved:
+                parts.append(f"Moved {len(moved)} mod(s) to {where}.")
+            if skipped:
+                parts.append("Skipped: " + "; ".join(f"'{n}' ({why})" for n, why in skipped))
+            return _folder_refresh(" ".join(parts) or "Nothing to do.", folder)
+
+        def do_delete_folder(name, folder):
+            if not name:
+                return _folder_refresh("Pick a folder to delete.", folder)
+            try:
+                removed = storage.delete_mod_folder(name)
+            except Exception as e:
+                return _folder_refresh(f"Could not delete the folder: {e}", folder)
+            return _folder_refresh(f"Deleted '{removed}'.", folder)
+
         def do_refresh(folder, current):
             return (_library_rows(folder),
                     gr.update(choices=_folder_choices(), value=folder),
                     gr.update(choices=_names_keeping(folder, current), value=current or None),
                     gr.update(choices=_library_mod_names(folder), value=[]),
                     gr.update(choices=_library_mod_names(folder), value=[]))
+
+        create_folder_btn.click(fn=do_create_folder, inputs=[new_folder_name, library_folder_dd],
+                                outputs=[table, library_folder_dd, move_target, delete_folder_dd, delete_dd, move_dd, audio_target_dd, edit_name_dd, folder_status], queue=False)
+        move_btn.click(fn=do_move_mods, inputs=[move_dd, move_target, library_folder_dd],
+                       outputs=[table, library_folder_dd, move_target, delete_folder_dd, delete_dd, move_dd, audio_target_dd, edit_name_dd, folder_status], queue=False)
+        delete_folder_btn.click(fn=do_delete_folder, inputs=[delete_folder_dd, library_folder_dd],
+                                outputs=[table, library_folder_dd, move_target, delete_folder_dd, delete_dd, move_dd, audio_target_dd, edit_name_dd, folder_status], queue=False)
 
         refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
                           outputs=[table, library_folder_dd, edit_name_dd, delete_dd,

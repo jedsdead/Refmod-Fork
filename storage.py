@@ -235,8 +235,64 @@ def reclassify_all_mods() -> Tuple[int, int]:
     return fixed, len(names)
 
 
+def create_mod_folder(folder: str) -> str:
+    """Create a subfolder (possibly nested, "characters/female") under
+    refmods_dir() and return its sanitized relative path. Already-existing
+    folders are fine. Raises ValueError if the name sanitizes to nothing."""
+    rel = _sanitize_relpath(folder).replace(os.sep, "/")
+    if not rel:
+        raise ValueError("Enter a folder name (letters, numbers, _ and - ; use / to nest).")
+    os.makedirs(os.path.join(refmods_dir(), rel.replace("/", os.sep)), exist_ok=True)
+    return rel
+
+
+def delete_mod_folder(folder: str) -> str:
+    """Remove an EMPTY subfolder. Folders holding mods are left alone --
+    deleting mods is a separate, explicit action."""
+    rel = _sanitize_relpath(folder).replace(os.sep, "/")
+    if not rel:
+        raise ValueError("Pick a folder.")
+    path = os.path.join(refmods_dir(), rel.replace("/", os.sep))
+    if not os.path.isdir(path):
+        raise ValueError(f"No folder named '{rel}'.")
+    if list_refmods(rel, recursive=True):
+        raise ValueError(f"'{rel}' still contains mods -- move or delete them first.")
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        if filenames:
+            raise ValueError(f"'{rel}' contains other files -- remove them by hand.")
+        os.rmdir(dirpath)
+    return rel
+
+
+def move_mods(names, folder: str):
+    """Move mods into a subfolder ("" means the top level), keeping each
+    mod's own name. Returns (moved, skipped) as lists of (name, detail).
+
+    A move is a rename with a different folder part, so it goes through
+    rename_and_update_mod and inherits its guarantees: the latent is
+    rewritten untouched, metadata (including any attached soundtrack) is
+    preserved, and an existing mod of the same name is never overwritten."""
+    raw_folder = str(folder or "").strip().strip("/")
+    destination = _sanitize_relpath(raw_folder).replace(os.sep, "/") if raw_folder else ""
+    moved, skipped = [], []
+    for name in [n for n in (names or []) if n]:
+        current_folder, leaf = _split_folder(name)
+        if current_folder == destination:
+            skipped.append((name, "already there"))
+            continue
+        try:
+            if destination:
+                create_mod_folder(destination)
+            final = rename_and_update_mod(name, new_folder=destination)
+            moved.append((name, final))
+        except Exception as e:
+            skipped.append((name, str(e)))
+    return moved, skipped
+
+
 def rename_and_update_mod(old_name: str, new_name: Optional[str] = None,
-                          new_description: Optional[str] = None) -> str:
+                          new_description: Optional[str] = None,
+                          new_folder: Optional[str] = None) -> str:
     """Rename a saved mod and/or update its description in place -- the
     latent data is untouched either way, only metadata changes (and, for a
     rename, the file name). Returns the mod's final folder-relative name
@@ -252,7 +308,17 @@ def rename_and_update_mod(old_name: str, new_name: Optional[str] = None,
     mod = load_refmod(old_name)
     old_folder, _ = _split_folder(old_name)
     old_rel = _sanitize_relpath(old_name).replace(os.sep, "/")
-    if new_name:
+    if new_folder is not None:
+        # Explicit destination, including "" for the top level. Needed because
+        # the bare-name rule below deliberately keeps a mod where it is, which
+        # would make "move to the top level" a no-op.
+        leaf = _split_folder(str(new_name) if new_name else old_rel)[1]
+        # NB: _sanitize_relpath("") falls back to a default name, so an empty
+        # destination (the top level) must bypass it entirely.
+        raw_folder = str(new_folder).strip().strip("/")
+        destination = _sanitize_relpath(raw_folder).replace(os.sep, "/") if raw_folder else ""
+        target_name = f"{destination}/{leaf}" if destination else leaf
+    elif new_name:
         requested = str(new_name).replace("\\", "/")
         if "/" not in requested and old_folder:
             requested = f"{old_folder}/{requested}"

@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.5** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.6** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -84,6 +84,10 @@ video branch is built for multi-frame references.
 
 ### Quality of life
 
+- Folder management in the Library tab: create folders (`characters/female`
+  nests), move any number of selected mods between them, and delete empty ones.
+  A move rewrites the mod in place, so the latent, description and any attached
+  soundtrack survive, and a name clash is refused rather than overwriting.
 - Reference videos have a preview and a trim range in the extractor. With one
   video uploaded it is selected automatically; with several, a picker chooses
   which to preview. A trim limits both the frames encoded and the audio taken
@@ -115,6 +119,9 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.6** — folders can be created, filled and removed from the
+  Library tab: make a folder (nested with `/`), select any number of mods and
+  move them into it or back to the top level, and delete folders once empty.
 - **0.31.0-fork.5** — `requirements.txt` no longer asks for
   `opencv-python-headless`. Wan2GP already requires `opencv-python`, and the two
   are the same library packaged differently and not meant to share an
