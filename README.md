@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.15** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.16** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -119,6 +119,21 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.16** — **Soundtrack length, and a 2-second minimum.**
+  - A new *Soundtrack length* slider in the Extract tab's *Soundtrack*
+    section (2-15s, **4s by default**) sets how much audio a mod keeps -- an
+    audio-only mod, an audio file attached to pictures or a video, or a
+    clip's own audio -- independent of the video length. *Reference duration
+    to use* is now for video only (it still defaults to ~2.5s).
+  - **Audio files shorter than 2s are refused** (H3's documented minimum for
+    an audio reference), before anything runs, with the reason shown in the
+    status box. The one exception is *Use the clip's own audio*: the clip can
+    still make a good visual mod, so its audio is kept even when under 2s,
+    with a warning in the status box that the voice may not be picked up.
+    The Library's *Soundtrack* tool refuses short clips, and its *Seconds to
+    use* now starts at 2s.
+  - The audio-file warning now compares against *Soundtrack length*, and
+    flags a file under 2s up front.
 - **0.31.0-fork.15** — **An empty RefMod panel now always means no mods.**
   The panel's selection is also kept as a server-wide fallback, for a task
   that arrives without its own copy. A page reload (or a rebuilt panel) shows

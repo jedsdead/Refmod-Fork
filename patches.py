@@ -111,9 +111,38 @@ def unpack_refmod_setting(custom_settings):
             _log(f"could not parse {SETTING_COMBINED}; ignoring it:\n" + traceback.format_exc())
     return state, extract
 STASH_KEY = "_h3refmod_selection"        # key inside the session `state` dict for the inline panel
-# Shortest soundtrack a visual mod is given at extraction: H3 documents 2s as
-# the minimum length of an audio reference.
-MIN_SOUNDTRACK_SECONDS = 2.0
+# Audio in a mod (an audio mod, or a visual mod's soundtrack): how much is kept
+# by default, and the shortest allowed -- H3 documents 2s as the minimum
+# length of an audio reference, so a shorter clip is refused at extraction.
+DEFAULT_AUDIO_SECONDS = 4.0
+MIN_AUDIO_SECONDS = 2.0
+MIN_SOUNDTRACK_SECONDS = MIN_AUDIO_SECONDS   # name used by earlier forks
+
+
+class ExtractionBlocked(ValueError):
+    """An extraction refused for a reason the user can fix; its message is
+    shown in the status box instead of a traceback."""
+
+
+def _require_audio_length(waveform, what: str) -> float:
+    """Refuse audio shorter than MIN_AUDIO_SECONDS; returns its length."""
+    seconds = waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
+    if seconds < MIN_AUDIO_SECONDS - 0.05:
+        raise ExtractionBlocked(
+            f"{what} is only ~{seconds:.1f}s long. H3 needs at least {MIN_AUDIO_SECONDS:g}s of "
+            f"audio to use it as a reference -- use a longer clip, or a longer part of it.")
+    return seconds
+
+
+def _audio_seconds(spec: dict, fallback: float) -> float:
+    """The extraction's "Soundtrack length", never under the minimum. Specs
+    from before fork.16 have none and keep their old length (``fallback``)."""
+    value = spec.get("audio_seconds")
+    try:
+        value = float(value) if value is not None else float(fallback)
+    except (TypeError, ValueError):
+        value = float(fallback)
+    return max(MIN_AUDIO_SECONDS, value)
 FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24   # matches plugin.py's own constant of the same name --
                                          # MiniMax H3's own default fps, used only to turn a
                                          # latent frame count into an estimated-seconds figure
@@ -1507,6 +1536,13 @@ def install_patches() -> Optional[str]:
             set_progress_status = kwargs.get("set_progress_status")
             try:
                 _run_extract_job(self, extract_job, set_progress_status=set_progress_status)
+            except ExtractionBlocked as blocked:
+                _log(f"extraction refused: {blocked}")
+                if set_progress_status is not None:
+                    try:
+                        set_progress_status(f"RefMod extraction refused: {blocked}")
+                    except Exception:
+                        pass
             except Exception:
                 _log("extraction job failed:\n" + traceback.format_exc())
                 if set_progress_status is not None:
@@ -2296,7 +2332,9 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
     # in plugin.py) only comes into play once the *real* audio latent gets
     # produced below, for the token-budget and duration-reporting math.
     target_px = (latent_frames - 1) * 4 + 1 if latent_frames > 1 else 1
-    target_seconds = target_px / FPS_ASSUMED_FOR_DURATION_ESTIMATE
+    # Since fork.16 an audio mod's length is its own "Soundtrack length"
+    # setting; specs without one keep the old video-slider length.
+    target_seconds = _audio_seconds(spec, target_px / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
 
     status(f"H3 RefMod: loading audio reference (up to ~{target_seconds:.1f}s, mode=encode -- "
           f"audio mods are always full-fidelity)")
@@ -2305,12 +2343,12 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
         full_seconds = sf.info(audio_path).frames / sf.info(audio_path).samplerate
         if full_seconds > target_seconds + 0.15:
             status(f"H3 RefMod: this file is ~{full_seconds:.1f}s long, but only the first "
-                  f"~{target_seconds:.1f}s (set by 'Reference duration to use' above) will be "
+                  f"~{target_seconds:.1f}s (set by 'Soundtrack length') will be "
                   f"used -- raise that slider before extracting if you want more of it kept.")
     except Exception:
         pass
     waveform = storage.load_audio_waveform(audio_path, max_seconds=target_seconds)
-    duration = waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
+    duration = _require_audio_length(waveform, f"The audio file {os.path.basename(str(audio_path))}")
     status(f"H3 RefMod: encoding audio reference (~{duration:.1f}s)")
 
     latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
@@ -2369,10 +2407,16 @@ def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
         # pulled out first, so an existing mod can be given the voice from the
         # very clip it was built from -- provided you still have that file,
         # since a mod records no source paths.
-        waveform = storage.extract_audio_from_video(audio_path, max_seconds=max(0.5, seconds or 4.0))
+        waveform = storage.extract_audio_from_video(
+            audio_path, max_seconds=max(MIN_AUDIO_SECONDS, seconds or DEFAULT_AUDIO_SECONDS))
         if waveform is None:
             status(f"Attach audio: no audio track could be read from "
                    f"{os.path.basename(str(audio_path))}.")
+            return
+        try:
+            _require_audio_length(waveform, f"The audio in {os.path.basename(str(audio_path))}")
+        except ExtractionBlocked as blocked:
+            status(f"Attach audio refused: {blocked}")
             return
         latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
         if latent.dim() != 4 or latent.shape[1] != 32 or latent.shape[2] != 2:
@@ -2511,6 +2555,50 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
 
     if not image_paths and not video_paths:
         raise ValueError("RefMod extraction: no reference image(s) or video provided.")
+
+    # The soundtrack is chosen and read FIRST: a clip too short to use is
+    # refused before any slow visual encoding, not after it.
+    # "Use the clip's own audio": the first video source with a soundtrack;
+    # a separately chosen audio file always wins if both are given.
+    from_clip = False
+    if not audio_path and spec.get("use_clip_audio") and video_paths:
+        for candidate in video_paths:
+            if storage.video_has_audio(candidate):
+                audio_path = candidate
+                from_clip = True
+                status(f"H3 RefMod: using the clip's own audio from "
+                       f"{os.path.basename(candidate)}")
+                break
+        else:
+            status("H3 RefMod: 'use the clip's own audio' was set, but no video source has "
+                   "an audio track -- extracting without a soundtrack")
+    soundtrack_waveform = None
+    if audio_path and spec.get("audio_seconds") is not None:
+        # "Soundtrack length" (fork.16+): one setting for every soundtrack,
+        # independent of the visual duration.
+        target_seconds = _audio_seconds(spec, DEFAULT_AUDIO_SECONDS)
+        clip_trim = (spec.get("video_trims") or {}).get(os.path.basename(str(audio_path)))
+        soundtrack_waveform = storage.extract_audio_from_video(
+            audio_path, max_seconds=target_seconds,
+            start_seconds=float(clip_trim[0]) if clip_trim else 0.0)
+        if soundtrack_waveform is None:
+            raise ExtractionBlocked(f"No audio could be read from "
+                                    f"{os.path.basename(str(audio_path))}.")
+        where = (f"The audio from {os.path.basename(str(audio_path))}"
+                 + (f" (from {float(clip_trim[0]):g}s, the trim start)" if clip_trim else ""))
+        if from_clip:
+            # A clip's own audio is the one exception to the 2s minimum: the
+            # clip can still make a perfectly good visual mod, so a short
+            # soundtrack is kept, with a warning, rather than refusing it all.
+            got = soundtrack_waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
+            if got < MIN_AUDIO_SECONDS - 0.05:
+                status(f"H3 RefMod: ⚠️ {where} is only ~{got:.1f}s long -- kept anyway, but H3 "
+                       f"documents {MIN_AUDIO_SECONDS:g}s as the shortest usable audio reference, "
+                       f"so this voice may not be picked up. A longer clip (or an earlier trim "
+                       f"start) gives the model more to work with.")
+        else:
+            got = _require_audio_length(soundtrack_waveform, where)
+        status(f"H3 RefMod: soundtrack ~{got:.1f}s (Soundtrack length {target_seconds:g}s)")
 
     pool_warning = core.identity_training_pool_warning(concept_type, mode, pool_h, pool_w)
     if pool_warning:
@@ -2676,20 +2764,8 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     # can be stored side by side and injected as one reference: H3 tags a
     # reference video carrying audio "video_audio" and gives it audio rows.
     audio_latent = None
-    # "Use the clip's own audio": take the soundtrack from the first video
-    # source, so one clip of someone talking yields both the look and the
-    # voice. A separately chosen audio file always wins if both are given.
-    if not audio_path and spec.get("use_clip_audio") and video_paths:
-        for candidate in video_paths:
-            if storage.video_has_audio(candidate):
-                audio_path = candidate
-                status(f"H3 RefMod: using the clip's own audio from "
-                       f"{os.path.basename(candidate)}")
-                break
-        else:
-            status("H3 RefMod: 'use the clip's own audio' was set, but no video source has "
-                   "an audio track -- extracting without a soundtrack")
-    if audio_path:
+    if audio_path and soundtrack_waveform is None:
+        # Specs from before fork.16 (no "Soundtrack length"): the old sizing.
         if n_vid > 0 and not merged_n:
             # A clip: the soundtrack matches the visual duration it kept.
             target_seconds = (((total_t - 1) * 4 + 1 if total_t > 1 else 1)
@@ -2708,14 +2784,16 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         # H3 documents 2 seconds as the shortest usable audio reference; a
         # shorter voice sample gives it too little to go on.
         target_seconds = max(MIN_SOUNDTRACK_SECONDS, target_seconds)
-        status(f"H3 RefMod: encoding the attached soundtrack (up to ~{target_seconds:.1f}s)")
         clip_trim = (spec.get("video_trims") or {}).get(os.path.basename(str(audio_path)))
-        waveform = storage.extract_audio_from_video(
+        soundtrack_waveform = storage.extract_audio_from_video(
             audio_path, max_seconds=target_seconds,
             start_seconds=float(clip_trim[0]) if clip_trim else 0.0)
-        if waveform is None:
+        if soundtrack_waveform is None:
             raise ValueError(f"No audio could be read from {os.path.basename(audio_path)}.")
-        audio_latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
+    if audio_path and soundtrack_waveform is not None:
+        status(f"H3 RefMod: encoding the attached soundtrack "
+               f"(~{soundtrack_waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE:.1f}s)")
+        audio_latent = _encode_ref_audio(pipeline_self, soundtrack_waveform).to(torch.float16)
         if audio_latent.dim() != 4 or audio_latent.shape[1] != 32 or audio_latent.shape[2] != 2:
             raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(audio_latent.shape)}.")
         status(f"H3 RefMod: soundtrack attached ({audio_latent.shape[-1]} audio latents, "

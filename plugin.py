@@ -43,7 +43,8 @@ from . import core, encframes, storage
 from .patches import (SETTING_COMBINED, SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY,
                       install_patches, pack_refmod_setting, set_pending_extract,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
-                      is_minimax_h3_ref2va, is_minimax_h3_refmod_capable)
+                      is_minimax_h3_ref2va, is_minimax_h3_refmod_capable,
+                      DEFAULT_AUDIO_SECONDS, MIN_AUDIO_SECONDS)
 
 PlugIn_Name = "MiniMax H3 RefMods"
 PlugIn_Id = "H3RefMods"
@@ -327,6 +328,18 @@ def _normalize_rows(rows):
     return out
 
 
+def _audio_file_seconds(path):
+    """Length of an audio file in seconds, or None if it can't be read."""
+    if not path:
+        return None
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        return info.frames / float(info.samplerate)
+    except Exception:
+        return None
+
+
 def _row_meta(name, strength):
     """Metadata for a picker row that will actually be sent, else None."""
     try:
@@ -571,7 +584,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.15"
+        self.version = "0.31.0-fork.16"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -980,19 +993,28 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                               "that has one, so a single clip of someone talking "
                                               "gives this mod both the look and the voice. Ignored "
                                               "if you choose an audio file, or if no video source "
-                                              "has an audio track. With a picture stack, the voice "
-                                              "covers the whole span.")
+                                              "has an audio track. A trimmed clip's audio starts "
+                                              "at the trim start.")
+        soundtrack_seconds = gr.Slider(
+            MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS, step=0.5,
+            label="Soundtrack length (seconds)",
+            info=f"How much audio this mod keeps -- an audio file, or a clip's own audio -- "
+                 f"independent of the video length. At least {MIN_AUDIO_SECONDS:g}s, H3's shortest "
+                 f"audio reference: an audio file shorter than that is refused; a clip's own audio "
+                 f"is kept with a warning. Longer gives the model more of a voice to copy, at ~80 "
+                 f"tokens per second.")
         audio_duration_warning = gr.Markdown("")
         with gr.Accordion("How soundtracks work", open=False):
             gr.Markdown("*Audio on its own makes an audio-only mod. Audio **together with** images "
                        "or video gives that mod a soundtrack as well as a look: the two latents are "
                        "stored side by side (they can't be stacked -- their shapes differ) and the "
                        "audio is injected as its own `<Audio N>` reference, so refer to it that way "
-                       "in prompts while `<Picture N>`/`<Video N>` stays the picture. A video "
-                       "mod's soundtrack matches the clip it kept; a picture mod's is as long as "
-                       "'Reference duration to use' (pictures taken from a video: their span), "
-                       "never under 2s, H3's shortest audio reference. It adds 2 tokens per audio "
-                       "latent (~80/second). Audio is always extracted at full fidelity; 'Mode' above "
+                       "in prompts while `<Picture N>`/`<Video N>` stays the picture. Every "
+                       "soundtrack, and every audio-only mod, is as long as 'Soundtrack length' "
+                       "(4s by default), whatever the video length. An audio file shorter than 2s, "
+                       "H3's shortest audio reference, is refused; a clip's own audio that short is "
+                       "kept with a warning. It adds 2 tokens per audio latent "
+                       "(~80/second). Audio is always extracted at full fidelity; 'Mode' above "
                        "doesn't apply to it. You can also add or replace a soundtrack later from the "
                        "Library tab.*")
 
@@ -1004,17 +1026,14 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                 "tokens, less detail.")
                 latent_frames = gr.Slider(0.1, latent_frames_to_seconds(MAX_LATENT_FRAMES),
                                           value=latent_frames_to_seconds(16), step=0.1,
-                                          label="Reference duration to use (seconds) -- video AND audio",
-                                          info="Approximate real seconds kept from the source, for a "
-                                               "video-kind ref **or** an audio-kind ref (whichever you're "
-                                               "extracting) -- always double-check this before extracting "
-                                               "audio, since it defaults to a short video-sized value and "
-                                               "audio has no separate duration control of its own. "
+                                          label="Reference duration to use (seconds) -- video",
+                                          info="Approximate real seconds kept from a video source "
+                                               "(and the span pictures are taken from, for a picture "
+                                               "stack). Audio has its own 'Soundtrack length' above. "
                                                "MiniMax H3's native 15s reference cap is a **shared** "
-                                               "budget within its own kind -- **if a generation combines "
-                                               "two video-kind (or two audio-kind) mods, their durations "
-                                               "add together, so one mod near 14.9s leaves no room for a "
-                                               "second one of the same kind alongside it.**")
+                                               "budget -- **if a generation combines two video mods, "
+                                               "their durations add together, so one mod near 14.9s "
+                                               "leaves no room for a second one alongside it.**")
                 max_tokens = gr.Slider(0, 65536, value=65536, step=512, label="Max tokens (0 = no cap)",
                                        info="Max tokens allowed. 0 = unlimited.")
             with gr.Row(visible=True) as training_row:
@@ -1060,24 +1079,22 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     outputs=[pool_warning], queue=False)
 
         def update_audio_duration_warning(audio_path, current_seconds):
-            if not audio_path:
+            real_seconds = _audio_file_seconds(audio_path)
+            if real_seconds is None:
                 return ""
-            try:
-                import soundfile as sf
-                info = sf.info(audio_path)
-                real_seconds = info.frames / info.samplerate
-            except Exception:
-                return ""
+            if real_seconds < MIN_AUDIO_SECONDS - 0.05:
+                return (f"⛔ This audio file is only ~{real_seconds:.1f}s long. H3 needs at least "
+                        f"{MIN_AUDIO_SECONDS:g}s of audio to use it as a reference, so extraction "
+                        f"will be refused -- use a longer clip.")
             if real_seconds > float(current_seconds) + 0.15:
-                return (f"⚠️ This audio file is ~{real_seconds:.1f}s long, but 'Reference duration "
-                       f"to use' (in Settings, below) is only set to {float(current_seconds):.1f}s -- only the "
-                       f"first {float(current_seconds):.1f}s will be kept. Raise it (up to "
-                       f"{latent_frames_to_seconds(MAX_LATENT_FRAMES)}s) to use more of this "
-                       f"recording.")
+                return (f"⚠️ This audio file is ~{real_seconds:.1f}s long, but 'Soundtrack length' "
+                        f"is set to {float(current_seconds):.1f}s -- only the first "
+                        f"{float(current_seconds):.1f}s will be kept. Raise it (up to 15s) to use "
+                        f"more of this recording.")
             return ""
 
-        for w in (ref_audio, latent_frames):
-            w.change(fn=update_audio_duration_warning, inputs=[ref_audio, latent_frames],
+        for w in (ref_audio, soundtrack_seconds):
+            w.change(fn=update_audio_duration_warning, inputs=[ref_audio, soundtrack_seconds],
                     outputs=[audio_duration_warning], queue=False)
 
         def update_stills_estimate(enabled, per_second, videos, images, trims, duration_s,
@@ -1175,13 +1192,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                        remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
                        identity, multiplier, max_tokens, use_clip_audio, description, save,
                        store_frames=True, trims=None, as_pictures=False, per_second=1.0,
-                       merge_refs=False):
+                       merge_refs=False, audio_seconds=DEFAULT_AUDIO_SECONDS):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
             video_paths = [f.name if hasattr(f, "name") else f for f in (ref_videos or [])]
             if not image_paths and not video_paths and not ref_audio:
                 return "Add at least one reference image, video, or audio file."
+            # Refuse an audio file too short to use before running anything
+            # (a clip's own audio is checked by the task, also before any
+            # slow encoding).
+            audio_len = _audio_file_seconds(ref_audio)
+            if audio_len is not None and audio_len < MIN_AUDIO_SECONDS - 0.05:
+                return (f"Extraction refused: the reference audio is only ~{audio_len:.1f}s long. "
+                        f"H3 needs at least {MIN_AUDIO_SECONDS:g}s of audio to use it as a "
+                        f"reference -- use a longer clip.")
             spec = {
                 "name": name, "mode": mode, "concept_type": concept_type,
                 "image_paths": image_paths, "video_paths": video_paths,
@@ -1197,6 +1222,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "video_as_pictures": bool(as_pictures),
                 "pictures_per_second": float(per_second or 1.0),
                 "merge": bool(merge_refs),
+                "audio_seconds": max(MIN_AUDIO_SECONDS, float(audio_seconds or DEFAULT_AUDIO_SECONDS)),
             }
             log = {"lines": []}
 
@@ -1225,11 +1251,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 return f"Extraction task failed to run: {e!r}"
             finally:
                 set_pending_extract(None)
-            tail = "\n".join(log["lines"][-6:])
+            lines = log["lines"]
+            refused = [l for l in lines if "extraction refused" in l.lower()]
+            if refused:
+                return refused[-1]
+            # Warnings stay visible however many lines follow them.
+            warnings = [l for l in lines if "⚠️" in l]
+            tail = [l for l in lines[-6:] if l not in warnings]
             ok = ("Done -- check the Library tab (Refresh) to see the saved mod." if any(
-                    "saved" in l.lower() for l in log["lines"]) else
+                    "saved" in l.lower() for l in lines) else
                   "Task finished, but no confirmation line was captured -- check the terminal log.")
-            return (tail + ("\n" if tail else "") + ok) if tail else ok
+            return "\n".join(warnings + tail + [ok])
 
         estimate_inputs = [video_as_pictures, pictures_per_second, ref_videos, ref_images,
                            trim_state, latent_frames, mode, ref_resolution, pool_h, pool_w,
@@ -1255,7 +1287,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             inputs=[model_dd, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                    remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
                    identity, multiplier, max_tokens, use_clip_audio, description, save,
-                   store_frames, trim_state, video_as_pictures, pictures_per_second, merge],
+                   store_frames, trim_state, video_as_pictures, pictures_per_second, merge,
+                   soundtrack_seconds],
             outputs=[extract_status],
             queue=False,
         )
@@ -1331,8 +1364,10 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             with gr.Row():
                 audio_file = gr.File(label="Audio or video file (a video's soundtrack is used)",
                                      file_types=["audio", "video"], type="filepath", scale=2)
-                audio_seconds = gr.Slider(0.5, 15.0, value=4.0, step=0.5,
-                                          label="Seconds to use", scale=1)
+                audio_seconds = gr.Slider(MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS,
+                                          step=0.5, label="Seconds to use", scale=1,
+                                          info=f"At least {MIN_AUDIO_SECONDS:g}s; a clip shorter "
+                                               f"than that is refused.")
                 audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")
             audio_status = gr.Textbox(label="", interactive=False, show_label=False)
         with gr.Accordion("Encoder frames", open=False):
