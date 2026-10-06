@@ -1,0 +1,16 @@
+# No extra packages are needed: everything this plugin uses is already part of
+# a working Wan2GP install.
+#
+#   opencv (video loading)     -> Wan2GP requires opencv-python>=4.12.0.88
+#   imageio / imageio-ffmpeg   -> Wan2GP requires both (video fallback)
+#   soundfile                  -> Wan2GP requires it (audio RefMods)
+#   torchaudio                 -> comes with Wan2GP's torch install (resampling)
+#   safetensors, torch, numpy, Pillow -> required by Wan2GP itself
+#
+# Earlier versions listed opencv-python-headless here. That is the SAME library
+# as opencv-python packaged differently, and the two are not meant to share an
+# environment -- they install into the same cv2 namespace. Asking for it could
+# make the dependency step fail outright ("Failed to install dependencies for
+# MiniMaxH3Mod-for-WanGP"), taking the whole plugin install down with it, and it
+# was never needed: storage.py tries cv2 first and falls back to imageio, and
+# Wan2GP ships both.
