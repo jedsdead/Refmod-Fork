@@ -542,6 +542,48 @@ def _default_model_choice(model_choices):
     return model_choices[0][1] if model_choices else None
 
 
+def _decompile_details(mod):
+    """A plain summary of what a mod holds, for the Decompile tab."""
+    counts = next((core.parse_source_counts(t) for t in mod.tags
+                   if core.parse_source_counts(t) is not None), None)
+    made = []
+    if counts:
+        if counts[0]:
+            made.append(f"{counts[0]} picture{'s' if counts[0] != 1 else ''}")
+        if counts[1]:
+            made.append(f"{counts[1]} video{'s' if counts[1] != 1 else ''}")
+    extras = [t for t in mod.tags if core.parse_source_counts(t) is None]
+    lines = [f"**{mod.name}** — {mod.kind} mod, **{mod.token_count:,} tokens**"]
+    if made:
+        lines.append("Made from: " + " and ".join(made)
+                     + (f" ({', '.join(extras)})" if extras else ""))
+    if mod.kind == "audio":
+        lines.append(f"Audio: ~{mod.latent_t / AUDIO_LATENTS_PER_SECOND:.1f}s")
+    else:
+        px = f"~{mod.latent_w * 16}x{mod.latent_h * 16}px"
+        if mod.mode == "training":
+            lines.append(f"Mode: **training** — pooled to a {mod.latent_h}x{mod.latent_w} grid "
+                         f"(decodes to a small, blurry {px} picture; the fine detail was pooled "
+                         f"away at extraction)")
+        else:
+            lines.append(f"Mode: **encode** — full detail at {px}")
+        if mod.still_stack() or mod.kind == "image" or mod.latent_t <= 1:
+            lines.append(f"Pictures: {mod.latent_t}"
+                         + (" (one merged picture)" if mod.source == "merge" else ""))
+        else:
+            seconds = ((mod.latent_t - 1) * 4 + 1) / FPS_ASSUMED_FOR_DURATION_ESTIMATE
+            lines.append(f"Video: {mod.latent_t} latent frames, ~{seconds:.1f}s")
+        if mod.audio_latent is not None:
+            lines.append(f"Soundtrack: ~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s")
+        lines.append("Encoder frames: " + (f"{len(mod.enc_times)} stored" if mod.has_encoder_frames()
+                                           else "not stored"))
+    if mod.concept_type and mod.concept_type != "generic":
+        lines.append(f"Concept type: {mod.concept_type}")
+    if mod.description:
+        lines.append(f"Description: {mod.description}")
+    return "  \n".join(lines)
+
+
 def _library_rows(folder=None):
     """Table rows for the Library tab. ``folder`` follows the same picker
     convention as _mod_choices: None/ALL_FOLDERS_CHOICE lists every mod in
@@ -584,7 +626,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.16"
+        self.version = "0.31.0-fork.17"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1668,6 +1710,107 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     # ── Generate ────────────────────────────────────────────────────────
 
+    def _build_decompile_section(self, api_session, model_dd):
+        gr.Markdown("### Decompile a RefMod\n"
+                    "See what a mod holds: its pictures, video and audio, rebuilt as ordinary "
+                    "files you can view, play and save. These are **reconstructions of what the "
+                    "mod stores, not the original sources** -- anything extraction discarded "
+                    "(the original resolution, the parts outside a trim, the fine detail pooled "
+                    "away in training mode, the individual pictures behind a merge) can't come "
+                    "back. Encode-mode mods come closest to their sources.")
+        with gr.Row():
+            mod_dd = gr.Dropdown(label="Mod", choices=_library_mod_names(), value=None, scale=4)
+            refresh_btn = gr.Button("🔄 Refresh", size="sm", scale=0, min_width=110)
+        details = gr.Markdown("*Pick a mod to see what's inside it.*")
+        with gr.Accordion("Quick look (stored encoder frames, no decoding)", open=True):
+            quick_note = gr.Markdown("")
+            quick_gallery = gr.Gallery(label="Encoder frames", columns=6, height="auto",
+                                       show_label=False, visible=False)
+        decompile_btn = gr.Button("Decompile (full decode)", variant="primary")
+        decompile_status = gr.Textbox(label="", interactive=False, show_label=False)
+        out_gallery = gr.Gallery(label="Pictures", columns=4, height="auto", visible=False)
+        out_video = gr.Video(label="Video", visible=False)
+        out_audio = gr.Audio(label="Audio", type="filepath", visible=False)
+
+        def show_outputs(name):
+            pictures, videos, audios = storage.list_decompiled(name) if name else ([], [], [])
+            return (gr.update(value=pictures or None, visible=bool(pictures)),
+                    gr.update(value=videos[0] if videos else None, visible=bool(videos)),
+                    gr.update(value=audios[0] if audios else None, visible=bool(audios)))
+
+        def on_pick(name):
+            if not name:
+                return ("*Pick a mod to see what's inside it.*", "", gr.update(visible=False),
+                        "", *show_outputs(None))
+            try:
+                mod = storage.load_refmod(name)
+            except Exception as e:
+                return (f"Could not read this mod: {e}", "", gr.update(visible=False), "",
+                        *show_outputs(None))
+            if mod.has_encoder_frames():
+                frames = mod.encoder_frames_uint8().numpy()
+                times = list(mod.enc_times)
+                label = ("picture {}" if mod.encoder_layout() == encframes.LAYOUT_STILLS
+                         else "{:.1f}s")
+                items = [(frames[i], label.format(i + 1 if "picture" in label else times[i]))
+                         for i in range(len(frames))]
+                note = (f"{len(items)} stored frame(s): what the text encoder is shown for this "
+                        f"mod, at a reduced size.")
+                gallery = gr.update(value=items, visible=True)
+            else:
+                note = ("*No stored encoder frames"
+                        + (" -- audio mods have none." if mod.kind == "audio"
+                           else ". Decompile below, or store them from the Library.*"))
+                gallery = gr.update(value=None, visible=False)
+            already = any(storage.list_decompiled(name))
+            return (_decompile_details(mod), note, gallery,
+                    "Showing the files from an earlier decompile." if already else "",
+                    *show_outputs(name))
+
+        def do_decompile(name, model_type=None):
+            if not name:
+                return ("Pick a mod first.", *show_outputs(None))
+            if api_session is None or not model_type:
+                return ("Pick a model at the top of this tab first -- decoding needs the "
+                        "model's VAEs, so this runs as a task.", *show_outputs(name))
+            spec = {"op": "decompile", "name": name}
+            log = {"lines": []}
+
+            class DecompileCallbacks:
+                def on_status(self, message):
+                    log["lines"].append(str(message))
+                def on_error(self, message):
+                    log["lines"].append(f"error: {message}")
+                def on_progress(self, update):
+                    pass
+
+            spec_json = json.dumps(spec)
+            set_pending_extract(spec_json)
+            try:
+                self._submit(api_session, model_type,
+                             {"video_length": 107,
+                              "custom_settings": {SETTING_COMBINED:
+                                                  pack_refmod_setting(extract_json=spec_json)}},
+                             DecompileCallbacks())
+            except Exception as e:
+                return (f"Decompile failed to run: {e!r}", *show_outputs(name))
+            finally:
+                set_pending_extract(None)
+            done = [l for l in log["lines"] if "Decompile" in l]
+            return ((done[-1] if done else
+                     (log["lines"][-1] if log["lines"] else "Finished -- see the console.")),
+                    *show_outputs(name))
+
+        pick_outputs = [details, quick_note, quick_gallery, decompile_status,
+                        out_gallery, out_video, out_audio]
+        mod_dd.change(fn=on_pick, inputs=[mod_dd], outputs=pick_outputs, queue=False)
+        refresh_btn.click(fn=lambda current: _safe_choice_update(_library_mod_names(), current),
+                          inputs=[mod_dd], outputs=[mod_dd], queue=False)
+        decompile_btn.click(fn=do_decompile,
+                            inputs=[mod_dd] + ([model_dd] if model_dd is not None else []),
+                            outputs=[decompile_status, out_gallery, out_video, out_audio],
+                            queue=False)
+
     def _build_generate_section(self, api_session, model_dd):
         gr.Markdown(
             "# ⚠️ Prefer the **Media Generator** tab for actual generation\n"
@@ -1868,6 +2011,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     self._build_extract_section(api_session, model_dd)
                 with gr.Tab("Library"):
                     self._build_library_section(api_session, model_dd)
+                with gr.Tab("Decompile"):
+                    self._build_decompile_section(api_session, model_dd)
                 with gr.Tab("Generate"):
                     self._build_generate_section(api_session, model_dd)
         return root

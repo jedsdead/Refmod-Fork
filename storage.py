@@ -773,3 +773,77 @@ def remove_background_from_image(img: Image.Image, session=None, bg_color=(255, 
         session = new_rembg_session()
     return remove(img.convert("RGB"), session=session, alpha_matting_erode_size=1,
                  alpha_matting=True, bgcolor=list(bg_color) + [0]).convert("RGB")
+
+
+# ── Decompile output ────────────────────────────────────────────────────────
+
+def decompile_dir(name: str, create: bool = False) -> str:
+    """Where a mod's decompiled files go: loras/refmods_plugin/decompiled/<name>
+    -- beside the mods folder, not inside it, so the outputs never show up as a
+    mod folder. Subfolder names are kept ("characters/tanya")."""
+    root = os.path.join(os.path.dirname(refmods_dir()), "decompiled")
+    d = os.path.join(root, _sanitize_relpath(name))
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def clear_decompile_dir(name: str) -> str:
+    """Empty (or create) a mod's decompile folder, so old outputs from an
+    earlier decompile of a different version never linger beside new ones."""
+    d = decompile_dir(name, create=True)
+    for entry in os.listdir(d):
+        path = os.path.join(d, entry)
+        if os.path.isfile(path):
+            os.remove(path)
+    return d
+
+
+def list_decompiled(name: str):
+    """(pictures, videos, audios) already decompiled for a mod, sorted."""
+    d = decompile_dir(name)
+    if not os.path.isdir(d):
+        return [], [], []
+    files = sorted(os.path.join(d, f) for f in os.listdir(d))
+    pick = lambda exts: [f for f in files if f.lower().endswith(exts)]
+    return pick((".png", ".jpg")), pick((".mp4",)), pick((".wav",))
+
+
+def save_png(frame_hwc01: torch.Tensor, path: str) -> str:
+    array = (frame_hwc01.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+    Image.fromarray(array).save(path)
+    return path
+
+
+def save_wav(waveform: torch.Tensor, path: str, sample_rate: int = None) -> str:
+    """[channels, samples] float in [-1, 1] -> 16-bit WAV."""
+    import soundfile as sf
+    data = waveform.detach().float().clamp(-1, 1).cpu().numpy()
+    if data.ndim == 1:
+        data = data[None]
+    sf.write(path, data.T, int(sample_rate or AUDIO_SAMPLE_RATE), subtype="PCM_16")
+    return path
+
+
+def save_mp4(frames_thwc01: torch.Tensor, path: str, fps: float, audio_path: str = None) -> str:
+    """Frames -> an H.264 MP4 any browser plays, with an optional WAV muxed in.
+    Uses the ffmpeg Wan2GP already relies on; falls back to imageio."""
+    import subprocess
+    frames = (frames_thwc01.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+    t, h, w, _ = frames.shape
+    # H.264 with yuv420p needs even dimensions.
+    if h % 2 or w % 2:
+        frames = frames[:, :h - h % 2, :w - w % 2]
+        t, h, w, _ = frames.shape
+    command = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-s", f"{w}x{h}", "-r", f"{fps:g}", "-i", "-"]
+    if audio_path:
+        command += ["-i", audio_path, "-c:a", "aac", "-shortest"]
+    command += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", path]
+    try:
+        subprocess.run(command, input=frames.tobytes(), check=True, capture_output=True)
+        return path
+    except Exception:
+        import imageio.v2 as imageio
+        imageio.mimwrite(path, list(frames), fps=fps, macro_block_size=1)
+        return path

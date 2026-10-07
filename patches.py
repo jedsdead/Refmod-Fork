@@ -2471,6 +2471,64 @@ def _attach_encoder_frames(pipeline_self, mod, status) -> bool:
         return False
 
 
+def _decode_audio_latent(pipeline_self, latent) -> torch.Tensor:
+    """An H3 audio latent [1, 32, 2, T] -> waveform [2, samples] at 32 kHz,
+    with the pipeline's own audio VAE (the one that decodes generated sound)."""
+    audio_vae = getattr(pipeline_self, "audio_vae", None)
+    if audio_vae is None:
+        raise RuntimeError("this pipeline has no audio VAE to decode with")
+    waveform = audio_vae.decode(latent.to(device=pipeline_self.device, dtype=torch.float32))[0]
+    return waveform.float().clamp(-1.0, 1.0).cpu()
+
+
+def _run_decompile_job(pipeline_self, spec: dict, status) -> None:
+    """Reconstruct what a mod holds as ordinary files: one PNG per picture, an
+    MP4 for a video, a WAV for its audio. These are VAE reconstructions of the
+    stored latents, not the original sources -- whatever extraction discarded
+    (resolution, the parts outside a trim, pooled detail in training mode,
+    the individual pictures behind a merge) can't come back."""
+    name = spec.get("name")
+    if not name:
+        status("Decompile: no mod chosen.")
+        return
+    mod = storage.load_refmod(name)
+    out = storage.clear_decompile_dir(name)
+    written = []
+    soundtrack_path = None
+    audio_latent = mod.latent if mod.kind == "audio" else mod.audio_latent
+    if audio_latent is not None:
+        try:
+            waveform = _decode_audio_latent(pipeline_self, audio_latent)
+            soundtrack_path = storage.save_wav(
+                waveform, os.path.join(out, "audio.wav" if mod.kind == "audio" else "soundtrack.wav"))
+            written.append(f"{os.path.basename(soundtrack_path)} "
+                           f"({waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE:.1f}s)")
+        except Exception:
+            soundtrack_path = None
+            _log(f"decompile: could not decode the audio of {name!r}:\n" + traceback.format_exc())
+            status(f"Decompile: the audio of '{name}' could not be decoded -- see the console")
+    if mod.kind != "audio":
+        if mod.still_stack() or mod.kind == "image" or mod.latent.shape[2] <= 1:
+            # Pictures were encoded one by one, so they're decoded one by one.
+            count = mod.latent.shape[2]
+            for j in range(count):
+                picture = _cthw_to_thwc01(_decode_cthw(pipeline_self, mod.latent[:, :, j:j + 1]))[0]
+                storage.save_png(picture, os.path.join(out, f"picture_{j + 1:02d}.png"))
+                if j == 0:
+                    size = f"{picture.shape[1]}x{picture.shape[0]}"
+            written.append(f"{count} picture(s), {size}px")
+        else:
+            frames = _cthw_to_thwc01(_decode_cthw(pipeline_self, mod.latent))
+            storage.save_mp4(frames, os.path.join(out, "video.mp4"),
+                                    FPS_ASSUMED_FOR_DURATION_ESTIMATE, soundtrack_path)
+            written.append(f"video.mp4 ({frames.shape[0]} frames, ~"
+                           f"{frames.shape[0] / FPS_ASSUMED_FOR_DURATION_ESTIMATE:.1f}s, "
+                           f"{frames.shape[2]}x{frames.shape[1]}px"
+                           + (", with its soundtrack" if soundtrack_path else "") + ")")
+            frames = None
+    status(f"Decompile finished: '{name}' -> " + ", ".join(written) + f" in {out}")
+
+
 def _run_store_frames_job(pipeline_self, spec: dict, status) -> None:
     """Add encoder frames to mods that were saved without them (or whose
     stored frames no longer match how the mod is used). Decoding needs the
@@ -2525,6 +2583,9 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         return
     if spec.get("op") == "store_frames":
         _run_store_frames_job(pipeline_self, spec, status)
+        return
+    if spec.get("op") == "decompile":
+        _run_decompile_job(pipeline_self, spec, status)
         return
 
     name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")

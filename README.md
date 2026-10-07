@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.16** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.17** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -119,6 +119,16 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.17** — **Decompile tab.** A fourth tab rebuilds what a mod
+  holds as ordinary files: one PNG per picture, an MP4 for a video mod (with
+  its soundtrack), and a WAV for any audio. It also lists what the mod was
+  made from, its mode, size, tokens and soundtrack length, and shows its
+  stored encoder frames instantly, without decoding. The files are
+  reconstructions of the stored latents, not the original sources: what
+  extraction discarded (resolution, the parts outside a trim, pooled detail
+  in training mode, the pictures behind a merge) can't come back. Decoding
+  runs as a short task; the files go to
+  `loras/refmods_plugin/decompiled/<mod name>/`.
 - **0.31.0-fork.16** — **Soundtrack length, and a 2-second minimum.**
   - A new *Soundtrack length* slider in the Extract tab's *Soundtrack*
     section (2-15s, **4s by default**) sets how much audio a mod keeps -- an
