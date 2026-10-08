@@ -275,6 +275,9 @@ def _trim_summary(trims, names):
 
 # Values per picker row: mod, strength, "Send as one video", "Include audio".
 ROW_WIDTH = 4
+# Panel-wide controls after the mod rows: picture mode, N, video mode, N,
+# fit to output.
+STACK_CONTROLS = 5
 
 
 def _row_boxes_update(name, kind="image"):
@@ -362,7 +365,8 @@ def _is_picture_mod(meta):
 
 
 def _stack_payload(stack_mode, stack_n,
-                   video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN):
+                   video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
+                   fit_to_output=False):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown. Whether a
@@ -377,7 +381,9 @@ def _stack_payload(stack_mode, stack_n,
     return {"stack_pictures": mode,
             "stack_pictures_n": count(stack_n, encframes.STACK_DEFAULT_N),
             "video_frames": vmode,
-            "video_frames_n": count(video_n, encframes.MAX_CLIP_FRAMES_SHOWN)}
+            "video_frames_n": count(video_n, encframes.MAX_CLIP_FRAMES_SHOWN),
+            # "Fit mods to the output size" (fork.18, off by default).
+            "fit_to_output": bool(fit_to_output)}
 
 
 def _format_label_line(rows):
@@ -626,7 +632,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.17"
+        self.version = "0.31.0-fork.18"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -729,7 +735,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # handler below still correctly hides it the moment any model switch happens.
         with gr.Accordion("MiniMax H3 RefMods (inline)", open=False) as accordion:
             gr.Markdown(
-                "Applies only when a **MiniMax H3 Ref2VA** model is selected above -- every other "
+                "Applies when a **MiniMax H3 Ref2VA, FL2VA or FL2VA ControlNet** model is selected "
+                "above -- every other "
                 "field on this page (resolution, frame count, steps, attention mode, memory "
                 "profile, output filename, etc.) is untouched and works exactly as normal. "
                 "Extract new RefMods from the **MiniMax H3 RefMods** tab. Selecting a mod here "
@@ -746,7 +753,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             n_rows = IMAGE_ROWS + VIDEO_ROWS + AUDIO_ROWS
             rows = _rows_payload(vals[:n_rows * ROW_WIDTH])
             payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
-                       **_stack_payload(*vals[n_rows * ROW_WIDTH:n_rows * ROW_WIDTH + 4])}
+                       **_stack_payload(*vals[n_rows * ROW_WIDTH:n_rows * ROW_WIDTH + STACK_CONTROLS])}
             try:
                 from . import patches as _h3p
                 _h3p.set_armed_selection(json.dumps(payload) if rows else None)
@@ -758,7 +765,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 return state, "⚠️ Could not access session state -- try reloading the page."
             if rows:
                 state[STASH_KEY] = json.dumps(payload)
-                msg = f"✅ {len(rows)} RefMod(s) armed for the next MiniMax H3 Ref2VA generation from this page."
+                msg = f"✅ {len(rows)} RefMod(s) armed for the next MiniMax H3 generation from this page."
             else:
                 # Clearing the pickers clears the selection. (This used to hold
                 # on to the last selection, from when the task payload was
@@ -834,8 +841,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         on image/video rows holding a mod with a soundtrack. Callers must keep
         that order when reading values
         back (_refresh_mod_dropdown_updates() does too) -- plus the encoder
-        controls (picture mode, N, video mode, N), which callers put into the
-        selection payload with _stack_payload()."""
+        controls (picture mode, N, video mode, N) and the "Fit mods to the
+        output size" box -- STACK_CONTROLS values -- which callers put into
+        the selection payload with _stack_payload()."""
         with gr.Row():
             folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
                                     label="Folder", scale=3,
@@ -869,6 +877,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                          "lighter text encode and slightly faster steps.")
                 video_n = gr.Number(value=encframes.MAX_CLIP_FRAMES_SHOWN, precision=0, minimum=1,
                                     maximum=256, label="N", scale=1)
+        fit_to_output = gr.Checkbox(
+            False, label="Fit mods to the output size (faster)",
+            info="Off: every picture and video mod goes in at the size it was extracted at. "
+                 "On: a mod bigger than the video you're making is shrunk to its size first, "
+                 "keeping its shape. Fewer tokens, so generation is faster -- but a shrunk mod "
+                 "carries less fine detail, faces first. Mods already that size or smaller are "
+                 "left alone. Works in Ref2VA, FL2VA and FL2VA ControlNet.")
 
         # One slot per kind to start with; "Add" reveals the next one and
         # "Remove" clears and hides the last. Every slot is still built up
@@ -950,7 +965,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         video_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
-        return mod_rows, (stack_mode, stack_n, video_mode, video_n)
+        return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output)
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"
@@ -1922,7 +1937,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             rows = _rows_payload(row_values[:n_rows * ROW_WIDTH])
             state_payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
                              **_stack_payload(*row_values[n_rows * ROW_WIDTH:
-                                                          n_rows * ROW_WIDTH + 4])}
+                                                          n_rows * ROW_WIDTH + STACK_CONTROLS])}
 
             overrides = dict(synced_settings or {})
             overrides.update({

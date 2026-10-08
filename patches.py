@@ -187,10 +187,18 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
     return model_type.startswith("minimax_h3_ref2va")
 
 
+def _fl2va_family_prefixes():
+    """Architectures that take RefMods through the FL2VA route: FL2VA itself
+    (and finetunes built on it, e.g. VDN) and, since fork.18, the FL2VA
+    ControlNet-Union model, which is FL2VA plus a control branch."""
+    return ("minimax_h3_fl2va",) + (("minimax_h3_control",) if CONTROLNET_REFMODS else ())
+
+
 def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
-    """Models RefMods can be used with: Ref2VA, plus FL2VA and its finetunes
-    (e.g. VDN) when FL2VA_REFMODS is on. Resolves finetunes to their
-    architecture exactly as is_minimax_h3_ref2va does."""
+    """Models RefMods can be used with: Ref2VA, plus FL2VA, its finetunes
+    (e.g. VDN) and the FL2VA ControlNet model when FL2VA_REFMODS is on.
+    Resolves finetunes to their architecture exactly as is_minimax_h3_ref2va
+    does."""
     if is_minimax_h3_ref2va(model_type, get_base_model_type_fn):
         return True
     if not FL2VA_REFMODS:
@@ -202,10 +210,10 @@ def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> boo
         try:
             base = get_base_model_type_fn(model_type)
             if base:
-                return str(base).startswith("minimax_h3_fl2va")
+                return str(base).startswith(_fl2va_family_prefixes())
         except Exception:
             pass
-    return model_type.startswith("minimax_h3_fl2va")
+    return model_type.startswith(_fl2va_family_prefixes())
 
 
 class _RefModImageSentinel:
@@ -796,6 +804,51 @@ def _would_shrink(sentinel, kind, pipeline_self, target_width, target_height, re
         return None, None
 
 
+def _fit_output_dims(latent, target_width, target_height):
+    """Size (width, height) in pixels that brings a mod down to the output's
+    pixel area, keeping its own aspect ratio -- or (None, None) when the mod
+    is already that size or smaller (never upscale)."""
+    try:
+        lat_h, lat_w = int(latent.shape[-2]), int(latent.shape[-1])
+        out_w, out_h = int(target_width), int(target_height)
+    except Exception:
+        return None, None
+    if out_w <= 0 or out_h <= 0 or lat_h <= 0 or lat_w <= 0:
+        return None, None
+    stored = lat_h * lat_w
+    canvas = (out_w / _VAE_SPATIAL_FACTOR) * (out_h / _VAE_SPATIAL_FACTOR)
+    if stored <= canvas:
+        return None, None
+    scale = math.sqrt(canvas / stored)
+    new_w = max(32, int(lat_w * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
+    new_h = max(32, int(lat_h * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
+    if (new_w // _VAE_SPATIAL_FACTOR) * (new_h // _VAE_SPATIAL_FACTOR) >= stored:
+        return None, None
+    return new_w, new_h
+
+
+def _fit_to_output(pipeline_self, sentinel, kind, latent, target_width=None, target_height=None):
+    """The panel's "Fit mods to the output size" (fork.18, off by default):
+    rebuild a visual mod at the output's pixel area when it is bigger. Fewer
+    reference tokens, so faster -- at the cost of some fine detail. Returns
+    the rebuilt latent, or None to keep the one given."""
+    if not getattr(pipeline_self, "_h3_fit_output", False):
+        return None
+    if not target_width or not target_height:
+        target_width, target_height = getattr(pipeline_self, "_h3_out_size", (None, None))
+    new_w, new_h = _fit_output_dims(latent, target_width, target_height)
+    if new_w is None:
+        return None
+    rebuilt = _rescaled_refmod_latent(pipeline_self, sentinel, kind, target_width=new_w,
+                                      target_height=new_h, relative=100.0, force=True)
+    if rebuilt is not None:
+        name = getattr(getattr(sentinel, "mod", None), "name", "?")
+        _log(f"fit to output: '{name}' ({kind}) {tuple(latent.shape[-2:])} -> "
+             f"{tuple(rebuilt.shape[-2:])} latent cells "
+             f"({latent.shape[-2] * latent.shape[-1]} -> {rebuilt.shape[-2] * rebuilt.shape[-1]} per frame)")
+    return rebuilt
+
+
 def _capped_rescale_size(sentinel, kind, target_width, target_height):
     """Shrink the requested phase-2 size until the rebuilt mod costs at most
     REFMOD_RESCALE_MAX_TOKEN_GROWTH times its stored token count. Returns
@@ -1285,6 +1338,9 @@ def install_patches() -> Optional[str]:
                                                   relative=image_refs_relative_size)
                 if rebuilt is not None:
                     latent = rebuilt
+            fitted = _fit_to_output(self, image, "image", latent, target_width, target_height)
+            if fitted is not None:
+                latent = fitted
             visual_latents.append(latent)
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
@@ -1318,6 +1374,10 @@ def install_patches() -> Optional[str]:
                                                   target_height=height)
                 if rebuilt is not None:
                     latent = rebuilt
+            fit_h, fit_w = getattr(video, "rescale_to", None) or (None, None)
+            fitted = _fit_to_output(self, video, "video", latent, fit_w, fit_h)
+            if fitted is not None:
+                latent = fitted
             # A mod can carry its own soundtrack. H3 handles this natively:
             # a reference video with audio is tagged "video_audio" with
             # ref_audio_t set, and the packer gives it audio rows as well as
@@ -1414,6 +1474,26 @@ def install_patches() -> Optional[str]:
         _log("no _prepare_condition_rows found on MiniMaxH3Pipeline -- RefMod references will be "
              "added immediately instead of after Wan2GP's own reference-count check, so the "
              "native 9-image / 2-video / 2-audio caps will still apply to RefMods on this build.")
+
+    _orig_prepare_control_rows = getattr(Pipeline, "_prepare_control_rows", None)
+    if _orig_prepare_control_rows is not None and CONTROLNET_REFMODS:
+        @functools.wraps(_orig_prepare_control_rows)
+        def patched_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
+                                         height, width, condition_latents, *args, **kwargs):
+            # ControlNet: the control rows carry one blank row for every
+            # condition row ahead of the video. They are built before the
+            # FL2VA mods are appended (in _prepare_condition_rows), so count
+            # the mods in here as well, or the row counts won't match.
+            if _FL2VA["active"] and _FL2VA["visual"] and isinstance(condition_latents, (list, tuple)):
+                condition_latents = list(condition_latents) + list(_FL2VA["visual"])
+                _log(f"FL2VA ControlNet: control rows padded for {len(_FL2VA['visual'])} "
+                     f"RefMod reference(s)")
+            return _orig_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
+                                              height, width, condition_latents, *args, **kwargs)
+        Pipeline._prepare_control_rows = patched_prepare_control_rows
+    elif CONTROLNET_REFMODS:
+        _log("no _prepare_control_rows found on MiniMaxH3Pipeline -- RefMods on the ControlNet "
+             "model may stop with a control-row mismatch on this Wan2GP build.")
 
     _orig_prepare_audio_references = getattr(Pipeline, "_prepare_audio_references", None)
     if _orig_prepare_audio_references is not None:
@@ -1572,7 +1652,7 @@ def install_patches() -> Optional[str]:
         fl2va = FL2VA_REFMODS and _is_fl2va_pipeline(self)
         refmod_capable = _is_ref2va_pipeline(self) or fl2va
         if refmod_capable:
-            _log(f"generate(): {'FL2VA' if fl2va else 'Ref2VA'}, "
+            _log(f"generate(): {_fl2va_label(self) if fl2va else 'Ref2VA'}, "
                  f"window {int(kwargs.get('window_no') or 1)}, "
                  f"task payload={'yes' if state_json else 'no'}, "
                  f"armed={'yes' if _ARMED['json'] else 'no'}")
@@ -1585,6 +1665,12 @@ def install_patches() -> Optional[str]:
                      "expect mods in this generation, clear the panel (or press 'Clear armed "
                      "RefMods') -- an unexpected mod takes a reference slot from your own "
                      "references.")
+        # "Fit mods to the output size" (panel option, off by default).
+        setattr(self, "_h3_out_size", (kwargs.get("width"), kwargs.get("height")))
+        setattr(self, "_h3_fit_output", _fit_output_requested(state_json))
+        if self._h3_fit_output and refmod_capable:
+            _log(f"fit to output: on -- visual mods bigger than "
+                 f"{kwargs.get('width')}x{kwargs.get('height')} are rebuilt at that pixel area")
         if state_json and fl2va:
             if not kwargs.get("refinement_mode"):
                 try:
@@ -2018,6 +2104,16 @@ ATTACHED_AUDIO_AS_SEPARATE_REF = True
 
 FL2VA_REFMODS = True
 
+# RefMods on the FL2VA ControlNet-Union model (fork.18). It is the FL2VA
+# transformer plus a control branch, so mods go in through the FL2VA route.
+# The one extra step: the control branch's rows are built with blank padding
+# for every condition row ahead of the video (start/end frames), BEFORE the
+# mods are appended, so _prepare_control_rows is patched to pad for the mods
+# too -- otherwise the transformer stops with "control rows must match the
+# packed video rows". The control branch itself only acts on text and the
+# target video, never on reference rows.
+CONTROLNET_REFMODS = True
+
 # Which RefMods get a prompt label in FL2VA.
 #   "audio" - label audio mods only (default)
 #   "all"   - label every mod, as Ref2VA does
@@ -2054,7 +2150,22 @@ def _is_fl2va_pipeline(pipeline_self) -> bool:
     return (not getattr(pipeline_self, "reference_mode", False)
             and getattr(pipeline_self, "fixed_prompt", None) is None
             and not getattr(pipeline_self, "audio_only", False)
-            and not _transformer_has_control(getattr(pipeline_self, "transformer", None)))
+            and (CONTROLNET_REFMODS
+                 or not _transformer_has_control(getattr(pipeline_self, "transformer", None))))
+
+
+def _fl2va_label(pipeline_self) -> str:
+    return ("FL2VA ControlNet" if _transformer_has_control(getattr(pipeline_self, "transformer", None))
+            else "FL2VA")
+
+
+def _fit_output_requested(state_json) -> bool:
+    if not state_json:
+        return False
+    try:
+        return bool(json.loads(state_json).get("fit_to_output", False))
+    except Exception:
+        return False
 
 
 def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
@@ -2065,6 +2176,11 @@ def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
     if built is None:
         return False
     image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention = built
+    for kind, group in (("image", image_sentinels), ("video", video_sentinels)):
+        for sentinel in group:
+            fitted = _fit_to_output(pipeline_self, sentinel, kind, sentinel.latent)
+            if fitted is not None:
+                sentinel.latent = fitted
     visual, audio, entries = [], [], []
     for sentinel in image_sentinels:
         latent = sentinel.latent
@@ -2184,6 +2300,9 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         # straight into refs/visual_latents after the cap check instead.
         for sentinel in remaining:
             latent = sentinel.latent
+            fitted = _fit_to_output(pipeline_self, sentinel, "video", latent)
+            if fitted is not None:
+                latent = fitted
             state["overflow_visual"].append((latent, {
                 "kind": "video", "latent_t": latent.shape[2],
                 "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0}))

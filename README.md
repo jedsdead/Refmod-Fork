@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.17** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.18** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -54,7 +54,7 @@ what's different.
   ComfyUI original's Apply node uses. Visual mods carry no `<Picture N>` label,
   as in ComfyUI; audio mods are labelled `<Audio N>` (see
   `FL2VA_PROMPT_LABELS`) because a voice reference has little to anchor it
-  otherwise. Control, Viggle and TTS models are excluded. The FL2VA
+  otherwise. The FL2VA ControlNet model takes mods too (since fork.18); Viggle and TTS models are excluded. The FL2VA
   checkpoint wasn't trained with references, so expect results to vary more
   than in Ref2VA.
 - **Mods with both visuals and audio.** A mod can carry a soundtrack as well
@@ -110,6 +110,7 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 | `FIT_REFMODS_TO_PHASE_1_CANVAS` | `True` | In two-phase runs, shrink mods to phase 1's half-resolution canvas. |
 | `ATTACHED_AUDIO_AS_SEPARATE_REF` | `True` | Inject a mod's soundtrack as its own `<Audio N>` reference. `False` merges it into the visual reference (`video_audio`). |
 | `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. |
+| `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model (pads its control rows for the mods). |
 | `FL2VA_PROMPT_LABELS` | `"audio"` | Which mods get a prompt label in FL2VA. `"audio"` labels audio mods as `<Audio N>`; `"none"` matches the ComfyUI original. |
 | `STABLE_REFMOD_LABELS` | `True` | In windows 2+, number mods ahead of the carried-over frame so their `<Picture N>` stays the same as in window 1. |
 | `RESCALE_REFMODS_IN_PHASE_2` | `False` | Experimental: rebuild image mods at phase 2's full resolution. |
@@ -119,6 +120,26 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.18** —
+  - **RefMods on the FL2VA ControlNet model.** The MiniMax H3 FL2VA
+    ControlNet-Union model now takes mods the same way FL2VA does, and the
+    inline panel shows for it. ControlNet builds its control rows with blank
+    padding for every reference row ahead of the video, before the mods are
+    added, so the plugin pads for the mods too -- without that the model
+    stops with "control rows must match the packed video rows". The control
+    branch only acts on the prompt and the video being made, never on the
+    mods. Neither ControlNet nor FL2VA was trained with references, so
+    results need testing; lowering *Control Strength* gives the mods more say.
+    Write prompts as for RefMod in FL2VA.
+  - **Fit mods to the output size** (inline panel, under the text encoder
+    options; **off by default**). Ticked, any picture or video mod bigger than
+    the video being made is rebuilt at the output's pixel area, keeping its
+    own shape. Fewer reference tokens, so generation is faster -- a 704p video
+    mod in a 480p generation costs about half as many tokens -- but a shrunk
+    mod carries less fine detail, faces first. Mods already that size or
+    smaller are left alone. Works in Ref2VA, FL2VA and FL2VA ControlNet. In a
+    two-phase Ref2VA run, phase 1 already fits mods to its half-size canvas;
+    this also fits them to the full output in phase 2.
 - **0.31.0-fork.17** — **Decompile tab.** A fourth tab rebuilds what a mod
   holds as ordinary files: one PNG per picture, an MP4 for a video mod (with
   its soundtrack), and a WAV for any audio. It also lists what the mod was
