@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.20** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.21** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -120,6 +120,17 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.21** — **Fix: Wan2GP could refuse to start with fork.20**
+  ("When localhost is not accessible, a shareable link must be created").
+  On the first page load Gradio lists every event handler for its API page,
+  and for each handler input it searches the whole component list. The
+  RefMods panel has a few hundred handlers that each take every picker as
+  input, so with Wan2GP's own UI around it that first load could run past the
+  3 seconds Gradio waits when it checks localhost at launch -- fork.19 was
+  already close, fork.20's extra dropdown tipped it over. The plugin's
+  handlers are now kept out of the API listing (nothing calls them through
+  the API), which takes the first page load from over 3 seconds to about
+  0.3 seconds in testing. No other changes.
 - **0.31.0-fork.20** — three things taken from the original port's 0.32-0.34
   updates:
   - **Video mods work in image (single-frame) output.** Wan2GP folds the

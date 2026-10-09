@@ -30,6 +30,7 @@ missing, even ones this panel doesn't have a dedicated widget for.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -588,6 +589,43 @@ def _format_ref_counter(rows):
            + ("\n\n**Max size:** " + " · ".join(sizes) if sizes else ""))
 
 
+def _hidden_from_api(build):
+    """Run a UI builder and keep every event handler it registers out of
+    Gradio's API listing (show_api=False).
+
+    On the first page load Gradio builds that listing for every handler, and
+    for each input it searches the whole component list -- so the work grows
+    with handlers x inputs x components. The panel's handlers take every
+    picker as input (~160 of them), and with Wan2GP's own large UI around it
+    the first page load could pass the 3 seconds Gradio allows when it checks
+    that localhost is reachable at launch. It then refuses to start with "When
+    localhost is not accessible, a shareable link must be created" (seen with
+    fork.20, fixed in fork.21). Nothing here is meant to be called through the API -- the
+    plugin runs generations through Wan2GP's own session -- so hiding them
+    loses nothing."""
+    @functools.wraps(build)
+    def wrapper(*args, **kwargs):
+        try:
+            from gradio.context import Context
+            root = Context.root_block
+            before = set(root.fns.keys()) if root is not None else None
+        except Exception:
+            root, before = None, None
+        try:
+            return build(*args, **kwargs)
+        finally:
+            if root is not None and before is not None:
+                hidden = 0
+                for key, fn in list(root.fns.items()):
+                    if key not in before and getattr(fn, "show_api", False):
+                        fn.show_api = False
+                        hidden += 1
+                if hidden:
+                    print(f"[H3RefMod] {hidden} panel event handler(s) kept out of Gradio's API "
+                          f"listing (faster first page load)")
+    return wrapper
+
+
 def _model_choices(api_session):
     try:
         records = api_session.list_model_defs(
@@ -699,7 +737,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.20"
+        self.version = "0.31.0-fork.21"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -788,6 +826,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     # ── Inline panel injected onto the Media Generator page ───────────────
 
+    @_hidden_from_api
     def _build_inline_refmods_section(self):
         # Wan2GP hands plugins their requested components out of generate_media_tab's
         # own locals(), so the key is the Python *variable* name ("model_choice_target"),
@@ -2089,6 +2128,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     # ── Tab assembly ────────────────────────────────────────────────────
 
+    @_hidden_from_api
     def create_ui(self, api_session):
         with gr.Column() as root:
             if self._patch_error:
