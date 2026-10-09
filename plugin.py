@@ -273,11 +273,59 @@ def _trim_summary(trims, names):
     return "Trimmed: " + ", ".join(parts) if parts else ""
 
 
-# Values per picker row: mod, strength, "Send as one video", "Include audio".
-ROW_WIDTH = 4
+# Values per picker row: mod, strength, "Send as one video", "Include audio",
+# "Max size" (fork.19).
+ROW_WIDTH = 5
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
-# fit to output.
-STACK_CONTROLS = 5
+# fit to output, mods in phase 2.
+STACK_CONTROLS = 6
+
+# "Max size" slider: short edge in pixels, in steps of 32, down to this.
+MAX_SIZE_FLOOR = 128
+MAX_SIZE_STEP = 32
+PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
+
+
+def _mod_short_edge(meta):
+    """A picture or video mod's short edge in pixels (16 px per latent cell),
+    or 0 when it has no size (audio, or unknown)."""
+    if not meta or meta.get("kind") == "audio":
+        return 0
+    try:
+        return min(int(meta.get("latent_h", 0)), int(meta.get("latent_w", 0))) * 16
+    except (TypeError, ValueError):
+        return 0
+
+
+def _max_size_update(meta):
+    """The "Max size" slider for a freshly picked mod: its range runs from the
+    mod's own short edge ("full size", where it starts) down to
+    MAX_SIZE_FLOOR, in MAX_SIZE_STEP steps. Hidden for audio mods and for mods
+    already too small to shrink."""
+    short = _mod_short_edge(meta)
+    if short <= MAX_SIZE_FLOOR:
+        return gr.update(visible=False, value=0)
+    lowest = short - MAX_SIZE_STEP * ((short - MAX_SIZE_FLOOR) // MAX_SIZE_STEP)
+    return gr.update(visible=True, minimum=lowest, maximum=short, value=short)
+
+
+def _shrunk_size(meta, max_size):
+    """(old w, old h, new w, new h) in pixels when the row's "Max size" shrinks
+    the mod -- the same sizing patches.py uses -- else None."""
+    short = _mod_short_edge(meta)
+    try:
+        cap = int(max_size or 0)
+    except (TypeError, ValueError):
+        return None
+    if not short or cap < 32 or cap >= short:
+        return None
+    lat_h, lat_w = int(meta.get("latent_h", 0)), int(meta.get("latent_w", 0))
+    scale = cap / float(short)
+    new_w = max(32, int(lat_w * 16 * scale) // 32 * 32)
+    new_h = max(32, int(lat_h * 16 * scale) // 32 * 32)
+    if (new_w // 16) * (new_h // 16) >= lat_h * lat_w:
+        return None
+    return lat_w * 16, lat_h * 16, new_w, new_h
 
 
 def _row_boxes_update(name, kind="image"):
@@ -293,13 +341,15 @@ def _row_boxes_update(name, kind="image"):
     multi = (kind == "image" and bool(meta) and _is_picture_mod(meta)
              and int(meta.get("latent_t", 1) or 1) > 1)
     has_audio = bool(meta) and meta.get("kind") != "audio" and bool(meta.get("has_audio"))
-    return gr.update(visible=multi, value=False), gr.update(visible=has_audio, value=True)
+    return (gr.update(visible=multi, value=False), gr.update(visible=has_audio, value=True),
+            _max_size_update(meta))
 
 
 def _cleared_row_updates():
     """gr.update()s returning one picker row to empty."""
     return [gr.update(value=NONE_CHOICE), gr.update(value=1.0),
-            gr.update(value=False, visible=False), gr.update(value=True, visible=False)]
+            gr.update(value=False, visible=False), gr.update(value=True, visible=False),
+            gr.update(value=0, visible=False)]
 
 
 def _rows_payload(values):
@@ -307,27 +357,32 @@ def _rows_payload(values):
     (ROW_WIDTH per row): one entry per row with a mod and strength > 0."""
     rows = []
     for i in range(0, len(values) - ROW_WIDTH + 1, ROW_WIDTH):
-        name, strength, as_video, use_audio = values[i:i + ROW_WIDTH]
+        name, strength, as_video, use_audio, max_size = values[i:i + ROW_WIDTH]
         try:
             strength = float(strength)
         except (TypeError, ValueError):
             continue
         if name and name != NONE_CHOICE and strength > 0:
-            rows.append({"mod": name, "strength": strength, "as_video": bool(as_video),
-                         "use_audio": bool(use_audio)})
+            row = {"mod": name, "strength": strength, "as_video": bool(as_video),
+                   "use_audio": bool(use_audio)}
+            # Only when it actually shrinks the mod: "full size" is left out.
+            if _shrunk_size(_row_meta(name, strength), max_size):
+                row["max_size"] = int(max_size)
+            rows.append(row)
     return rows
 
 
 def _normalize_rows(rows):
-    """Picker rows as (name, strength, send-as-one-video, include-audio);
-    rows with fewer values mean "not sent as one video" and "audio
-    included"."""
+    """Picker rows as (name, strength, send-as-one-video, include-audio,
+    max-size); rows with fewer values mean "not sent as one video", "audio
+    included" and "full size"."""
     out = []
     for row in rows or []:
         row = tuple(row)
         out.append((row[0], row[1],
                     bool(row[2]) if len(row) > 2 else False,
-                    bool(row[3]) if len(row) > 3 else True))
+                    bool(row[3]) if len(row) > 3 else True,
+                    row[4] if len(row) > 4 else None))
     return out
 
 
@@ -366,7 +421,7 @@ def _is_picture_mod(meta):
 
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
-                   fit_to_output=False):
+                   fit_to_output=False, phase2_mods="full"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown. Whether a
@@ -383,7 +438,9 @@ def _stack_payload(stack_mode, stack_n,
             "video_frames": vmode,
             "video_frames_n": count(video_n, encframes.MAX_CLIP_FRAMES_SHOWN),
             # "Fit mods to the output size" (fork.18, off by default).
-            "fit_to_output": bool(fit_to_output)}
+            "fit_to_output": bool(fit_to_output),
+            # "Mods in phase 2" (fork.19): full / tile / off.
+            "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full"}
 
 
 def _format_label_line(rows):
@@ -392,7 +449,7 @@ def _format_label_line(rows):
     then audio, each in row order). Assumes no start image and no references
     of the generation's own, which are numbered ahead of the mods."""
     pictures, videos, audios = [], [], []    # (mod name, count)
-    for name, strength, as_video, use_audio in _normalize_rows(rows):
+    for name, strength, as_video, use_audio, _max_size in _normalize_rows(rows):
         meta = _row_meta(name, strength)
         if meta is None:
             continue
@@ -449,7 +506,8 @@ def _format_ref_counter(rows):
     n_video_files = 0
     n_audio_files = 0
     n_soundtracks = 0
-    for name, strength, as_video, use_audio in _normalize_rows(rows):
+    sizes = []
+    for name, strength, as_video, use_audio, max_size in _normalize_rows(rows):
         try:
             strength = float(strength)
         except (TypeError, ValueError):
@@ -464,6 +522,11 @@ def _format_ref_counter(rows):
             continue
         kind = meta.get("kind", "image")
         latent_t = max(1, int(meta.get("latent_t", 1)))
+        shrunk = _shrunk_size(meta, max_size)
+        if shrunk:
+            ow, oh, nw, nh = shrunk
+            sizes.append(f"`{name}` {ow}×{oh} → {nw}×{nh}px "
+                         f"(~{100.0 * (nw // 16) * (nh // 16) / max(1, (ow // 16) * (oh // 16)):.0f}% of its tokens)")
         if _is_picture_mod(meta) and as_video and latent_t > 1:
             n_stacks += 1          # one video reference; pictures have no duration
         elif _is_picture_mod(meta):
@@ -518,7 +581,8 @@ def _format_ref_counter(rows):
            f"(documented: 15s, at {FPS_ASSUMED_FOR_DURATION_ESTIMATE}fps)&nbsp;&nbsp;&nbsp;"
            f"{aud_mark} **Audio: {audio_seconds_total:.1f}s**{aud_files} (documented: 15s)"
            f"{note}"
-           + (f"\n\n{label_line}" if label_line else ""))
+           + (f"\n\n{label_line}" if label_line else "")
+           + ("\n\n**Max size:** " + " · ".join(sizes) if sizes else ""))
 
 
 def _model_choices(api_session):
@@ -632,7 +696,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.18"
+        self.version = "0.31.0-fork.19"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -835,14 +899,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         one slot per kind (image, video, audio) with Add / Remove buttons
         revealing up to IMAGE_ROWS / VIDEO_ROWS / AUDIO_ROWS -- all wired
         before returning. Returns the flat list of (dropdown, strength,
-        send-as-one-video, include-audio) rows (ROW_WIDTH values each), image
+        send-as-one-video, include-audio, max-size) rows (ROW_WIDTH values each), image
         rows first, then video rows, then audio rows. "Send as one video" only
         shows on image rows holding a multi-picture mod, "Include audio" only
         on image/video rows holding a mod with a soundtrack. Callers must keep
         that order when reading values
         back (_refresh_mod_dropdown_updates() does too) -- plus the encoder
         controls (picture mode, N, video mode, N) and the "Fit mods to the
-        output size" box -- STACK_CONTROLS values -- which callers put into
+        output size" box and the "Mods in phase 2" choice -- STACK_CONTROLS
+        values -- which callers put into
         the selection payload with _stack_payload()."""
         with gr.Row():
             folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
@@ -877,13 +942,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                          "lighter text encode and slightly faster steps.")
                 video_n = gr.Number(value=encframes.MAX_CLIP_FRAMES_SHOWN, precision=0, minimum=1,
                                     maximum=256, label="N", scale=1)
-        fit_to_output = gr.Checkbox(
-            False, label="Fit mods to the output size (faster)",
-            info="Off: every picture and video mod goes in at the size it was extracted at. "
-                 "On: a mod bigger than the video you're making is shrunk to its size first, "
-                 "keeping its shape. Fewer tokens, so generation is faster -- but a shrunk mod "
-                 "carries less fine detail, faces first. Mods already that size or smaller are "
-                 "left alone. Works in Ref2VA, FL2VA and FL2VA ControlNet.")
+        with gr.Row():
+            fit_to_output = gr.Checkbox(
+                False, label="Fit mods to the output size (faster)", scale=2,
+                info="Off: every picture and video mod goes in at the size it was extracted "
+                     "at. On: a mod bigger than the video you're making is shrunk to its size "
+                     "first, keeping its shape. Fewer tokens, so generation is faster -- but a "
+                     "shrunk mod carries less fine detail, faces first. Mods already that size or "
+                     "smaller are left alone. Works in Ref2VA, FL2VA and FL2VA ControlNet.")
+            phase2_mods = gr.Dropdown(
+                choices=PHASE2_MODS_UI, value="full", label="Mods in phase 2", scale=1,
+                info="Two-phase runs only. Full: mods as set above. Fit to tile: with phase 2 "
+                     "tiling on, each mod is shrunk to one tile, so the 4 tiles pay a quarter "
+                     "each. Off (experimental): phase 2 runs without the visual mods -- fastest, "
+                     "but faces may drift. Ref2VA keeps them if you also use references of your "
+                     "own.")
 
         # One slot per kind to start with; "Add" reveals the next one and
         # "Remove" clears and hides the last. Every slot is still built up
@@ -904,17 +977,22 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 with gr.Row(visible=i == 0) as row_ui:
                     mdd = gr.Dropdown(choices=_mod_choices(kind), value=NONE_CHOICE,
                                       label=f"{kind.capitalize()} mod {i + 1}", scale=4)
-                    strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength",
-                                         scale=3)
-                    as_video = gr.Checkbox(False, label="Send as one video", visible=False,
-                                           scale=1, min_width=130)
-                    use_audio = gr.Checkbox(True, label="Include audio", visible=False,
-                                            scale=1, min_width=120)
-                kind_rows.append((mdd, strength, as_video, use_audio))
+                    with gr.Column(scale=3, min_width=220):
+                        strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength")
+                        # "Max size" (fork.19): shown once a picture or video
+                        # mod is picked; starts at the mod's own size (full).
+                        max_size = gr.Slider(MAX_SIZE_FLOOR, 1024, value=0, step=MAX_SIZE_STEP,
+                                             label="Max size (short edge, px)", visible=False,
+                                             info="Starts at the mod's own size. Lower = fewer "
+                                                  "tokens and faster, less fine detail.")
+                    with gr.Column(scale=1, min_width=130):
+                        as_video = gr.Checkbox(False, label="Send as one video", visible=False)
+                        use_audio = gr.Checkbox(True, label="Include audio", visible=False)
+                kind_rows.append((mdd, strength, as_video, use_audio, max_size))
                 kind_ui.append(row_ui)
                 if kind != "audio":
                     mdd.change(fn=lambda name, _kind=kind: _row_boxes_update(name, _kind),
-                               inputs=[mdd], outputs=[as_video, use_audio], queue=False)
+                               inputs=[mdd], outputs=[as_video, use_audio, max_size], queue=False)
             with gr.Row():
                 add_btn = gr.Button(f"➕ Add {kind} mod", size="sm", scale=0, min_width=150)
                 remove_btn = gr.Button("➖ Remove last", size="sm", scale=0, min_width=150)
@@ -965,7 +1043,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         video_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
-        return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output)
+        return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods)
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"

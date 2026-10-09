@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.18** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.19** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -120,6 +120,33 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.19** — **Mod size controls.**
+  - **Max size, per mod.** Each picture and video row in the inline panel has
+    a *Max size* slider under *Strength*, shown once a mod is picked. It
+    starts at the mod's own size (full) and goes down in 32-pixel steps on
+    the short edge, keeping the mod's shape. A smaller size means fewer
+    tokens and a faster generation, at the cost of fine detail, faces first.
+    The readout shows each shrink and roughly what share of the mod's tokens
+    is left. It applies to single-phase runs and to phase 2. Audio mods and
+    mods already too small to shrink have no slider.
+  - **Mods in phase 2** (inline panel, two-phase runs only): *Full* (default)
+    keeps the mods as set; *Fit to tile* shrinks each mod to one tile of a
+    tiled phase 2, so the four tiles stop paying full price for every mod
+    (with tiling off it behaves like Full); *Off* (experimental) runs phase 2
+    without the visual mods -- fastest, but faces may drift. Audio mods stay
+    in, and in Ref2VA the mods keep their prompt labels. Ref2VA keeps the mods
+    in phase 2 anyway when the generation has reference images or videos of
+    its own, because it lines phase 2's references up with phase 1's by
+    position.
+  - **FL2VA phase 1 now shrinks mods to the half-size phase-1 picture**, as
+    Ref2VA has done since fork.9. Before, FL2VA mods went into phase 1 at
+    full size.
+  - Shrinking is done inside the generation with its own, already-loaded
+    video VAE: each mod is decoded, resized and re-encoded once, then kept in
+    memory for later windows and runs at the same size. When several limits
+    apply (Max size, Fit mods to the output size, the phase-1 canvas, a
+    phase-2 tile), the smallest wins. Mods are only ever shrunk, never
+    enlarged.
 - **0.31.0-fork.18** —
   - **RefMods on the FL2VA ControlNet model.** The MiniMax H3 FL2VA
     ControlNet-Union model now takes mods the same way FL2VA does, and the
