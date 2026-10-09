@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.19** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.20** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -120,6 +120,23 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.20** — three things taken from the original port's 0.32-0.34
+  updates:
+  - **Video mods work in image (single-frame) output.** Wan2GP folds the
+    reference video into the reference pictures when making an image; a video
+    mod used to crash there. Its first frame is now used as a picture (logged
+    once), with its prompt label. A picture mod handed to the video path is
+    treated as a one-picture clip.
+  - **Shrink method** (inline panel, next to *Mods in phase 2*):
+    *Re-encode* (default, as before) decodes the mod, resizes it and
+    re-encodes it with the loaded VAE -- best quality, a few seconds per mod
+    once. *Fast* resizes the stored mod directly by averaging its latent
+    cells -- instant, no VAE and no model swap, but rougher. It applies to
+    every shrink: Max size, Fit mods, the phase-1 canvas and phase-2 tiles.
+  - **Video mods keep their shape in phase 1** of a two-phase Ref2VA run.
+    They used to be stretched to the half-size canvas (the way Wan2GP treats
+    its own reference videos), while phase 2 kept their real shape; now both
+    phases agree.
 - **0.31.0-fork.19** — **Mod size controls.**
   - **Max size, per mod.** Each picture and video row in the inline panel has
     a *Max size* slider under *Strength*, shown once a mod is picked. It

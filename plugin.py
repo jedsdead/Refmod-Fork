@@ -277,13 +277,14 @@ def _trim_summary(trims, names):
 # "Max size" (fork.19).
 ROW_WIDTH = 5
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
-# fit to output, mods in phase 2.
-STACK_CONTROLS = 6
+# fit to output, mods in phase 2, shrink method.
+STACK_CONTROLS = 7
 
 # "Max size" slider: short edge in pixels, in steps of 32, down to this.
 MAX_SIZE_FLOOR = 128
 MAX_SIZE_STEP = 32
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
+SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
 def _mod_short_edge(meta):
@@ -421,7 +422,7 @@ def _is_picture_mod(meta):
 
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
-                   fit_to_output=False, phase2_mods="full"):
+                   fit_to_output=False, phase2_mods="full", shrink_method="reencode"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown. Whether a
@@ -440,7 +441,9 @@ def _stack_payload(stack_mode, stack_n,
             # "Fit mods to the output size" (fork.18, off by default).
             "fit_to_output": bool(fit_to_output),
             # "Mods in phase 2" (fork.19): full / tile / off.
-            "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full"}
+            "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
+            # "Shrink method" (fork.20): reencode / fast.
+            "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode"}
 
 
 def _format_label_line(rows):
@@ -696,7 +699,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.19"
+        self.version = "0.31.0-fork.20"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -906,7 +909,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         that order when reading values
         back (_refresh_mod_dropdown_updates() does too) -- plus the encoder
         controls (picture mode, N, video mode, N) and the "Fit mods to the
-        output size" box and the "Mods in phase 2" choice -- STACK_CONTROLS
+        output size" box, the "Mods in phase 2" and "Shrink method" choices -- STACK_CONTROLS
         values -- which callers put into
         the selection payload with _stack_payload()."""
         with gr.Row():
@@ -957,6 +960,12 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                      "each. Off (experimental): phase 2 runs without the visual mods -- fastest, "
                      "but faces may drift. Ref2VA keeps them if you also use references of your "
                      "own.")
+            shrink_method = gr.Dropdown(
+                choices=SHRINK_METHOD_UI, value="reencode", label="Shrink method", scale=1,
+                info="How a mod is made smaller (Max size, Fit mods, phase 1, tiles). Re-encode: "
+                     "decoded, resized and re-encoded with the loaded VAE -- best quality, takes a "
+                     "few seconds per mod once. Fast: the stored mod is resized directly -- "
+                     "instant, no VAE, but rougher.")
 
         # One slot per kind to start with; "Add" reveals the next one and
         # "Remove" clears and hides the last. Every slot is still built up
@@ -1043,7 +1052,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         video_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
-        return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods)
+        return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods,
+                          shrink_method)
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"

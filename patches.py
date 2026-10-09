@@ -62,6 +62,7 @@ from typing import Optional
 import collections
 import math
 import torch
+import torch.nn.functional as F
 
 from . import core, encframes, storage
 
@@ -332,6 +333,37 @@ class _RefModVideoSentinel:
                  f"{self.latent.shape[2]} latent frames to share Wan2GP's time budget")
             return trimmed
         raise TypeError(f"_RefModVideoSentinel supports only [:, :n] slicing, got {key!r}")
+
+
+def _video_sentinel_as_still(video):
+    """A video-kind RefMod as a one-picture reference: its first latent frame,
+    shown to the text encoder as its first stored frame."""
+    still = _RefModImageSentinel(
+        video.latent[:, :, :1],
+        None if video.preview_latent is None else video.preview_latent[:, :, :1],
+        None if video.preview_key is None else tuple(video.preview_key) + ("still",),
+        audio_latent=None, mod=video.mod, still_index=0, enc_strength=video.enc_strength)
+    still.hide_ref = video.hide_ref
+    still.max_short = getattr(video, "max_short", None)
+    if not _VIDEO_AS_STILL_LOGGED["done"]:
+        _VIDEO_AS_STILL_LOGGED["done"] = True
+        _log("a video RefMod was handed to the picture path (image output); using its first frame "
+             "as a picture reference")
+    return still
+
+
+def _image_sentinel_as_clip(image):
+    """A picture RefMod on the video path: a one-picture stack."""
+    clip = _RefModVideoSentinel(
+        image.latent, image.preview_latent,
+        None if image.preview_key is None else tuple(image.preview_key) + ("clip",),
+        audio_latent=None, mod=image.mod, enc_strength=image.enc_strength, is_stack=True)
+    clip.hide_ref = image.hide_ref
+    clip.max_short = getattr(image, "max_short", None)
+    return clip
+
+
+_VIDEO_AS_STILL_LOGGED = {"done": False}
 
 
 class _RefModAudioSentinel:
@@ -799,7 +831,12 @@ def _would_shrink(sentinel, kind, pipeline_self, target_width, target_height, re
             new_h, new_w = h3_pipeline._resolve_canvas(
                 stored_w, stored_h, math.sqrt(budget / max(ratio, 1 / ratio)))
         else:
-            new_h, new_w = int(target_height), int(target_width)
+            # fork.20: a video mod keeps its own shape (fitted to the canvas's
+            # pixel area) instead of being stretched to the canvas -- so
+            # phase 1 matches phase 2, where it is never stretched.
+            new_w, new_h = _fit_output_dims(sentinel.latent, target_width, target_height)
+            if new_w is None:
+                return None, None
         if (new_h // _VAE_SPATIAL_FACTOR) * (new_w // _VAE_SPATIAL_FACTOR) >= lat_h * lat_w:
             return None, None  # same size or larger -- leave the stored latent alone
         return int(new_w), int(new_h)
@@ -980,6 +1017,9 @@ def _rescaled_refmod_latent(pipeline_self, sentinel, kind, target_width=None,
     opt-in phase-2 upscale. Returns None to keep the stored latent."""
     if not target_width or not target_height:
         return None
+    if force and getattr(pipeline_self, "_h3_shrink_fast", False):
+        # "Shrink method: Fast" (fork.20): resize the stored latent itself.
+        return _resample_latent(sentinel.latent, target_width, target_height, kind)
     if not force:
         # phase-2 upscale path (opt-in)
         if not RESCALE_REFMODS_IN_PHASE_2:
@@ -1041,6 +1081,27 @@ def _rescaled_refmod_latent(pipeline_self, sentinel, kind, target_width=None,
     except Exception:
         _log("could not rebuild a RefMod at this size; using its stored latent as before:\n"
              + traceback.format_exc())
+        return None
+
+
+def _resample_latent(latent, target_width, target_height, kind=""):
+    """Shrink a stored latent to (width, height) pixels by averaging latent
+    cells -- spatial axes only (time and the 24 channels untouched), both axes
+    even for the DiT's 2x2 patches, never enlarged. No VAE is involved, so it
+    is near-instant and needs no model swap, but averaging latent cells is
+    rougher than decoding, resizing the pixels and re-encoding."""
+    try:
+        lat_t, lat_h, lat_w = int(latent.shape[2]), int(latent.shape[-2]), int(latent.shape[-1])
+        new_h = max(2, (int(target_height) // _VAE_SPATIAL_FACTOR) // 2 * 2)
+        new_w = max(2, (int(target_width) // _VAE_SPATIAL_FACTOR) // 2 * 2)
+        if new_h * new_w >= lat_h * lat_w or new_h > lat_h or new_w > lat_w:
+            return None
+        out = F.interpolate(latent.float(), size=(lat_t, new_h, new_w), mode="area")
+        _log(f"fast shrink: {kind}-kind RefMod latent {lat_h}x{lat_w} -> {new_h}x{new_w} cells "
+             f"(resampled, not re-encoded)")
+        return out.to(latent.dtype)
+    except Exception:
+        _log("fast shrink failed; keeping the stored latent:\n" + traceback.format_exc())
         return None
 
 
@@ -1412,6 +1473,12 @@ def install_patches() -> Optional[str]:
     @functools.wraps(_orig_add_image_reference)
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
+        if isinstance(image, _RefModVideoSentinel):
+            # Image (single-frame) output folds the reference video into the
+            # reference images (pipeline.py: "if image_outputs and
+            # video_references"). A moving reference means nothing for one
+            # frame, so the mod's first frame is used as a picture.
+            image = _video_sentinel_as_still(image)
         if isinstance(image, _RefModImageSentinel):
             latent = image.latent
             if _gen_state(self)["phase"] == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS \
@@ -1461,6 +1528,10 @@ def install_patches() -> Optional[str]:
 
     @functools.wraps(_orig_add_video_reference)
     def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
+        if isinstance(video, _RefModImageSentinel):
+            # Not routed this way by this plugin, but another one could: a
+            # picture on the video path is the one-frame clip it already is.
+            video = _image_sentinel_as_clip(video)
         if isinstance(video, _RefModVideoSentinel):
             latent = video.latent
             if _gen_state(self)["phase"] == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS \
@@ -1781,6 +1852,7 @@ def install_patches() -> Optional[str]:
         # each row's "Max size" and "Mods in phase 2" (fork.19).
         setattr(self, "_h3_out_size", (kwargs.get("width"), kwargs.get("height")))
         setattr(self, "_h3_fit_output", _fit_output_requested(state_json))
+        setattr(self, "_h3_shrink_fast", _shrink_method_requested(state_json) == SHRINK_FAST)
         setattr(self, "_h3_tiled_p2", bool(self._h3_two_phase)
                 and _tiling_flag() in str(kwargs.get("video_prompt_type") or ""))
         p2_mode = _phase2_mode_requested(state_json) if self._h3_two_phase else PHASE2_MODS_FULL
@@ -2351,6 +2423,19 @@ def _phase2_mode_requested(state_json) -> str:
     except Exception:
         return PHASE2_MODS_FULL
     return mode if mode in PHASE2_MODS_CHOICES else PHASE2_MODS_FULL
+
+
+SHRINK_REENCODE, SHRINK_FAST = "reencode", "fast"
+
+
+def _shrink_method_requested(state_json) -> str:
+    if not state_json:
+        return SHRINK_REENCODE
+    try:
+        method = str(json.loads(state_json).get("shrink_method") or SHRINK_REENCODE).lower()
+    except Exception:
+        return SHRINK_REENCODE
+    return method if method in (SHRINK_REENCODE, SHRINK_FAST) else SHRINK_REENCODE
 
 
 def _fit_output_requested(state_json) -> bool:

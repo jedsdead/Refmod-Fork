@@ -1,7 +1,7 @@
 {
   "name": "MiniMax H3 RefMods (jedsdead fork)",
   "author": "fork by jedsdead; original Wan2GP port by g3n3rativ3; original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
-  "version": "0.31.0-fork.19",
+  "version": "0.31.0-fork.20",
   "description": "No-training 'reference mods' for MiniMax H3 Ref2VA, FL2VA and FL2VA ControlNet: compress an image/video/audio reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation. Fork with sliding-window, two-phase, FL2VA and combined visual+audio mod support.",
   "type": [
     "app"
