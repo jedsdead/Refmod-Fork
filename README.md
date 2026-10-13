@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.21** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.22** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -120,6 +120,25 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.22** — **Works with 2 Phases Plus (H3 Upscaler tab) again.**
+  - That plugin builds its own copy of the RefMods panel by calling
+    `MiniMaxH3RefModsPlugin._build_mod_picker_rows(None)` and expects the
+    original port's shape: a list of (mod, strength) rows. This fork returned
+    its rows plus a group of panel options, which stopped Wan2GP from starting
+    ("'tuple' object has no attribute 'change'"). `_build_mod_picker_rows`
+    now returns that original shape -- a compact panel (6 picture, 3 video,
+    3 audio slots; mod and strength only, which is all the caller reads) --
+    and this plugin's own panels use `_build_mod_picker_rows_full`.
+  - The one custom setting is now declared as `h3_refmod_state`, the original
+    port's id, so a selection another plugin hands to its task under that key
+    is kept by Wan2GP and understood: this fork's own format, a plain
+    selection, or the original port's extraction wrapper. The fork.12-21 key
+    (`h3_refmod`) is still read.
+  - A 2 Phases Plus upscale no longer falls back to the Media Generator
+    panel's armed mods when its own panel has none picked.
+  - Each panel's "update the readout" and "arm the selection" actions are now
+    one Gradio handler each instead of one per widget -- the same behaviour,
+    far less work on the first page load.
 - **0.31.0-fork.21** — **Fix: Wan2GP could refuse to start with fork.20**
   ("When localhost is not accessible, a shareable link must be created").
   On the first page load Gradio lists every event handler for its API page,

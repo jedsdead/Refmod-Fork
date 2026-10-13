@@ -59,6 +59,8 @@ PlugIn_Id = "H3RefMods"
 # image references working correctly. Raise these if you want more slots --
 # the live counter below will keep telling you what you're actually sending.
 IMAGE_ROWS = 20
+# The compact panel other plugins get through _build_mod_picker_rows (fork.22).
+BASIC_IMAGE_ROWS, BASIC_VIDEO_ROWS, BASIC_AUDIO_ROWS = 6, 3, 3
 VIDEO_ROWS = 6
 AUDIO_ROWS = 4
 try:
@@ -737,7 +739,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.21"
+        self.version = "0.31.0-fork.22"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -848,7 +850,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "Extract new RefMods from the **MiniMax H3 RefMods** tab. Selecting a mod here "
                 "applies immediately to generations started from *this page's* own Generate "
                 "button -- no separate submission needed.")
-            mod_rows, stack_controls = self._build_mod_picker_rows()
+            mod_rows, stack_controls = self._build_mod_picker_rows_full()
             with gr.Row():
                 status = gr.Markdown("*No RefMods selected.*")
                 clear_btn = gr.Button("Clear armed RefMods", size="sm", scale=0)
@@ -901,8 +903,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                         outputs=[self.state, status] + [c for row in mod_rows for c in row],
                         queue=False)
 
-        for w in widgets:
-            w.change(fn=apply_selection, inputs=[self.state] + widgets, outputs=[self.state, status], queue=False)
+        # One handler for every widget (gr.on), not one per widget: each
+        # handler takes all ~160 widgets as inputs, and Gradio's first page
+        # load does work for every handler x input (see _hidden_from_api).
+        gr.on(triggers=[w.change for w in widgets], fn=apply_selection,
+              inputs=[self.state] + widgets, outputs=[self.state, status], queue=False)
 
         if target is not None:
             get_base_mt = getattr(self, "get_base_model_type", None)
@@ -935,7 +940,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     # ── Extract ─────────────────────────────────────────────────────────
 
-    def _build_mod_picker_rows(self):
+    def _build_mod_picker_rows(self=None):
+        """For OTHER plugins (fork.22). The original port's panel builder
+        returned a plain list of (mod dropdown, strength slider) rows, and
+        plugins such as "2 Phases Plus" (H3 Upscaler tab) build their own copy
+        of the panel by calling this through the class, with no plugin
+        instance: MiniMaxH3RefModsPlugin._build_mod_picker_rows(None). This
+        fork's panel returns more than that, which crashed them ("'tuple'
+        object has no attribute 'change'"). So this keeps the original shape:
+        a compact panel (fewer slots, mod + strength per row, no extra
+        options -- the caller only reads mod and strength) returned as a list
+        of 2-tuples. This plugin's own panels use _build_mod_picker_rows_full."""
+        rows, _ = _hidden_from_api(MiniMaxH3RefModsPlugin._build_mod_picker_rows_full)(self, basic=True)
+        return [tuple(row) for row in rows]
+
+    def _build_mod_picker_rows_full(self, basic=False):
         """The mod pickers: a folder picker + "Refresh mod list" button, the
         live budget/label readout, the "Text encoder options" accordion, then
         one slot per kind (image, video, audio) with Add / Remove buttons
@@ -962,7 +981,10 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # is selected (with each mod's prompt label), then the text encoder
         # options.
         counter = gr.Markdown(_format_ref_counter([]))
-        with gr.Accordion("Text encoder options", open=True):
+        if basic:
+            stack_mode = stack_n = video_mode = video_n = None
+            fit_to_output = phase2_mods = shrink_method = None
+        with gr.Accordion("Text encoder options", open=True, visible=not basic):
             gr.Markdown("How many pictures of each mod the text encoder is shown, to bind its "
                         "prompt label. The model always receives every mod in full.")
             with gr.Row():
@@ -984,7 +1006,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                          "lighter text encode and slightly faster steps.")
                 video_n = gr.Number(value=encframes.MAX_CLIP_FRAMES_SHOWN, precision=0, minimum=1,
                                     maximum=256, label="N", scale=1)
-        with gr.Row():
+        with gr.Row(visible=not basic):
             fit_to_output = gr.Checkbox(
                 False, label="Fit mods to the output size (faster)", scale=2,
                 info="Off: every picture and video mod goes in at the size it was extracted "
@@ -1013,18 +1035,26 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # then video rows, then audio rows, each a (dropdown, strength,
         # send-as-one-video) triple.
         mod_rows = []
-        for kind, label, count in (("image", "Image RefMods", IMAGE_ROWS),
-                                   ("video", "Video RefMods", VIDEO_ROWS),
-                                   ("audio", "Audio RefMods", AUDIO_ROWS)):
+        counts = ((BASIC_IMAGE_ROWS, BASIC_VIDEO_ROWS, BASIC_AUDIO_ROWS) if basic
+                  else (IMAGE_ROWS, VIDEO_ROWS, AUDIO_ROWS))
+        for kind, label, count in (("image", "Image RefMods", counts[0]),
+                                   ("video", "Video RefMods", counts[1]),
+                                   ("audio", "Audio RefMods", counts[2])):
             note = (" -- a mod made from several pictures also gets a **Send as one video** "
                     "box: ticked, it is one `<Video N>` in the prompt instead of one "
-                    "`<Picture N>` per picture." if kind == "image" else "")
+                    "`<Picture N>` per picture." if kind == "image" and not basic else "")
             gr.Markdown(f"**{label}**{note}")
             kind_rows, kind_ui = [], []
             for i in range(count):
                 with gr.Row(visible=i == 0) as row_ui:
                     mdd = gr.Dropdown(choices=_mod_choices(kind), value=NONE_CHOICE,
                                       label=f"{kind.capitalize()} mod {i + 1}", scale=4)
+                    if basic:
+                        strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength",
+                                             scale=3)
+                        kind_rows.append((mdd, strength))
+                        kind_ui.append(row_ui)
+                        continue
                     with gr.Column(scale=3, min_width=220):
                         strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength")
                         # "Max size" (fork.19): shown once a picture or video
@@ -1051,16 +1081,18 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 n = min(_count, int(n or 1) + 1)
                 return [n] + [gr.update(visible=k < n) for k in range(_count)]
 
-            def remove_slot(n, _count=count):
+            _width = len(kind_rows[0]) if kind_rows else ROW_WIDTH
+
+            def remove_slot(n, _count=count, _width=_width):
                 n = max(1, int(n or 1))
                 last = n - 1                       # the slot being cleared
                 n = max(1, n - 1)
                 cleared = []
                 for k in range(_count):
                     if k == last:
-                        cleared += _cleared_row_updates()
+                        cleared += _cleared_row_updates()[:_width]
                     else:
-                        cleared += [gr.update()] * ROW_WIDTH
+                        cleared += [gr.update()] * _width
                 return [n] + [gr.update(visible=k < n) for k in range(_count)] + cleared
 
             add_btn.click(fn=add_slot, inputs=[shown], outputs=[shown] + kind_ui, queue=False)
@@ -1079,13 +1111,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         folder_dd.change(fn=_refresh_mod_dropdown_updates, inputs=picker_inputs,
                          outputs=picker_outputs, queue=False)
 
+        width = len(mod_rows[0]) if mod_rows else ROW_WIDTH
+
         def update_counter(*vals):
-            rows = [tuple(vals[i * ROW_WIDTH:(i + 1) * ROW_WIDTH]) for i in range(len(mod_rows))]
+            rows = [tuple(vals[i * width:(i + 1) * width]) for i in range(len(mod_rows))]
             return _format_ref_counter(rows)
 
         row_widgets = [c for row in mod_rows for c in row]
-        for w in row_widgets:
-            w.change(fn=update_counter, inputs=row_widgets, outputs=[counter], queue=False)
+        gr.on(triggers=[w.change for w in row_widgets], fn=update_counter, inputs=row_widgets,
+              outputs=[counter], queue=False)
+        if basic:
+            return mod_rows, None
         stack_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[stack_mode], outputs=[stack_n], queue=False)
         video_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
@@ -1991,7 +2027,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                  label="Reference image budget (% of output pixels)",
                                                  info="Higher = more reference detail kept, slower.")
 
-        mod_rows, stack_controls = self._build_mod_picker_rows()
+        mod_rows, stack_controls = self._build_mod_picker_rows_full()
 
         with gr.Accordion("Advanced Mode", open=False):
             with gr.Tab("LoRAs"):

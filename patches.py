@@ -80,7 +80,17 @@ SETTING_EXTRACT = "h3_refmod_extract"    # custom_settings key: "run an extracti
 # A character Wan2GP never uses in a video prompt type, so a custom setting
 # keyed to it is never shown (see install_model_def_patch).
 HIDDEN_SETTING_FLAG = "\u00a7"
-SETTING_COMBINED = "h3_refmod"           # {"state": <selection json>, "extract": <job json>}
+# The one custom setting this plugin declares. Since fork.22 its id is
+# "h3_refmod_state" -- the id the original port uses -- so other plugins that
+# hand a RefMod selection to a task under that key (e.g. 2 Phases Plus' H3
+# Upscaler tab) are understood, and Wan2GP keeps the key because it is
+# declared. It holds either this fork's {"state": ..., "extract": ...} blob,
+# a plain selection ({"rows": [...]}) from another plugin, or the original
+# port's {"__h3refmod_extract__": spec}. Forks 12-21 used "h3_refmod"; that
+# key is still read.
+SETTING_COMBINED = "h3_refmod_state"
+LEGACY_SETTING_COMBINED = "h3_refmod"
+UPSTREAM_EXTRACT_WRAPPER_KEY = "__h3refmod_extract__"
 CUSTOM_SETTINGS_MAX_ASSUMED = 5
 
 
@@ -95,22 +105,37 @@ def pack_refmod_setting(state_json=None, extract_json=None) -> str:
 
 def unpack_refmod_setting(custom_settings):
     """(selection json, extraction job json) from a task's custom_settings.
-    Reads the combined key, and still honours the two legacy keys so tasks
-    queued by an older build -- or settings saved from one -- keep working."""
+    Reads the declared key in any of the shapes it can hold (see
+    SETTING_COMBINED), the fork.12-21 key, and the original two legacy keys,
+    so tasks queued by older builds -- or settings saved from one -- keep
+    working."""
     if not isinstance(custom_settings, dict):
         return None, None
-    state = custom_settings.get(SETTING_GENERATE) or None
+    state = None
     extract = custom_settings.get(SETTING_EXTRACT) or None
-    blob = custom_settings.get(SETTING_COMBINED)
-    if blob:
+    for key in (LEGACY_SETTING_COMBINED, SETTING_COMBINED):   # the declared key wins
+        blob = custom_settings.get(key)
+        if not blob:
+            continue
         try:
             parsed = json.loads(blob) if isinstance(blob, str) else blob
-            if isinstance(parsed, dict):
-                state = parsed.get("state") or state
-                extract = parsed.get("extract") or extract
         except Exception:
-            _log(f"could not parse {SETTING_COMBINED}; ignoring it:\n" + traceback.format_exc())
+            _log(f"could not parse {key}; ignoring it:\n" + traceback.format_exc())
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if "state" in parsed or "extract" in parsed:
+            state = parsed.get("state") or state
+            extract = parsed.get("extract") or extract
+        elif UPSTREAM_EXTRACT_WRAPPER_KEY in parsed:
+            job = parsed[UPSTREAM_EXTRACT_WRAPPER_KEY]
+            extract = (job if isinstance(job, str) else json.dumps(job)) or extract
+        elif "rows" in parsed:
+            # A plain selection, as the original port and other plugins send it.
+            state = blob if isinstance(blob, str) else json.dumps(parsed)
     return state, extract
+
+
 STASH_KEY = "_h3refmod_selection"        # key inside the session `state` dict for the inline panel
 # Audio in a mod (an audio mod, or a visual mod's soundtrack): how much is kept
 # by default, and the shortest allowed -- H3 documents 2s as the minimum
@@ -1840,7 +1865,7 @@ def install_patches() -> Optional[str]:
                  f"task payload={'yes' if state_json else 'no'}, "
                  f"armed={'yes' if _ARMED['json'] else 'no'}")
         if not state_json and _ARMED["json"] and refmod_capable \
-                and not kwargs.get("refinement_mode"):
+                and not kwargs.get("refinement_mode") and not _foreign_task(kwargs):
             state_json = _ARMED["json"]
             if first_window:
                 _log("NOTE: this task reached generate() without its RefMod selection, so the "
@@ -1955,11 +1980,11 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
                     existing = dict(result.get("custom_settings") or {})
                     if stash:
                         existing[SETTING_COMBINED] = pack_refmod_setting(state_json=stash)
-                        existing.pop(SETTING_GENERATE, None)   # legacy key, no longer declared
+                        existing.pop(LEGACY_SETTING_COMBINED, None)   # fork.12-21 key
                         result["custom_settings"] = existing
-                    elif SETTING_COMBINED in existing or SETTING_GENERATE in existing:
+                    elif SETTING_COMBINED in existing or LEGACY_SETTING_COMBINED in existing:
                         existing.pop(SETTING_COMBINED, None)
-                        existing.pop(SETTING_GENERATE, None)
+                        existing.pop(LEGACY_SETTING_COMBINED, None)
                         result["custom_settings"] = existing or None
         except Exception:
             _log("prepare_inputs_dict patch: RefMod injection failed, leaving settings "
@@ -2018,12 +2043,12 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
                 existing = dict(settings.get("custom_settings") or {})
                 if stash:
                     existing[SETTING_COMBINED] = pack_refmod_setting(state_json=stash)
-                    existing.pop(SETTING_GENERATE, None)   # legacy key, no longer declared
+                    existing.pop(LEGACY_SETTING_COMBINED, None)   # fork.12-21 key
                     settings = dict(settings)
                     settings["custom_settings"] = existing
-                elif SETTING_COMBINED in existing or SETTING_GENERATE in existing:
+                elif SETTING_COMBINED in existing or LEGACY_SETTING_COMBINED in existing:
                     existing.pop(SETTING_COMBINED, None)
-                    existing.pop(SETTING_GENERATE, None)
+                    existing.pop(LEGACY_SETTING_COMBINED, None)
                     settings = dict(settings)
                     settings["custom_settings"] = existing or None
         except Exception:
@@ -2399,6 +2424,18 @@ def _pass_canvas(pipeline_self, pass_no):
     if pass_no == 1 and getattr(pipeline_self, "_h3_two_phase", False):
         return _phase_1_canvas(out_w, out_h)
     return int(out_w), int(out_h)
+
+
+# Keys other plugins put in custom_settings when they run their own task
+# (e.g. 2 Phases Plus' H3 Upscaler tab). Such a task comes with its own RefMod
+# selection or none, so the Media Generator panel's armed selection must not
+# be used for it.
+FOREIGN_TASK_KEYS = ("two_phases_plus_upscale_source",)
+
+
+def _foreign_task(kwargs) -> bool:
+    custom = kwargs.get("custom_settings")
+    return isinstance(custom, dict) and any(custom.get(key) for key in FOREIGN_TASK_KEYS)
 
 
 def _fl2va_label(pipeline_self) -> str:
