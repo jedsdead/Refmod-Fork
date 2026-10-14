@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.38.1-fork.26** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.27** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -50,7 +50,10 @@ what the fork adds.
   fraction of its tokens.
 - **Merge into one picture** (training mode): several sources become one small
   picture of what they have in common.
-- **Preview and trim** reference videos before extracting.
+- **Preview and trim** reference videos before extracting. The trim is the
+  only duration control: an untrimmed video is used whole, up to H3's
+  15-second reference limit, and a span under 2 seconds gets a warning (too
+  short for its own audio to work as a voice).
 - **Library**: folders (create, move mods between them, delete empty ones),
   add / replace / remove a soundtrack on existing mods, and store prompt-view
   frames in mods saved without them.
@@ -62,8 +65,11 @@ what the fork adds.
 - **Send as one video**, per mod: a multi-picture mod becomes one
   `<Video N>` instead of one `<Picture N>` per picture.
 - **Include audio**, per mod.
-- **Max size**, per mod (short edge in pixels), with the saving shown in the
-  readout.
+- **Label**, per mod: pick its `<Picture N>` / `<Video N>` / `<Audio N>`, and
+  its soundtrack's `<Audio N>` while *Include audio* is ticked. Auto takes the
+  next free number. A start/end frame and references of your own take the
+  first numbers, so pick after them; numbers that clash or skip close up, and
+  the console logs the label each mod really got.
 - **Text encoder options**: how many pictures of a stack, and how many frames
   of a video mod, the text encoder is shown.
 - **Live readout** of each mod's prompt label, audio seconds and budget.
@@ -108,6 +114,14 @@ of the file for the model switches.
 | `STABLE_REFMOD_LABELS` | `True` | On windows 2+, picture mods are numbered ahead of the carried-over frame, so their labels match window 1. |
 
 ### Release history
+
+- **0.38.1-fork.27** — **choose each mod's prompt label** (a *Label* dropdown
+  per mod, and one for its soundtrack); the extractor's *Reference duration
+  to use* slider is gone (the trim decides, whole video up to 15 s, with a
+  warning under 2 s); the per-mod *Max size* slider is gone (*Fit mods to
+  the output size* and *Fit to tile* still shrink mods). Labels also stay
+  the same on later sliding windows when window 1 has a start image, in
+  Ref2VA and FL2VA.
 
 - **0.38.1-fork.26** — FL2VA prompt labels for picture and video mods are
   now standard: fork.25's checkbox is gone, and every FL2VA run labels every

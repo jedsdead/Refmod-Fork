@@ -86,6 +86,7 @@ LEGACY_FORK_SETTING = "h3_refmod"
 # length of an audio reference, so a shorter clip is refused at extraction.
 DEFAULT_AUDIO_SECONDS = 4.0
 MIN_AUDIO_SECONDS = 2.0
+REFERENCE_SECONDS_MAX = 15.0   # fork: H3's limit for a reference video
 
 
 class ExtractionBlocked(ValueError):
@@ -1107,7 +1108,7 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, image_output=False,
-                            visual_labels=True):
+                            visual_labels=True, offsets=None):
     """Load a RefMod selection and turn it into sentinels, one list per kind.
 
     Shared by the Ref2VA route (_inject_refmods, which hands the sentinels to
@@ -1115,8 +1116,11 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
     (_stage_fl2va_refmods, which can't use those inputs at all). Returns
     (image_sentinels, video_sentinels, audio_sentinels, total_tokens,
     retention, window_mode), or None when there is nothing to inject.
-    ``visual_labels`` False (FL2VA, which labels audio mods only) skips
-    decoding prompt-view frames for mods saved without them."""
+    ``visual_labels`` False skips decoding prompt-view frames for mods saved
+    without them. ``offsets`` ({"image", "video", "audio"}) is how many labels
+    of each kind the generation's own pictures/references take ahead of the
+    mods; each kind's mods are ordered so the prompt labels picked in the
+    panel (a row's "label" / "audio_label") come out where asked."""
     later_window = isinstance(window_no, int) and window_no > 1
     try:
         state = json.loads(state_json)
@@ -1160,7 +1164,10 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
         loaded_rows = loaded_rows[:keep]
         _log(f"scramble seed={seed}: kept {len(loaded_rows)}/{len(rows)} row(s), order shuffled")
 
-    image_sentinels, video_sentinels, audio_sentinels = [], [], []
+    # Fork: sentinels are collected per mod ("groups") so each kind can be put
+    # in the order of the labels picked in the panel. A group is
+    # [wanted label number or None, display name, [sentinels]].
+    image_groups, video_groups, audio_groups = [], [], []
     total_tokens = 0
     for mod, strength, copies, row in loaded_rows:
         eff = max(0.0, min(2.0, strength * retention))
@@ -1170,7 +1177,8 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
         total_tokens += mod.token_count
         if visual_labels:
             _ensure_enc_frames(pipeline_self, mod)   # fork: mods saved without encoder frames
-        first_image, first_video = len(image_sentinels), len(video_sentinels)
+        want = _row_label(row, "label")
+        image_sentinels, video_sentinels = [], []
         # A picture stack ComfyUI saved as kind "video" is still pictures (fork).
         pictures = mod.kind == "image" or mod.still_stack()
         if pictures and row.get("as_video") and latent.shape[2] > 1:
@@ -1218,6 +1226,7 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
                 still = _RefModImageSentinel(latent[:, :, :1])
                 still.enc = _enc_as_still(_enc_item(mod, "video", 0, eff))
                 image_sentinels.append(still)
+                want = None   # a picture now: its video label number no longer applies
             else:
                 if copies > 1:
                     latent = latent.repeat(1, 1, copies, 1, 1)
@@ -1235,11 +1244,12 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
             # Audio prompt entries carry no pixels at all -- the label is the
             # whole thing -- so an audio mod always gets one.
             sentinel.enc = {"type": "audio"} if PROMPT_LABELS_FOR_REFMODS else None
-            audio_sentinels.append(sentinel)
+            audio_groups.append([want, mod.name, [_named(sentinel, mod.name, want)]])
 
-        # Fork: the row's "Max size", applied wherever the mod is sized.
-        for sentinel in image_sentinels[first_image:] + video_sentinels[first_video:]:
-            sentinel.max_short = _row_max_short(row)
+        if image_sentinels:
+            image_groups.append([want, mod.name, [_named(s, mod.name, want) for s in image_sentinels]])
+        if video_sentinels:
+            video_groups.append([want, mod.name, [_named(s, mod.name, want) for s in video_sentinels]])
         # Fork: a visual mod's own soundtrack is injected exactly like an
         # audio mod -- its own native audio slot and <Audio N> label -- unless
         # the row's "Include audio" is unticked.
@@ -1247,13 +1257,15 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
             if row.get("use_audio", True):
                 soundtrack = _RefModAudioSentinel(mod.audio_latent)
                 soundtrack.enc = {"type": "audio"} if PROMPT_LABELS_FOR_REFMODS else None
-                audio_sentinels.append(soundtrack)
+                audio_want = _row_label(row, "audio_label")
+                audio_groups.append([audio_want, mod.name + " (soundtrack)",
+                                     [_named(soundtrack, mod.name + " (soundtrack)", audio_want)]])
                 _log(f"'{mod.name}' carries a soundtrack (~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s) "
                      f"-- injected as its own <Audio N> reference")
             else:
                 _log(f"'{mod.name}': soundtrack left out (Include audio unticked)")
 
-    if not image_sentinels and not video_sentinels and not audio_sentinels:
+    if not image_groups and not video_groups and not audio_groups:
         return None
 
     # Image / single-frame output: a reference *video* has no place to go.
@@ -1265,32 +1277,98 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
     # here, that same code would keep the first one and silently drop any
     # others. Convert them ourselves instead -- one still reference per mod,
     # from its first latent frame, exactly what the image path can use.
-    if image_output:
-        if video_sentinels:
-            for sentinel in video_sentinels:
+    if image_output and video_groups:
+        for _want, name, sentinels in video_groups:
+            converted = []
+            for sentinel in sentinels:
                 if sentinel.is_stack:
                     # Fork: a picture stack sent as one video goes back to
                     # being its pictures -- all of them, not just the first.
-                    image_sentinels.extend(_stack_as_pictures(sentinel))
+                    converted.extend(_stack_as_pictures(sentinel))
                     continue
                 still = _RefModImageSentinel(sentinel.latent[:, :, :1])
                 still.enc = _enc_as_still(sentinel.enc)
                 still.max_short = sentinel.max_short
-                image_sentinels.append(still)
-            _log(f"image output mode: {len(video_sentinels)} video-kind RefMod(s) converted to "
-                 f"still image references (first frame each) -- a reference video has no meaning "
-                 f"for a single-frame output, and WanGP would otherwise keep only the first one.")
-            video_sentinels = []
+                converted.append(still)
+            image_groups.append([None, name, [_named(s, name, None) for s in converted]])
+        _log(f"image output mode: {len(video_groups)} video-kind RefMod(s) converted to "
+             f"still image references (first frame each) -- a reference video has no meaning "
+             f"for a single-frame output, and WanGP would otherwise keep only the first one.")
+        video_groups = []
 
-    return image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode
+    offsets = offsets or {}
+    ordered = {}
+    for kind, groups in (("image", image_groups), ("video", video_groups), ("audio", audio_groups)):
+        ordered[kind] = _order_by_label(groups, int(offsets.get(kind, 0) or 0), kind)
+    flat = lambda groups: [s for _w, _n, sentinels in groups for s in sentinels]
+    return (flat(ordered["image"]), flat(ordered["video"]), flat(ordered["audio"]),
+            total_tokens, retention, window_mode)
+
+
+_LABEL_WORDS = {"image": "Picture", "video": "Video", "audio": "Audio"}
+
+
+def _row_label(row, key):
+    """A row's chosen label number (fork.27), or None for automatic."""
+    try:
+        value = int(row.get(key) or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def _named(sentinel, name, want):
+    """Tag a sentinel's prompt entry with its mod's name and wanted label
+    number, so the labels it really got can be reported. The text encoder
+    reads only "type", "frames" and "timestamps"; extra keys are ignored."""
+    if isinstance(getattr(sentinel, "enc", None), dict):
+        sentinel.enc["refmod"] = name
+        sentinel.enc["want"] = want
+    for enc in getattr(sentinel, "picture_encs", None) or []:
+        if isinstance(enc, dict):
+            enc["refmod"], enc["want"] = name, None
+    return sentinel
+
+
+def _order_by_label(groups, offset, kind):
+    """Order one kind's mods so each lands on the label number picked for it.
+
+    Labels are numbered in order, after the ``offset`` the generation's own
+    pictures / references take. Mods with a chosen number go where they
+    asked; mods left on Auto fill the numbers in between, in row order. Two
+    mods asking for the same number, or a number past a gap, close up --
+    the labels actually given are logged when the prompt is encoded."""
+    explicit = sorted((g for g in groups if g[0]), key=lambda g: g[0])
+    auto = [g for g in groups if not g[0]]
+    ordered, position = [], offset + 1
+    while explicit or auto:
+        if explicit and (explicit[0][0] <= position or not auto):
+            group = explicit.pop(0)
+        else:
+            group = auto.pop(0)
+        ordered.append(group)
+        position += len(group[2])
+    if any(g[0] for g in groups):
+        plan, position = [], offset + 1
+        for want, name, sentinels in ordered:
+            count = len(sentinels)
+            label = (f"<{_LABEL_WORDS[kind]} {position}>" if count == 1
+                     else f"<{_LABEL_WORDS[kind]} {position}>-<{_LABEL_WORDS[kind]} {position + count - 1}>")
+            plan.append(f"'{name}' -> {label}" + (f" (asked for {want})" if want and want != position else ""))
+            position += count
+        _log(f"{_LABEL_WORDS[kind].lower()} label order: " + ", ".join(plan)
+             + (f" -- after {offset} of the generation's own" if offset else ""))
+    return ordered
 
 
 def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     window_no = kwargs.get("window_no")
     later_window = isinstance(window_no, int) and window_no > 1
+    stable = STABLE_REFMOD_LABELS and not kwargs.get("input_ref_images")
     built = _build_refmod_sentinels(
         pipeline_self, state_json, window_no,
-        image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False))
+        image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False),
+        offsets=_label_offsets(kwargs, later_window, stable, ref2va=True))
     if built is None:
         return kwargs
     image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode = built
@@ -1313,9 +1391,9 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
         kwargs["input_ref_images"] = list(existing) + image_sentinels
-        if STABLE_REFMOD_LABELS and later_window and not existing:
+        if stable:
             for sentinel in image_sentinels:   # fork: see STABLE_REFMOD_LABELS
-                sentinel.label_first = True
+                sentinel.label_first = "keep" if later_window else "record"
 
     native_videos = []
     if video_sentinels:
@@ -1483,22 +1561,78 @@ def _shown_frames_from_state(state) -> dict:
             "clip_n": count("video_frames_n", encframes.MAX_CLIP_FRAMES_SHOWN)}
 
 
-def _insert_ahead_of_carryover(presentation, entry) -> None:
-    """Put a picture RefMod's prompt entry ahead of the first picture that
-    isn't one of ours (the frame carried over from the previous window), after
-    any RefMod pictures already placed there, so their order is kept."""
-    ours = getattr(_insert_ahead_of_carryover, "_ours", None)
-    if ours is None or ours[0] is not presentation:
-        ours = (presentation, set())
-        _insert_ahead_of_carryover._ours = ours
-    at = next((i for i, item in enumerate(presentation)
-               if isinstance(item, dict) and item.get("type") == "image" and id(item) not in ours[1]),
-              None)
-    if at is None:
-        presentation.append(entry)
+# Label bookkeeping for one generation (all its windows): how many pictures
+# of the generation's own came ahead of the mods' pictures in window 1, so
+# later windows can put the mods' pictures back at the same numbers.
+_LABEL_BASE = {"image": None}
+_LABEL_LOG = {"done": False}
+
+
+def _label_offsets(kwargs, later_window, stable, ref2va):
+    """How many labels of each kind the generation's own inputs take ahead of
+    the mods: start/end frames (a sliding window's carried-over frame takes
+    the start frame's place) and, in Ref2VA, its own reference images, videos
+    and audio. Used to put each mod on the label number picked for it."""
+    video_prompt_type = str(kwargs.get("video_prompt_type") or "")
+    audio_prompt_type = str(kwargs.get("audio_prompt_type") or "")
+    if later_window and stable and _LABEL_BASE["image"] is not None:
+        images = _LABEL_BASE["image"]
     else:
-        presentation.insert(at, entry)
-    ours[1].add(id(entry))
+        images = (1 if (later_window or kwargs.get("image_start") is not None) else 0) \
+            + (1 if kwargs.get("image_end") is not None else 0)
+    if not ref2va:
+        return {"image": images, "video": 0, "audio": 0}
+    return {"image": images + len(kwargs.get("input_ref_images") or []),
+            "video": ((kwargs.get("input_frames") is not None and "V" in video_prompt_type)
+                      + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type)
+                      + (kwargs.get("input_frames3") is not None and "*" in video_prompt_type)),
+            "audio": ((kwargs.get("audio_guide") is not None and "A" in audio_prompt_type)
+                      + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type)
+                      + (kwargs.get("audio_guide3") is not None and "D" in audio_prompt_type))}
+
+
+def _is_ours(item) -> bool:
+    return isinstance(item, dict) and "refmod" in item
+
+
+def _place_picture_label(presentation, entry, mode) -> None:
+    """Add a mod picture's prompt entry so its <Picture N> is the same on every
+    sliding window. Window 1 ("record") appends it and notes how many of the
+    generation's own pictures came first. Later windows ("keep") put it back
+    after that many: the frame carried over from the previous window would
+    otherwise sit ahead of it and push its number up by one."""
+    own = [i for i, item in enumerate(presentation) if isinstance(item, dict)
+           and item.get("type") == "image" and not _is_ours(item)]
+    if mode == "record":
+        if _LABEL_BASE["image"] is None:
+            _LABEL_BASE["image"] = len(own)
+        presentation.append(entry)
+        return
+    base = _LABEL_BASE["image"] or 0
+    if len(own) > base:
+        presentation.insert(own[base], entry)
+    else:
+        presentation.append(entry)
+
+
+def _log_prompt_labels(presentation) -> None:
+    """Report, once per generation, the label each mod actually got."""
+    if _LABEL_LOG["done"] or not isinstance(presentation, list):
+        return
+    counts = {"image": 0, "video": 0, "audio": 0}
+    named = []
+    for item in presentation:
+        kind = item.get("type") if isinstance(item, dict) else None
+        if kind not in counts:
+            continue
+        counts[kind] += 1
+        if _is_ours(item):
+            want = item.get("want")
+            named.append(f"'{item['refmod']}' -> <{_LABEL_WORDS[kind]} {counts[kind]}>"
+                         + (f" (asked for <{_LABEL_WORDS[kind]} {want}>)" if want and want != counts[kind] else ""))
+    if named:
+        _LABEL_LOG["done"] = True
+        _log("RefMods in the prompt: " + ", ".join(named))
 
 
 # ── Caches ────────────────────────────────────────────────────────────────
@@ -1877,6 +2011,9 @@ def _tiling_flag() -> str:
 
 def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
     """Read this run's panel options onto the pipeline for the hooks."""
+    _LABEL_LOG["done"] = False
+    if int(kwargs.get("window_no") or 1) <= 1:
+        _LABEL_BASE["image"] = None   # a new generation
     # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None
     two_phase = (int(kwargs.get("guide_phases") or 1) > 1
                  and kwargs.get("frozen_control_video") is None)
@@ -1968,10 +2105,12 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
     window_no = kwargs.get("window_no")
     labels_on = PROMPT_LABELS_FOR_REFMODS and str(FL2VA_PROMPT_LABELS or "none").lower() != "none"
     visual_labels = labels_on
+    later_window = isinstance(window_no, int) and window_no > 1
     built = _build_refmod_sentinels(
         pipeline_self, state_json, window_no,
         image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False),
-        visual_labels=visual_labels)
+        visual_labels=visual_labels,
+        offsets=_label_offsets(kwargs, later_window, STABLE_REFMOD_LABELS, ref2va=False))
     if built is None:
         return False
     image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode = built
@@ -2012,10 +2151,10 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
         # In the order the references are packed: pictures, videos, audio.
         labels = [s.enc for s in image_sentinels + video_sentinels if isinstance(s.enc, dict)]
     if labels_on:
-        labels += [{"type": "audio"} for _ in audio_sentinels]
+        labels += [s.enc for s in audio_sentinels if isinstance(s.enc, dict)]
     _FL2VA.update(active=True, visual=visual, audio=[s.latent for s in audio_sentinels], entries=entries,
                   announced=False, presentation=labels, visual2=visual2, entries2=entries2, calls=0,
-                  pass_no=1)
+                  pass_no=1, label_mode=("keep" if later_window and STABLE_REFMOD_LABELS else "record"))
     _log(f"FL2VA: staging {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), retention={retention:.2f} "
          f"(~{total_tokens} tokens); prompt labels: "
@@ -2043,29 +2182,23 @@ _FL2VA_HOOKS_MARKER = "_h3refmod_fl2va_hooks"
 
 
 def _install_fl2va_hooks(Pipeline) -> None:
-    if not FL2VA_REFMODS or getattr(Pipeline, _FL2VA_HOOKS_MARKER, False):
+    if getattr(Pipeline, _FL2VA_HOOKS_MARKER, False):
         return
     setattr(Pipeline, _FL2VA_HOOKS_MARKER, True)
 
     _orig_encode_prompt = getattr(Pipeline, "_encode_prompt", None)
-    if _orig_encode_prompt is not None:
+    if _orig_encode_prompt is not None:   # FL2VA labels, and every route's label report
         @functools.wraps(_orig_encode_prompt)
         def patched_encode_prompt(self, prompt, presentation, *args, **kwargs):
             # FL2VA builds its presentation from keyframes only; the staged
             # labels go after them, so a start frame stays <Picture 1>.
             if _FL2VA["active"] and _FL2VA.get("presentation") and isinstance(presentation, list):
-                presentation.extend(_FL2VA["presentation"])
-                if not _FL2VA.get("labels_logged"):
-                    _FL2VA["labels_logged"] = True
-                    counts = {"image": 0, "video": 0, "audio": 0}
-                    named = []
-                    for item in presentation:
-                        kind = item.get("type")
-                        if kind in counts:
-                            counts[kind] += 1
-                            if any(item is ours for ours in _FL2VA["presentation"]):
-                                named.append(f"<{ {'image': 'Picture', 'video': 'Video', 'audio': 'Audio'}[kind]} {counts[kind]}>")
-                    _log("FL2VA: RefMods in the prompt as " + ", ".join(named))
+                for entry in _FL2VA["presentation"]:
+                    if entry.get("type") == "image":
+                        _place_picture_label(presentation, entry, _FL2VA.get("label_mode", "record"))
+                    else:
+                        presentation.append(entry)
+            _log_prompt_labels(presentation)
             return _orig_encode_prompt(self, prompt, presentation, *args, **kwargs)
         Pipeline._encode_prompt = patched_encode_prompt
 
@@ -2246,7 +2379,7 @@ def _present_refmod(presentation, sentinel) -> None:
         return
     try:
         if getattr(sentinel, "label_first", False) and sentinel.enc.get("type") == "image":
-            _insert_ahead_of_carryover(presentation, sentinel.enc)   # fork
+            _place_picture_label(presentation, sentinel.enc, sentinel.label_first)   # fork
             return
         presentation.append(sentinel.enc)
     except Exception:
@@ -2668,6 +2801,17 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         dur_s = max(0.1, float(trim[1]) - float(trim[0])) if trim else None
         if trim:
             status(f"H3 RefMod: using {start_s:g}-{float(trim[1]):g}s of {os.path.basename(str(vp))}")
+        # Fork: the trim (or the whole video) sets the span, up to H3's 15 s
+        # reference limit -- the extractor has no separate duration slider.
+        span_s = dur_s if dur_s is not None else (storage.video_duration_seconds(vp) or 0.0)
+        if span_s > REFERENCE_SECONDS_MAX + 0.05:
+            status(f"H3 RefMod: {os.path.basename(str(vp))} gives {span_s:.1f}s -- only the first "
+                   f"{REFERENCE_SECONDS_MAX:g}s is used (H3's limit for a reference video); trim it "
+                   f"to choose which part")
+            dur_s = REFERENCE_SECONDS_MAX
+        elif 0 < span_s < MIN_AUDIO_SECONDS - 0.05:
+            status(f"H3 RefMod: ⚠️ {os.path.basename(str(vp))} gives only {span_s:.1f}s -- under 2s is "
+                   f"too short for its own audio to work as a voice reference")
         if video_as_pictures:
             limit_s = (((latent_frames - 1) * 4 + 1) if latent_frames > 1 else 1) \
                 / float(FPS_ASSUMED_FOR_DURATION_ESTIMATE)

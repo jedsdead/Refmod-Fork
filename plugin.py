@@ -275,91 +275,88 @@ def _safe_choice_update(choices, keep=None):
     return gr.update(choices=choices, value=keep if keep in choices else None)
 
 
-def _trim_summary(trims, names):
-    if not trims:
-        return "*No trims set - every video is used from its start.*"
-    parts = [f"`{n}` {trims[n][0]:g}-{trims[n][1]:g}s" for n in names if n in trims]
-    return "Trimmed: " + ", ".join(parts) if parts else ""
+def _trim_summary(trims, names, durations=None):
+    """What each video will give the mod, with a warning for spans under
+    H3's 2-second audio minimum and over its 15-second reference limit."""
+    durations = durations or {}
+    trims = trims or {}
+    parts, warnings = [], []
+    for n in names:
+        if n in trims:
+            parts.append(f"`{n}` {trims[n][0]:g}-{trims[n][1]:g}s")
+            span = float(trims[n][1]) - float(trims[n][0])
+        else:
+            span = float(durations.get(n) or 0.0)
+        if 0 < span < 2.0 - 0.05:
+            warnings.append(f"⚠️ `{n}`: only {span:.1f}s will be used. Under 2 seconds is too short "
+                            f"for its own audio to work as a voice reference.")
+        elif span > 15.05:
+            warnings.append(f"`{n}`: {span:.1f}s -- only the first 15s of it is used (H3's limit "
+                            f"for a reference video). Trim it to choose which 15s.")
+    text = ("Trimmed: " + ", ".join(parts)) if parts else "*No trims set - every video is used whole.*"
+    return "\n\n".join([text] + warnings)
 
 
 # Fork panel. Values per picker row: mod, strength, "Send as one video",
-# "Include audio", "Max size".
-ROW_WIDTH = 5
+# "Include audio", prompt label, soundtrack's prompt label.
+ROW_WIDTH = 6
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
 # fit to output, mods in phase 2, shrink method, video mods on sliding windows.
 STACK_CONTROLS = 8
 
-# "Max size" slider: short edge in pixels, in steps of 32, down to this.
-MAX_SIZE_FLOOR = 128
-MAX_SIZE_STEP = 32
+# Label dropdowns (fork.27): how far each one counts.
+LABEL_MAX = {"image": 20, "video": 9, "audio": 9}
+LABEL_WORDS = {"image": "Picture", "video": "Video", "audio": "Audio"}
+AUTO_LABEL = "auto"
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
-def _mod_short_edge(meta):
-    """A picture or video mod's short edge in pixels (16 px per latent cell),
-    or 0 when it has no size (audio, or unknown)."""
-    if not meta or meta.get("kind") == "audio":
-        return 0
-    try:
-        return min(int(meta.get("latent_h", 0)), int(meta.get("latent_w", 0))) * 16
-    except (TypeError, ValueError):
-        return 0
-
-
-def _max_size_update(meta):
-    """The "Max size" slider for a freshly picked mod: its range runs from the
-    mod's own short edge ("full size", where it starts) down to
-    MAX_SIZE_FLOOR, in MAX_SIZE_STEP steps. Hidden for audio mods and for mods
-    already too small to shrink."""
-    short = _mod_short_edge(meta)
-    if short <= MAX_SIZE_FLOOR:
-        return gr.update(visible=False, value=0)
-    lowest = short - MAX_SIZE_STEP * ((short - MAX_SIZE_FLOOR) // MAX_SIZE_STEP)
-    return gr.update(visible=True, minimum=lowest, maximum=short, value=short)
-
-
-def _shrunk_size(meta, max_size):
-    """(old w, old h, new w, new h) in pixels when the row's "Max size" shrinks
-    the mod -- the same sizing patches.py uses -- else None."""
-    short = _mod_short_edge(meta)
-    try:
-        cap = int(max_size or 0)
-    except (TypeError, ValueError):
-        return None
-    if not short or cap < 32 or cap >= short:
-        return None
-    lat_h, lat_w = int(meta.get("latent_h", 0)), int(meta.get("latent_w", 0))
-    scale = cap / float(short)
-    new_w = max(32, int(lat_w * 16 * scale) // 32 * 32)
-    new_h = max(32, int(lat_h * 16 * scale) // 32 * 32)
-    if (new_w // 16) * (new_h // 16) >= lat_h * lat_w:
-        return None
-    return lat_w * 16, lat_h * 16, new_w, new_h
+def _label_choices(kind):
+    """Choices for a prompt-label dropdown: Auto, then <Picture 1>, <Picture 2>..."""
+    return [("Auto", AUTO_LABEL)] + [(f"<{LABEL_WORDS[kind]} {n}>", n)
+                                      for n in range(1, LABEL_MAX[kind] + 1)]
 
 
 def _row_boxes_update(name, kind="image"):
-    """The two per-row boxes after a row's mod changes, starting fresh for
-    the newly picked mod (a tick made for the previous mod never carries
-    over).
+    """The per-row options after a row's mod changes, starting fresh for the
+    newly picked mod (nothing chosen for the previous mod carries over).
 
     "Send as one video" (image rows only) shows only while the row holds a
-    mod made from several pictures -- a single picture is already one
-    reference -- unticked. "Include audio" (image and video rows) shows only
-    while the mod carries a soundtrack, ticked."""
+    mod made from several pictures, unticked. "Include audio" (image and
+    video rows) shows only while the mod carries a soundtrack, ticked, and
+    with it the soundtrack's own label dropdown. The label dropdown shows
+    once a mod is picked."""
     meta = _row_meta(name, 1.0)
     multi = (kind == "image" and bool(meta) and _is_picture_mod(meta)
              and int(meta.get("latent_t", 1) or 1) > 1)
     has_audio = bool(meta) and meta.get("kind") != "audio" and bool(meta.get("has_audio"))
     return (gr.update(visible=multi, value=False), gr.update(visible=has_audio, value=True),
-            _max_size_update(meta))
+            gr.update(visible=bool(meta), choices=_label_choices(kind), value=AUTO_LABEL),
+            gr.update(visible=has_audio, value=AUTO_LABEL))
+
+
+def _soundtrack_label_update(include_audio, name):
+    """The soundtrack's label dropdown: shown while the row's mod has a
+    soundtrack and "Include audio" is ticked."""
+    meta = _row_meta(name, 1.0)
+    has_audio = bool(meta) and meta.get("kind") != "audio" and bool(meta.get("has_audio"))
+    return gr.update(visible=bool(include_audio and has_audio))
 
 
 def _cleared_row_updates():
     """gr.update()s returning one picker row to empty."""
     return [gr.update(value=NONE_CHOICE), gr.update(value=1.0),
             gr.update(value=False, visible=False), gr.update(value=True, visible=False),
-            gr.update(value=0, visible=False)]
+            gr.update(value=AUTO_LABEL, visible=False), gr.update(value=AUTO_LABEL, visible=False)]
+
+
+def _label_number(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 1 else None
 
 
 def _rows_payload(values):
@@ -367,7 +364,7 @@ def _rows_payload(values):
     (ROW_WIDTH per row): one entry per row with a mod and strength > 0."""
     rows = []
     for i in range(0, len(values) - ROW_WIDTH + 1, ROW_WIDTH):
-        name, strength, as_video, use_audio, max_size = values[i:i + ROW_WIDTH]
+        name, strength, as_video, use_audio, label, audio_label = values[i:i + ROW_WIDTH]
         try:
             strength = float(strength)
         except (TypeError, ValueError):
@@ -375,24 +372,26 @@ def _rows_payload(values):
         if name and name != NONE_CHOICE and strength > 0:
             row = {"mod": name, "strength": strength, "as_video": bool(as_video),
                    "use_audio": bool(use_audio)}
-            # Only when it actually shrinks the mod: "full size" is left out.
-            if _shrunk_size(_row_meta(name, strength), max_size):
-                row["max_size"] = int(max_size)
+            if _label_number(label):
+                row["label"] = _label_number(label)
+            if use_audio and _label_number(audio_label):
+                row["audio_label"] = _label_number(audio_label)
             rows.append(row)
     return rows
 
 
 def _normalize_rows(rows):
     """Picker rows as (name, strength, send-as-one-video, include-audio,
-    max-size); rows with fewer values mean "not sent as one video", "audio
-    included" and "full size"."""
+    label, soundtrack label); shorter rows (other plugins, older builds) mean
+    "not sent as one video", "audio included" and automatic labels."""
     out = []
     for row in rows or []:
         row = tuple(row)
         out.append((row[0], row[1],
                     bool(row[2]) if len(row) > 2 else False,
                     bool(row[3]) if len(row) > 3 else True,
-                    row[4] if len(row) > 4 else None))
+                    _label_number(row[4]) if len(row) > 4 else None,
+                    _label_number(row[5]) if len(row) > 5 else None))
     return out
 
 
@@ -460,13 +459,30 @@ def _stack_payload(stack_mode, stack_n,
             else WINDOW_MODE_DEFAULT}
 
 
+def _ordered_labels(items, word):
+    """Number one kind's mods the way patches._order_by_label does: chosen
+    numbers where asked, Auto ones filling the gaps in row order."""
+    explicit = sorted((i for i in items if i[2]), key=lambda i: i[2])
+    auto = [i for i in items if not i[2]]
+    out, position = [], 1
+    while explicit or auto:
+        name, count, want = (explicit.pop(0) if explicit and (explicit[0][2] <= position or not auto)
+                             else auto.pop(0))
+        last = position + count - 1
+        span = f"<{word} {position}>" if count == 1 else f"<{word} {position}>–<{word} {last}>"
+        out.append(f"`{name}` → {span}" + (f" (asked for <{word} {want}>)" if want and want != position else ""))
+        position = last + 1
+    return out
+
+
 def _format_label_line(rows):
     """Which <Picture N> / <Video N> / <Audio N> each picked mod will get in
-    window 1, in the order the pipeline assigns them (pictures, then videos,
-    then audio, each in row order). Assumes no start image and no references
-    of the generation's own, which are numbered ahead of the mods."""
-    pictures, videos, audios = [], [], []    # (mod name, count)
-    for name, strength, as_video, use_audio, _max_size in _normalize_rows(rows):
+    window 1 -- its chosen number, or the next free one on Auto. Assumes no
+    start image and no references of the generation's own: those take the
+    first numbers, so with a start image pick <Picture 2> onwards (the
+    console reports the labels each generation really used)."""
+    pictures, videos, audios = [], [], []    # (mod name, count, wanted number)
+    for name, strength, as_video, use_audio, label, audio_label in _normalize_rows(rows):
         meta = _row_meta(name, strength)
         if meta is None:
             continue
@@ -474,33 +490,26 @@ def _format_label_line(rows):
         latent_t = max(1, int(meta.get("latent_t", 1)))
         if _is_picture_mod(meta):
             if as_video and latent_t > 1:
-                videos.append((name, 1))
+                videos.append((name, 1, label))
             else:
-                pictures.append((name, latent_t))
+                pictures.append((name, latent_t, label))
         elif kind == "video":
-            videos.append((name, 1))
+            videos.append((name, 1, label))
         else:
-            audios.append((name, 1))
+            audios.append((name, 1, label))
             continue
         if meta.get("has_audio") and use_audio:
-            audios.append((name + " (soundtrack)", 1))
+            audios.append((name + " (soundtrack)", 1, audio_label))
 
-    def labels(items, word):
-        out, n = [], 0
-        for name, count in items:
-            first, n = n + 1, n + count
-            span = f"<{word} {first}>" if count == 1 else f"<{word} {first}>–<{word} {n}>"
-            out.append(f"`{name}` → {span}")
-        return out
-
-    parts = labels(pictures, "Picture") + labels(videos, "Video") + labels(audios, "Audio")
+    parts = (_ordered_labels(pictures, "Picture") + _ordered_labels(videos, "Video")
+             + _ordered_labels(audios, "Audio"))
     if not parts:
         return ""
     extra = ""
     if len(videos) > 3:
         extra = " (videos past the third have no label -- only 3 reference-video slots)"
-    return ("**Prompt labels** (window 1, with no start image or other references): "
-            + " · ".join(parts) + extra)
+    return ("**Prompt labels** (with no start image or references of your own -- those come "
+            "first): " + " · ".join(parts) + extra)
 
 
 def _format_ref_counter(rows):
@@ -523,8 +532,7 @@ def _format_ref_counter(rows):
     n_video_files = 0
     n_audio_files = 0
     n_soundtracks = 0
-    sizes = []
-    for name, strength, as_video, use_audio, max_size in _normalize_rows(rows):
+    for name, strength, as_video, use_audio, _label, _audio_label in _normalize_rows(rows):
         try:
             strength = float(strength)
         except (TypeError, ValueError):
@@ -539,11 +547,6 @@ def _format_ref_counter(rows):
             continue
         kind = meta.get("kind", "image")
         latent_t = max(1, int(meta.get("latent_t", 1)))
-        shrunk = _shrunk_size(meta, max_size)
-        if shrunk:
-            ow, oh, nw, nh = shrunk
-            sizes.append(f"`{name}` {ow}×{oh} → {nw}×{nh}px "
-                         f"(~{100.0 * (nw // 16) * (nh // 16) / max(1, (ow // 16) * (oh // 16)):.0f}% of its tokens)")
         if _is_picture_mod(meta) and as_video and latent_t > 1:
             n_stacks += 1          # one video reference; pictures have no duration
         elif _is_picture_mod(meta):
@@ -598,8 +601,7 @@ def _format_ref_counter(rows):
            f"(documented: 15s, at {FPS_ASSUMED_FOR_DURATION_ESTIMATE}fps)&nbsp;&nbsp;&nbsp;"
            f"{aud_mark} **Audio: {audio_seconds_total:.1f}s**{aud_files} (documented: 15s)"
            f"{note}"
-           + (f"\n\n{label_line}" if label_line else "")
-           + ("\n\n**Max size:** " + " · ".join(sizes) if sizes else ""))
+           + (f"\n\n{label_line}" if label_line else ""))
 
 
 def _hidden_from_api(build):
@@ -751,7 +753,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.26"
+        self.version = "0.38.1-fork.27"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1081,7 +1083,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                      "own.")
             shrink_method = gr.Dropdown(
                 choices=SHRINK_METHOD_UI, value="reencode", label="Shrink method", scale=1,
-                info="How a mod is made smaller (Max size, Fit mods, phase 1, tiles). Re-encode: "
+                info="How a mod is made smaller (Fit mods to the output size, Fit to tile). Re-encode: "
                      "decoded, resized and re-encoded with the loaded VAE -- best quality, takes a "
                      "few seconds per mod once. Fast: the stored mod is resized directly -- "
                      "instant, no VAE, but rougher.")
@@ -1109,28 +1111,38 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             note = (" -- a mod made from several pictures also gets a **Send as one video** "
                     "box: ticked, it is one `<Video N>` in the prompt instead of one "
                     "`<Picture N>` per picture." if kind == "image" else "")
-            gr.Markdown(f"**{label}**{note}")
+            gr.Markdown(f"**{label}**{note}"
+                        + (" Each mod's **Label** sets its `<Picture N>` / `<Video N>` / `<Audio N>`; "
+                           "a start image or references of your own take the first numbers, so pick "
+                           "after them." if kind == "image" else ""))
             kind_rows, kind_ui = [], []
             for i in range(count):
                 with gr.Row(visible=i == 0) as row_ui:
                     mdd = gr.Dropdown(choices=_mod_choices(kind), value=NONE_CHOICE,
                                       label=f"{kind.capitalize()} mod {i + 1}", scale=4)
-                    with gr.Column(scale=3, min_width=220):
-                        strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength")
-                        # "Max size" (fork.19): shown once a picture or video
-                        # mod is picked; starts at the mod's own size (full).
-                        max_size = gr.Slider(MAX_SIZE_FLOOR, 1024, value=0, step=MAX_SIZE_STEP,
-                                             label="Max size (short edge, px)", visible=False,
-                                             info="Starts at the mod's own size. Lower = fewer "
-                                                  "tokens and faster, less fine detail.")
-                    with gr.Column(scale=1, min_width=130):
+                    strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength",
+                                         scale=3, min_width=200)
+                    # fork.27: the prompt label this mod gets (Auto = next free).
+                    label_dd = gr.Dropdown(choices=_label_choices(kind), value=AUTO_LABEL,
+                                           label="Label", visible=False, scale=2, min_width=130)
+                    with gr.Column(scale=2, min_width=150):
                         as_video = gr.Checkbox(False, label="Send as one video", visible=False)
                         use_audio = gr.Checkbox(True, label="Include audio", visible=False)
-                kind_rows.append((mdd, strength, as_video, use_audio, max_size))
+                        audio_label_dd = gr.Dropdown(choices=_label_choices("audio"), value=AUTO_LABEL,
+                                                     label="Soundtrack label", visible=False)
+                kind_rows.append((mdd, strength, as_video, use_audio, label_dd, audio_label_dd))
                 kind_ui.append(row_ui)
+                mdd.change(fn=lambda name, _kind=kind: _row_boxes_update(name, _kind),
+                           inputs=[mdd], outputs=[as_video, use_audio, label_dd, audio_label_dd],
+                           queue=False)
+                if kind == "image":
+                    # One video reference: the label becomes a <Video N>.
+                    as_video.change(fn=lambda on: gr.update(choices=_label_choices("video" if on else "image"),
+                                                            value=AUTO_LABEL),
+                                    inputs=[as_video], outputs=[label_dd], queue=False)
                 if kind != "audio":
-                    mdd.change(fn=lambda name, _kind=kind: _row_boxes_update(name, _kind),
-                               inputs=[mdd], outputs=[as_video, use_audio, max_size], queue=False)
+                    use_audio.change(fn=_soundtrack_label_update, inputs=[use_audio, mdd],
+                                     outputs=[audio_label_dd], queue=False)
             with gr.Row():
                 add_btn = gr.Button(f"➕ Add {kind} mod", size="sm", scale=0, min_width=150)
                 remove_btn = gr.Button("➖ Remove last", size="sm", scale=0, min_width=150)
@@ -1211,7 +1223,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     False, label="Turn reference videos into a picture stack",
                     info="Instead of a clip, take still pictures from each video: the sharpest "
                          "frame from every slot of time, so motion blur and blinks are skipped. "
-                         "Same span as a clip (the trim, up to 'Reference duration to use'). "
+                         "Same span as a clip (the trim, or the whole video up to 15s). "
                          "Keeps identity at a fraction of a clip's tokens, but not motion.")
                 pictures_per_second = gr.Slider(
                     0.25, 12, value=1.0, step=0.25, label="Pictures per second of video",
@@ -1222,11 +1234,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         gr.Markdown("*Add as many reference images and videos as you like -- every one is encoded "
                    "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
                    "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
-        with gr.Accordion("Preview / trim reference videos", open=False):   # fork
+        with gr.Accordion("Preview / trim reference videos", open=True):   # fork
             gr.Markdown("Pick an uploaded video to watch it, and trim the span this mod is built "
-                        "from. Trims are per video and remembered while the page stays open; "
-                        "untrimmed videos are used from their start. A trim also limits the "
-                        "soundtrack taken by *Use the clip's own audio*.")
+                        "from. Trims are per video and remembered while the page stays open; an "
+                        "untrimmed video is used whole, up to H3's 15-second limit for a reference "
+                        "video. A trim also sets where *Use the clip's own audio* starts.")
             with gr.Row():
                 video_pick = gr.Dropdown(label="Video", choices=[], value=None, scale=2)
                 video_duration = gr.Markdown("")
@@ -1292,17 +1304,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "Changing them produces a byte-for-byte identical mod. Switch Mode to `training` "
                 "to use them.", visible=False)
             with gr.Row():
-                latent_frames = gr.Slider(0.1, latent_frames_to_seconds(MAX_LATENT_FRAMES),
-                                          value=latent_frames_to_seconds(16), step=0.1,
-                                          label="Reference duration to use (seconds) -- video",
-                                          info="Approximate real seconds kept from a video source "
-                                               "(and the span pictures are taken from, for a picture "
-                                               "stack). Audio has its own 'Audio length' above. "
-                                               "MiniMax H3's native 15s reference cap is a **shared** "
-                                               "budget within its own kind -- **if a generation combines "
-                                               "two video-kind (or two audio-kind) mods, their durations "
-                                               "add together, so one mod near 14.9s leaves no room for a "
-                                               "second one of the same kind alongside it.**")
+                # fork.27: no duration slider -- a video is used whole, or as
+                # trimmed in "Preview / trim reference videos", up to H3's 15 s.
+                latent_frames = gr.State(latent_frames_to_seconds(MAX_LATENT_FRAMES))
                 identity = gr.Slider(0, 2000, value=500, step=50, label="Identity refinement steps (training mode)",
                                      info="Training mode. Higher = truer to original, but it converges "
                                           "around 200 steps and is flat after that -- 500 and 2000 give "
@@ -1432,9 +1436,10 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             first_path, first_name = str(paths[0]), names[0]
             seconds = storage.video_duration_seconds(first_path) or 15.0
             start, end = trims.get(first_name, (0.0, seconds))
+            durations = {os.path.basename(str(p)): storage.video_duration_seconds(str(p)) for p in paths}
             return (gr.update(choices=names, value=first_name), first_path,
                     f"**{seconds:.2f}s**", trims,
-                    _trim_summary(trims, names))
+                    _trim_summary(trims, names, durations))
 
         def on_video_picked(selected, paths, trims):
             paths = [p for p in (paths or []) if p]
@@ -1461,7 +1466,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 trims.pop(selected, None)          # whole clip -> no trim recorded
             else:
                 trims[selected] = (round(start, 2), round(end, 2))
-            return trims, _trim_summary(trims, list(lookup))
+            durations = {n: storage.video_duration_seconds(p) for n, p in lookup.items()}
+            return trims, _trim_summary(trims, list(lookup), durations)
 
         def do_extract(model_type, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                        remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
