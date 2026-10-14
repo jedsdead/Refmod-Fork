@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.22** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.31.0-fork.23** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -120,6 +120,30 @@ These live at the top of `patches.py`. The defaults are what this fork ships wit
 
 ### Release history
 
+- **0.31.0-fork.23** — ideas from the original port's 0.35-0.38 updates,
+  built this fork's own way:
+  - **Stand-ins report a data type.** Newer Wan2GP builds check `.dtype` on a
+    reference before handing it on (on image output, the first reference
+    video goes through such a helper). The picture and video stand-ins now
+    answer from their stored latent, so they pass through untouched instead
+    of stopping the run.
+  - **Image output turns every video mod into pictures**, before Wan2GP's own
+    fold (which keeps only the first reference video): a clip gives its first
+    frame, a picture stack sent as one video gives back its pictures. Applies
+    in Ref2VA and FL2VA.
+  - **Video mods on later windows** (inline panel): *Whole clip* (default,
+    as before) sends the clip to every sliding window; *First frame as a
+    picture* sends windows 2, 3, ... its first frame as a `<Picture N>`, so
+    none of its frames can surface at a window boundary; *Window 1 only*
+    leaves it out after window 1. Picture stacks always go whole -- they are
+    pictures, not footage -- and audio is never affected.
+  - **VAE tiling before plugin jobs.** Extract, Decompile and Store encoder
+    frames run before a generation would set the VAE up, so on the first
+    task after a model load a large source could exhaust graphics memory in
+    one encode or decode. Tiling is now switched on first.
+  - **Encoder frames keep full colour resolution** (JPEG 4:4:4 instead of the
+    default 4:2:0, which halves colour detail -- skin tone and eye colour).
+    Applies to mods extracted or re-stored from now on.
 - **0.31.0-fork.22** — **Works with 2 Phases Plus (H3 Upscaler tab) again.**
   - That plugin builds its own copy of the RefMods panel by calling
     `MiniMaxH3RefModsPlugin._build_mod_picker_rows(None)` and expects the

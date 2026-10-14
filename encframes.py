@@ -68,7 +68,10 @@ def pack_frames(frames: torch.Tensor) -> Dict[str, torch.Tensor]:
     for i, frame in enumerate(frames):
         array = (frame.detach().float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
         buf = io.BytesIO()
-        Image.fromarray(array).save(buf, "JPEG", quality=JPEG_QUALITY)
+        # subsampling=0 (4:4:4, fork.23): JPEG's default 4:2:0 stores colour
+        # at half resolution, and colour detail -- skin tone, eye colour --
+        # is part of what the text encoder recognises a face by.
+        Image.fromarray(array).save(buf, "JPEG", quality=JPEG_QUALITY, subsampling=0)
         out[f"{ENC_PREFIX}{i}"] = torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8).clone()
     return out
 

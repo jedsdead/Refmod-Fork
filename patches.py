@@ -242,7 +242,30 @@ def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> boo
     return model_type.startswith(_fl2va_family_prefixes())
 
 
-class _RefModImageSentinel:
+class _LatentStandIn:
+    """Shared by the picture and video stand-ins (fork.23). Wan2GP's own
+    helpers sometimes look at a reference before handing it on -- newer
+    builds, for one, check `.dtype` to decide whether a guide needs
+    converting to float -- and a stand-in that has no such attribute stops
+    the run with AttributeError. These answer from the stored latent, which
+    is already floating point, so such helpers pass the stand-in straight
+    through untouched to the hooks below."""
+    __slots__ = ()
+
+    @property
+    def dtype(self):
+        return self.latent.dtype
+
+    @property
+    def device(self):
+        return self.latent.device
+
+    def float(self):
+        return self   # already floating point; nothing to convert
+
+
+
+class _RefModImageSentinel(_LatentStandIn):
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
     __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "audio_latent",
@@ -263,7 +286,7 @@ class _RefModImageSentinel:
         self.max_short = None   # the row's "Max size" (short edge, px), fork.19
 
 
-class _RefModVideoSentinel:
+class _RefModVideoSentinel(_LatentStandIn):
     """Stands in for a multi-frame ("video kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, T, H, W].
 
@@ -360,7 +383,7 @@ class _RefModVideoSentinel:
         raise TypeError(f"_RefModVideoSentinel supports only [:, :n] slicing, got {key!r}")
 
 
-def _video_sentinel_as_still(video):
+def _video_sentinel_as_still(video, quiet=False):
     """A video-kind RefMod as a one-picture reference: its first latent frame,
     shown to the text encoder as its first stored frame."""
     still = _RefModImageSentinel(
@@ -370,11 +393,83 @@ def _video_sentinel_as_still(video):
         audio_latent=None, mod=video.mod, still_index=0, enc_strength=video.enc_strength)
     still.hide_ref = video.hide_ref
     still.max_short = getattr(video, "max_short", None)
-    if not _VIDEO_AS_STILL_LOGGED["done"]:
+    if not quiet and not _VIDEO_AS_STILL_LOGGED["done"]:
         _VIDEO_AS_STILL_LOGGED["done"] = True
         _log("a video RefMod was handed to the picture path (image output); using its first frame "
              "as a picture reference")
     return still
+
+
+WINDOW_VIDEO_WHOLE, WINDOW_VIDEO_PICTURE, WINDOW_VIDEO_FIRST = "whole", "picture", "first"
+WINDOW_VIDEO_CHOICES = (WINDOW_VIDEO_WHOLE, WINDOW_VIDEO_PICTURE, WINDOW_VIDEO_FIRST)
+
+
+def _stack_as_pictures(stack):
+    """A picture stack sent as one video, split back into its pictures."""
+    pictures = []
+    for j in range(stack.latent.shape[2]):
+        still = _RefModImageSentinel(
+            stack.latent[:, :, j:j + 1],
+            None if stack.preview_latent is None or stack.preview_latent.shape[2] <= j
+            else stack.preview_latent[:, :, j:j + 1],
+            None if stack.preview_key is None else tuple(stack.preview_key) + ("pic", j),
+            audio_latent=None, mod=stack.mod, still_index=j, enc_strength=stack.enc_strength)
+        still.hide_ref = stack.hide_ref
+        still.max_short = getattr(stack, "max_short", None)
+        pictures.append(still)
+    return pictures
+
+
+def _reshape_video_mods(image_sentinels, video_sentinels, window_no=1, image_output=False,
+                        window_mode=WINDOW_VIDEO_WHOLE):
+    """Decide what each video-kind mod becomes for this generate() call
+    (fork.23). Returns new (image_sentinels, video_sentinels) lists; audio,
+    including a video mod's own soundtrack, is never touched.
+
+    * Image (single-frame) output: every video mod becomes pictures -- a clip
+      its first frame, a picture stack its pictures. Wan2GP itself only folds
+      the first reference video into the pictures there, so the rest would be
+      dropped.
+    * Sliding windows 2, 3, ... ("Video mods on later windows"):
+        whole   -- the clip again, as on window 1 (default; can show a few of
+                   its frames at the window boundary)
+        picture -- its first frame as a picture: keeps the identity, no clip
+                   frames to surface at the boundary
+        first   -- left out; the mod shapes window 1 only
+      Picture stacks are pictures, not footage, so they always stay whole.
+    """
+    if image_output:
+        pictures = list(image_sentinels)
+        for video in video_sentinels:
+            pictures += (_stack_as_pictures(video) if getattr(video, "is_stack", False)
+                         else [_video_sentinel_as_still(video)])
+        if video_sentinels:
+            _log(f"image output: {len(video_sentinels)} video mod(s) given as picture references")
+        return pictures, []
+    if window_no <= 1 or window_mode == WINDOW_VIDEO_WHOLE:
+        return list(image_sentinels), list(video_sentinels)
+    pictures, videos, changed = list(image_sentinels), [], 0
+    for video in video_sentinels:
+        if getattr(video, "is_stack", False):
+            videos.append(video)
+        elif window_mode == WINDOW_VIDEO_PICTURE:
+            pictures.append(_video_sentinel_as_still(video, quiet=True))
+            changed += 1
+        else:   # WINDOW_VIDEO_FIRST
+            changed += 1
+    if changed:
+        _log(f"window {window_no}: {changed} video mod(s) "
+             + ("given as their first frame" if window_mode == WINDOW_VIDEO_PICTURE else "left out")
+             + " (Video mods on later windows)")
+    return pictures, videos
+
+
+def _window_mode_requested(state_json) -> str:
+    try:
+        mode = str(json.loads(state_json).get("window_video") or WINDOW_VIDEO_WHOLE).lower()
+    except Exception:
+        return WINDOW_VIDEO_WHOLE
+    return mode if mode in WINDOW_VIDEO_CHOICES else WINDOW_VIDEO_WHOLE
 
 
 def _image_sentinel_as_clip(image):
@@ -1823,6 +1918,7 @@ def install_patches() -> Optional[str]:
         if extract_job:
             set_progress_status = kwargs.get("set_progress_status")
             try:
+                _prepare_vae_for_job(self, kwargs)
                 _run_extract_job(self, extract_job, set_progress_status=set_progress_status)
             except ExtractionBlocked as blocked:
                 _log(f"extraction refused: {blocked}")
@@ -1848,6 +1944,9 @@ def install_patches() -> Optional[str]:
         _REFMODS_ACTIVE.update({"on": False, "logged": False})
         first_window = int(kwargs.get("window_no") or 1) <= 1
         setattr(self, "_h3_window_no", int(kwargs.get("window_no") or 1))
+        # pipeline.py: image_outputs = image_mode > 0 and not self.audio_only
+        setattr(self, "_h3_image_output", int(kwargs.get("image_mode") or 0) > 0
+                and not getattr(self, "audio_only", False))
         setattr(self, "_h3_live_image_refs", len(kwargs.get("input_ref_images") or []))
         # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None.
         # A single-phase run is *also* "phase 1", so the phase-1 canvas fit must
@@ -2438,6 +2537,22 @@ def _foreign_task(kwargs) -> bool:
     return isinstance(custom, dict) and any(custom.get(key) for key in FOREIGN_TASK_KEYS)
 
 
+def _prepare_vae_for_job(pipeline_self, kwargs) -> None:
+    """Plugin jobs (extract, decompile, store encoder frames) run in place of
+    the generation, before generate() has set up the VAE -- and on the first
+    task after a model load its tiling is still off, so one large source can
+    run the graphics card out of memory in a single encode or decode
+    (fork.23). Switch it on the same way a generation would, first."""
+    configure = getattr(pipeline_self, "_configure_tiling", None)
+    if not callable(configure):
+        return
+    try:
+        configure(kwargs.get("VAE_tile_size"))
+    except Exception:
+        _log("could not switch on VAE tiling before the job; continuing without it:\n"
+             + traceback.format_exc())
+
+
 def _fl2va_label(pipeline_self) -> str:
     return ("FL2VA ControlNet" if _transformer_has_control(getattr(pipeline_self, "transformer", None))
             else "FL2VA")
@@ -2492,6 +2607,11 @@ def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
     if built is None:
         return False
     image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention = built
+    image_sentinels, video_sentinels = _reshape_video_mods(
+        image_sentinels, video_sentinels,
+        window_no=int(getattr(pipeline_self, "_h3_window_no", 1) or 1),
+        image_output=bool(getattr(pipeline_self, "_h3_image_output", False)),
+        window_mode=_window_mode_requested(state_json))
     two_phase = bool(getattr(pipeline_self, "_h3_two_phase", False))
     p2_off = bool(getattr(pipeline_self, "_h3_p2_off", False))
 
@@ -2587,6 +2707,11 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     if built is None:
         return kwargs
     image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention = built
+    image_sentinels, video_sentinels = _reshape_video_mods(
+        image_sentinels, video_sentinels,
+        window_no=int(window_no or 1) if isinstance(window_no, int) else 1,
+        image_output=bool(getattr(pipeline_self, "_h3_image_output", False)),
+        window_mode=_window_mode_requested(state_json))
 
     state = _gen_state(pipeline_self)
 

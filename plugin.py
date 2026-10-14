@@ -280,13 +280,16 @@ def _trim_summary(trims, names):
 # "Max size" (fork.19).
 ROW_WIDTH = 5
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
-# fit to output, mods in phase 2, shrink method.
-STACK_CONTROLS = 7
+# fit to output, mods in phase 2, shrink method, video mods on later windows.
+STACK_CONTROLS = 8
 
 # "Max size" slider: short edge in pixels, in steps of 32, down to this.
 MAX_SIZE_FLOOR = 128
 MAX_SIZE_STEP = 32
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
+WINDOW_VIDEO_UI = [("Whole clip (as on window 1)", "whole"),
+                   ("First frame as a picture", "picture"),
+                   ("Window 1 only", "first")]
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
@@ -425,7 +428,8 @@ def _is_picture_mod(meta):
 
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
-                   fit_to_output=False, phase2_mods="full", shrink_method="reencode"):
+                   fit_to_output=False, phase2_mods="full", shrink_method="reencode",
+                   window_video="whole"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown. Whether a
@@ -446,7 +450,9 @@ def _stack_payload(stack_mode, stack_n,
             # "Mods in phase 2" (fork.19): full / tile / off.
             "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
             # "Shrink method" (fork.20): reencode / fast.
-            "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode"}
+            "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode",
+            # "Video mods on later windows" (fork.23): whole / picture / first.
+            "window_video": window_video if window_video in ("whole", "picture", "first") else "whole"}
 
 
 def _format_label_line(rows):
@@ -739,7 +745,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.22"
+        self.version = "0.31.0-fork.23"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1027,6 +1033,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                      "decoded, resized and re-encoded with the loaded VAE -- best quality, takes a "
                      "few seconds per mod once. Fast: the stored mod is resized directly -- "
                      "instant, no VAE, but rougher.")
+        with gr.Row(visible=not basic):
+            window_video = gr.Dropdown(
+                choices=WINDOW_VIDEO_UI, value="whole", label="Video mods on later windows",
+                info="Only matters when a generation needs more than one sliding window. Picture "
+                     "and audio mods always reach every window. Whole clip: a video mod goes into "
+                     "every window as on window 1 -- strongest, but a few of its frames can show "
+                     "at a window boundary. First frame as a picture: windows 2, 3, ... get its "
+                     "first frame as a <Picture N> -- keeps the look, nothing to show at the "
+                     "boundary. Window 1 only: later windows carry on from what window 1 made.")
 
         # One slot per kind to start with; "Add" reveals the next one and
         # "Remove" clears and hides the last. Every slot is still built up
@@ -1128,7 +1143,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
         return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods,
-                          shrink_method)
+                          shrink_method, window_video)
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"
