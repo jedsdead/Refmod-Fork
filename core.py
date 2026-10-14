@@ -31,6 +31,7 @@ that changes is the token budget.
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -38,13 +39,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
-
-from . import encframes
 
 # Metadata key embedded in the safetensors header (keeps a mod in one file,
 # so it can be shared/uploaded as a single artifact). Kept identical to the
@@ -175,7 +175,8 @@ def parse_source_counts(tag) -> Optional[Tuple[int, int]]:
 def is_still_stack(kind: str, latent_t: int, tags=None, source: str = "") -> bool:
     """True for a mod made only from still pictures, with more than one of
     them. This plugin saves those as kind "image"; ComfyUI saves them as kind
-    "video" with source "stack", and only its tags tell the two apart."""
+    "video" with source "stack", and only its tags tell the two apart -- they
+    are injected as pictures either way."""
     if int(latent_t or 1) <= 1:
         return False
     if kind == "image":
@@ -183,6 +184,7 @@ def is_still_stack(kind: str, latent_t: int, tags=None, source: str = "") -> boo
     return kind == "video" and source == "stack" and infer_kind_from_tags(tags, "video") == "image"
 
 
+# Tensor key of a visual mod's optional soundtrack (see H3RefMod.audio_latent).
 AUDIO_LATENT_KEY = "audio_latent"
 
 
@@ -289,7 +291,7 @@ def merge_latents(pooled: List[torch.Tensor], fulls: List[torch.Tensor], latent_
                   device: Optional[torch.device] = None, progress_every: int = 0,
                   progress_cb=None) -> torch.Tensor:
     """Merge several references into ONE small latent: what they have in
-    common (port of the ComfyUI pack's "merge" mode, core.optimize_latent_multi).
+    common (the ComfyUI pack's "merge" mode).
 
     Starts from the mean of the references' pooled grids, then -- with
     ``steps`` > 0 -- refines that one grid so its upsampled reconstruction is
@@ -522,6 +524,122 @@ def fit_audio_token_budget(latent: torch.Tensor, budget: int, label: str) -> Tup
     return latent, messages
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Encoder frames -- the pictures MiniMax H3's text encoder is shown for a mod
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A reference that reaches the model natively travels two paths: its VAE
+# latent conditions the DiT, and its *pixels* go through Qwen3-VL and are
+# embedded into the text stream at a "<Picture N>: " / "<Video N>: " label.
+# A mod file only holds the latent, so without pixels a mod gets no label and
+# the prompt has no way to refer to it -- which is why H3's own prompt
+# structure ("subject_definitions: <Subject 1> is the violinist from
+# <Picture 1>") could never bind to a mod.
+#
+# So a few frames are stored alongside the latent, as JPEGs, in the same
+# layout ComfyUI-Fantastic-MiniMaxH3-PromptBuilder and the Refmod fork use,
+# so mods stay interchangeable with those tools:
+#   * tensors "enc_0".."enc_{N-1}": one JPEG each, as uint8
+#   * metadata "enc_times":  one timestamp per frame
+#   * metadata "enc_fps":    the rate a clip's frames were sampled at
+#   * metadata "enc_layout": "stills" (one per picture) or "clip"
+ENC_LAYOUT_STILLS, ENC_LAYOUT_CLIP = "stills", "clip"
+ENC_MAX_EDGE = 1024       # long edge of the frames shown to Qwen3-VL -- the
+                          # channel that binds a mod to its <Picture N> label.
+                          # A *live* reference is shown the whole image at the
+                          # generation canvas (1280x720 -> 880 vision tokens);
+                          # at the old 512 a mod got 144, a 6x deficit on the
+                          # circuit that carries recognition. 1024 -> 576,
+                          # which is live-reference territory. Qwen3-VL's own
+                          # ceiling for a still is 16.7 Mpixels, far above any
+                          # value offered here, so this is purely a cost dial.
+ENC_MAX_EDGE_CLIP = 512   # clips keep the smaller edge: a video mod stores up
+                          # to ENC_MAX_CLIP_FRAMES of them, and Qwen's video
+                          # path is budgeted per frame-pair, not per frame
+ENC_JPEG_QUALITY = 96
+ENC_MAX_CLIP_FRAMES = 8   # how many frames of a clip the encoder is shown
+
+
+def encode_enc_frames(frames: torch.Tensor, max_edge: Optional[int] = None) -> Dict[str, torch.Tensor]:
+    """[N, H, W, 3] float 0..1 -> {"enc_0": uint8 JPEG bytes, ...}.
+
+    ``max_edge`` caps the long edge (default ENC_MAX_EDGE); it never upscales."""
+    from PIL import Image
+    cap = int(max_edge or ENC_MAX_EDGE)
+    out = {}
+    for i in range(frames.shape[0]):
+        arr = (frames[i].clamp(0, 1) * 255).round().byte().cpu().numpy()
+        img = Image.fromarray(arr, mode="RGB")
+        if max(img.size) > cap:
+            scale = cap / max(img.size)
+            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                             Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        # subsampling=0 keeps full chroma resolution: JPEG's default 4:2:0
+        # halves the color detail, which is exactly where skin tone and eye
+        # color live, and those are what the vision encoder reads an identity from.
+        img.save(buf, format="JPEG", quality=ENC_JPEG_QUALITY, subsampling=0)
+        out[f"enc_{i}"] = torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8).clone()
+    return out
+
+
+def decode_enc_frames(tensors) -> Optional[torch.Tensor]:
+    """{"enc_0": ...} -> [N, H, W, 3] float 0..1, or None if there are none."""
+    from PIL import Image
+    keys = sorted((k for k in tensors if k.startswith("enc_")),
+                  key=lambda k: int(k.split("_", 1)[1]))
+    if not keys:
+        return None
+    frames = []
+    for k in keys:
+        img = Image.open(io.BytesIO(bytes(tensors[k].cpu().numpy()))).convert("RGB")
+        frames.append(torch.from_numpy(np.asarray(img).copy()).float().div_(255.0))
+    if len({tuple(f.shape) for f in frames}) > 1:
+        h = max(f.shape[0] for f in frames); w = max(f.shape[1] for f in frames)
+        frames = [F.interpolate(f.permute(2, 0, 1).unsqueeze(0), size=(h, w),
+                                mode="bilinear", align_corners=False).squeeze(0).permute(1, 2, 0)
+                  for f in frames]
+    return torch.stack(frames)
+
+
+def infer_enc_layout(times, latent_t: int) -> str:
+    """For files that don't record their layout (ComfyUI's): stills are
+    numbered 0, 1, 2 ... one per latent frame; anything else is a clip."""
+    times = [float(t) for t in times or []]
+    if times and len(times) == max(1, int(latent_t)) \
+            and all(abs(t - i) < 1e-6 for i, t in enumerate(times)):
+        return ENC_LAYOUT_STILLS
+    return ENC_LAYOUT_CLIP
+
+
+def expected_enc_layout(kind: str, latent_t: int, still_stack: bool = False) -> str:
+    """The layout a mod's encoder frames need to be shown the way it is
+    injected: pictures (single or stacked) as stills, a video mod as a clip."""
+    if kind == "image" or still_stack or int(latent_t) <= 1:
+        return ENC_LAYOUT_STILLS
+    return ENC_LAYOUT_CLIP
+
+
+def encoder_frames_status(meta: Optional[Dict]) -> str:
+    """From metadata alone: "stored" when a mod carries encoder frames laid
+    out the way it is injected, "missing" when it could but doesn't, "" for
+    audio mods, which have nothing to show."""
+    meta = meta or {}
+    kind = meta.get("kind", "image")
+    if kind == "audio":
+        return ""
+    times = meta.get("enc_times") or []
+    latent_t = max(1, int(meta.get("latent_t", 1) or 1))
+    if not times:
+        return "missing"
+    layout = meta.get("enc_layout") or infer_enc_layout(times, latent_t)
+    wanted = expected_enc_layout(
+        kind, latent_t, is_still_stack(kind, latent_t, meta.get("tags"), meta.get("source", "")))
+    if layout != wanted or (layout == ENC_LAYOUT_STILLS and len(times) != latent_t):
+        return "missing"
+    return "stored"
+
+
 @dataclass
 class H3RefMod:
     """A compressed reference for MiniMax H3.
@@ -533,23 +651,13 @@ class H3RefMod:
     time), always a full-resolution encode -- there is no spatial grid to
     pool for audio, so "training" mode's compression concept doesn't apply
     and audio mods are always extracted at full VAE fidelity.
-
-    ``audio_latent`` is an OPTIONAL second latent on an image/video mod, so
-    one mod can carry both a look and a voice. H3 supports this natively: a
-    reference video may carry a soundtrack, which the pipeline tags
-    ``kind: "video_audio"`` with ``ref_audio_t`` set, and the packer gives
-    that reference audio rows as well as video rows. Stored under its own
-    key in the same file; a reader that doesn't know about it still loads
-    the visual latent unchanged.
     ``kind`` is "video" if any real video source was included when the mod
     was extracted, "image" otherwise -- an "image" mod can still have
     ``latent_t > 1`` if several still images were stacked into it (each
     occupies its own image-reference slot at injection time, matching
-    Wan2GP's own ``refs`` payload kinds). An "audio" mod is extracted from a
-    single audio file on its own; an image/video mod may additionally carry a
-    soundtrack in ``audio_latent`` (stored beside the visual latent, never
-    stacked with it -- the shapes are incompatible -- and injected as its own
-    audio reference).
+    Wan2GP's own ``refs`` payload kinds). "audio" mods are always extracted
+    from a single audio file, never combined with image/video sources (the
+    latent shapes are structurally incompatible to stack together).
     """
 
     name: str
@@ -559,8 +667,6 @@ class H3RefMod:
     latent_w: int = 4
     latent_t: int = 1
     mode: str = "training"
-    audio_latent: Optional[torch.Tensor] = None
-    audio_t: int = 0
     source: str = ""
     source_shape: str = ""
     pool: str = ""
@@ -568,16 +674,25 @@ class H3RefMod:
     tags: List[str] = field(default_factory=list)
     description: str = ""
     concept_type: str = "generic"
-    # Pictures for the text encoder, stored beside the latent as JPEG (see
-    # encframes.py). Optional: a mod without them is decoded at generation
-    # time instead, as before.
-    enc_frames: Optional[Dict[str, torch.Tensor]] = None
+    # Pixels shown to the text encoder so the mod earns a <Picture N> /
+    # <Video N> label. [N, H, W, 3] float 0..1, or None for mods extracted
+    # before this existed (they still work, just without a prompt label).
+    enc_frames: Optional[torch.Tensor] = None
     enc_times: List[float] = field(default_factory=list)
+    enc_layout: str = ENC_LAYOUT_STILLS
     enc_fps: float = 0.0
-    enc_layout: str = ""
+    # Long edge the prompt-view frames are stored at. None = the module default.
+    enc_max_edge: Optional[int] = None
+    # Optional soundtrack on an image/video mod, so one mod can carry both a
+    # look and a voice: an audio-VAE latent [1, 32, 2, T] stored beside the
+    # visual latent under AUDIO_LATENT_KEY (the shapes can't be stacked) and
+    # injected as its own <Audio N> reference. A reader that doesn't know
+    # about it still loads the visual latent unchanged.
+    audio_latent: Optional[torch.Tensor] = None
+    audio_t: int = 0
     # Metadata keys this plugin doesn't use (ComfyUI's subject name,
     # appearance, voice description ...), carried through every rewrite so
-    # moving or renaming a mod here never strips them.
+    # moving or renaming a mod never strips them.
     extra_meta: Dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -602,9 +717,16 @@ class H3RefMod:
             return self.latent_t * 2
         per_frame = (self.latent_h // 2) * (self.latent_w // 2)
         total = self.latent_t * per_frame
-        if self.audio_latent is not None:   # the attached soundtrack costs rows too
+        if self.audio_latent is not None:   # an attached soundtrack costs rows too
             total += int(self.audio_latent.shape[-1]) * 2
         return total
+
+    def still_stack(self) -> bool:
+        """Several still pictures (see is_still_stack) -- injected as pictures."""
+        return is_still_stack(self.kind, self.latent_t, self.tags, self.source)
+
+    def has_encoder_frames(self) -> bool:
+        return self.enc_frames is not None and bool(self.enc_frames.shape[0])
 
     def weighted_latent(self, strength: float = 1.0, curve=None) -> Optional[torch.Tensor]:
         """The latent to inject, blended with a blurred copy of itself by
@@ -650,18 +772,17 @@ class H3RefMod:
         }
         meta = {**{k: v for k, v in (self.extra_meta or {}).items() if k not in meta}, **meta}
         tensors = {"latent": self.latent.contiguous()}
-        if self.has_encoder_frames():
-            # Same keys ComfyUI's Fantastic pack uses, so the frames survive a
-            # round trip through either tool.
-            tensors.update({k: v.contiguous() for k, v in self.enc_frames.items()})
-            meta["enc_times"] = [float(t) for t in self.enc_times]
-            meta["enc_fps"] = float(self.enc_fps)
-            meta["enc_layout"] = self.encoder_layout()
         if self.audio_latent is not None:
             # Own key, so a reader that only wants ["latent"] is unaffected.
             tensors[AUDIO_LATENT_KEY] = self.audio_latent.contiguous()
             meta["audio_t"] = int(self.audio_latent.shape[-1])
             meta["has_audio"] = True
+        if self.enc_frames is not None and self.enc_frames.shape[0]:
+            tensors.update(encode_enc_frames(self.enc_frames, self.enc_max_edge))
+            meta["enc_max_edge"] = int(self.enc_max_edge or ENC_MAX_EDGE)
+            meta["enc_times"] = [float(t) for t in self.enc_times] or list(range(self.enc_frames.shape[0]))
+            meta["enc_layout"] = self.enc_layout
+            meta["enc_fps"] = float(self.enc_fps)
         save_file(tensors, path_no_ext + ".safetensors",
                   metadata={META_KEY: json.dumps(meta)})
         return path_no_ext + ".safetensors"
@@ -673,19 +794,17 @@ class H3RefMod:
             raise ValueError(f"{path_no_ext}.safetensors has no RefMod metadata.")
         tensors = load_file(path_no_ext + ".safetensors", device=device)
         latent = tensors["latent"].clone()
-        audio_latent = tensors.get(AUDIO_LATENT_KEY)
-        audio_latent = audio_latent.clone() if audio_latent is not None else None
+        try:
+            enc_frames = decode_enc_frames(tensors)
+        except Exception as e:
+            print(f"[H3RefMod] could not read encoder frames from {path_no_ext}: {e!r}")
+            enc_frames = None
         # NOTE: dict.get(key, fallback) always evaluates `fallback` eagerly, even
         # when `key` is present and the fallback goes unused -- so the fallback
         # expression itself must never index a dimension that might not exist.
         # An audio latent is 4D ([1, C, S, T]); a visual one is 5D
         # ([1, C, T, H, W]); latent.shape[4] would raise on the former
         # regardless of whether meta actually had "latent_w" saved.
-        enc_times = [float(t) for t in (meta.get("enc_times") or [])]
-        enc_frames = {k: v.clone() for k, v in tensors.items() if encframes.is_enc_key(k)}
-        if not enc_frames or len(enc_frames) != len(enc_times) \
-                or any(f"{encframes.ENC_PREFIX}{i}" not in enc_frames for i in range(len(enc_times))):
-            enc_frames = None   # missing or inconsistent: ignore, the mod decodes instead
         if latent.dim() == 4:
             default_h, default_w, default_t = 4, 4, latent.shape[-1]
         else:
@@ -705,59 +824,16 @@ class H3RefMod:
             tags=list(meta.get("tags", [])),
             description=str(meta.get("description", "") or ""),
             concept_type=str(meta.get("concept_type", "generic") or "generic"),
-            audio_latent=audio_latent,
-            audio_t=int(meta.get("audio_t", 0) or 0) if audio_latent is not None else 0,
             enc_frames=enc_frames,
-            enc_times=enc_times if enc_frames else [],
-            enc_fps=float(meta.get("enc_fps") or 0.0) if enc_frames else 0.0,
-            enc_layout=str(meta.get("enc_layout") or "") if enc_frames else "",
+            enc_times=[float(t) for t in (meta.get("enc_times") or [])],
+            enc_layout=str(meta.get("enc_layout")
+                           or infer_enc_layout(meta.get("enc_times"), int(meta.get("latent_t", default_t)))),
+            enc_fps=float(meta.get("enc_fps") or 0.0),
+            enc_max_edge=int(meta["enc_max_edge"]) if meta.get("enc_max_edge") else None,
+            audio_latent=(tensors[AUDIO_LATENT_KEY].clone() if AUDIO_LATENT_KEY in tensors else None),
+            audio_t=(int(tensors[AUDIO_LATENT_KEY].shape[-1]) if AUDIO_LATENT_KEY in tensors else 0),
             extra_meta={k: v for k, v in meta.items() if k not in _KNOWN_META_KEYS},
         )
-
-    # ── encoder frames ────────────────────────────────────────────────
-
-    def has_encoder_frames(self) -> bool:
-        return bool(self.enc_frames) and len(self.enc_frames) == len(self.enc_times) > 0
-
-    def encoder_layout(self) -> str:
-        """The stored frames' layout, as recorded or (ComfyUI files) inferred."""
-        if not self.has_encoder_frames():
-            return ""
-        if self.enc_layout in (encframes.LAYOUT_STILLS, encframes.LAYOUT_CLIP):
-            return self.enc_layout
-        return encframes.infer_layout(self.enc_times, self.latent_t)
-
-    def still_stack(self) -> bool:
-        return is_still_stack(self.kind, self.latent_t, self.tags, self.source)
-
-    def wanted_layout(self) -> str:
-        return encframes.expected_layout(self.kind, self.latent_t, self.still_stack())
-
-    def encoder_frames_usable(self, fps: Optional[float] = None) -> bool:
-        """Stored frames can stand in for a decode: the layout matches how the
-        mod is presented, a stills record has one picture per latent frame,
-        and a clip was sampled at the rate being asked for."""
-        if self.kind == "audio" or not self.has_encoder_frames():
-            return False
-        layout = self.encoder_layout()
-        if layout != self.wanted_layout():
-            return False
-        if layout == encframes.LAYOUT_STILLS:
-            return len(self.enc_times) == max(1, int(self.latent_t))
-        return fps is None or abs(float(self.enc_fps) - float(fps)) < 1e-6
-
-    def set_encoder_frames(self, frames: torch.Tensor, times, fps: float, layout: str) -> None:
-        """Store [N, H, W, 3] float 0..1 frames (packed to JPEG)."""
-        self.enc_frames = encframes.pack_frames(frames)
-        self.enc_times = [float(t) for t in times]
-        self.enc_fps = float(fps)
-        self.enc_layout = layout
-
-    def clear_encoder_frames(self) -> None:
-        self.enc_frames, self.enc_times, self.enc_fps, self.enc_layout = None, [], 0.0, ""
-
-    def encoder_frames_uint8(self) -> torch.Tensor:
-        return encframes.unpack_frames(self.enc_frames, len(self.enc_times))
 
 
 # Metadata this plugin writes itself; anything else in a file is carried
@@ -765,27 +841,5 @@ class H3RefMod:
 _KNOWN_META_KEYS = {
     "name", "kind", "latent_h", "latent_w", "latent_t", "mode", "source", "source_shape",
     "pool", "optimize_steps", "tags", "description", "concept_type", "_format_version",
-    "_produced_by", "audio_t", "has_audio", "enc_times", "enc_fps", "enc_layout",
+    "_produced_by", "audio_t", "has_audio", "enc_times", "enc_fps", "enc_layout", "enc_max_edge",
 }
-
-
-def encoder_frames_status(meta: Optional[Dict]) -> str:
-    """From metadata alone: "stored" when a mod carries usable encoder frames,
-    "missing" when it could but doesn't (or they no longer match how it is
-    presented), "" for audio mods, which have nothing to show."""
-    meta = meta or {}
-    kind = meta.get("kind", "image")
-    if kind == "audio":
-        return ""
-    times = meta.get("enc_times") or []
-    latent_t = max(1, int(meta.get("latent_t", 1) or 1))
-    if not times:
-        return "missing"
-    layout = meta.get("enc_layout") or encframes.infer_layout(times, latent_t)
-    wanted = encframes.expected_layout(
-        kind, latent_t, is_still_stack(kind, latent_t, meta.get("tags"), meta.get("source", "")))
-    if layout != wanted:
-        return "missing"
-    if layout == encframes.LAYOUT_STILLS and len(times) != latent_t:
-        return "missing"
-    return "stored"

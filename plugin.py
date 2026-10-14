@@ -41,11 +41,15 @@ from PIL import Image
 from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, encframes, storage
-from .patches import (SETTING_COMBINED, SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY,
-                      install_patches, pack_refmod_setting, set_pending_extract,
+from .patches import (EXTRACT_WRAPPER_KEY, SETTING_GENERATE, STASH_KEY, install_patches,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
-                      is_minimax_h3_ref2va, is_minimax_h3_refmod_capable,
+                      is_minimax_h3_refmod_capable,
                       DEFAULT_AUDIO_SECONDS, MIN_AUDIO_SECONDS)
+
+try:
+    from gradio_rangeslider import RangeSlider   # shipped with Wan2GP (fork: video trim)
+except Exception:                                 # pragma: no cover
+    RangeSlider = None
 
 PlugIn_Name = "MiniMax H3 RefMods"
 PlugIn_Id = "H3RefMods"
@@ -59,17 +63,22 @@ PlugIn_Id = "H3RefMods"
 # image references working correctly. Raise these if you want more slots --
 # the live counter below will keep telling you what you're actually sending.
 IMAGE_ROWS = 20
-# The compact panel other plugins get through _build_mod_picker_rows (fork.22).
-BASIC_IMAGE_ROWS, BASIC_VIDEO_ROWS, BASIC_AUDIO_ROWS = 6, 3, 3
 VIDEO_ROWS = 6
 AUDIO_ROWS = 4
-try:
-    from gradio_rangeslider import RangeSlider          # shipped with Wan2GP
-except Exception:                                        # pragma: no cover
-    RangeSlider = None
-
 NONE_CHOICE = "(none)"
-ROOT_FOLDER_CHOICE = "(top level)"
+
+# How video-kind mods behave on sliding windows after the first one. Image and
+# audio mods always go to every window (that is what WanGP does with its own
+# live references: src_ref_images / audio_guide are set once, before the window
+# loop, and passed to every generate() call), so only the video case is a
+# choice. The values are what travels in the serialized state; see
+# patches.WINDOW_MODE_* for what each one does at injection time.
+WINDOW_MODE_CHOICES = [
+    ("First frame as a still (recommended)", "still"),
+    ("Whole clip, like a live reference video", "full"),
+    ("Not at all (first window only)", "first"),
+]
+WINDOW_MODE_DEFAULT = "still"
 
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
 # so this UI doesn't need a live import of Wan2GP internals just to draw a
@@ -109,10 +118,7 @@ def _diagnose(api_session, model_type, patch_error):
     try:
         model_def = api_session.get_model_def(model_type) or {}
         declared_ids = {s.get("id") for s in (model_def.get("custom_settings") or []) if isinstance(s, dict)}
-        missing = [] if SETTING_COMBINED in declared_ids else [SETTING_COMBINED]
-        if not missing and len(declared_ids) > 5:
-            lines.append(f"⚠️ This model declares {len(declared_ids)} custom settings; Wan2GP keeps only "
-                         f"the first 5, so '{SETTING_COMBINED}' may still be dropped at task time.")
+        missing = [sid for sid in (SETTING_GENERATE,) if sid not in declared_ids]
         if missing:
             lines.append(f"❌ This model does NOT declare {missing} under custom_settings -- RefMods will "
                          f"silently no-op for it (a real generation will run instead of an extraction, or "
@@ -192,7 +198,7 @@ def _refresh_mod_dropdown_updates(folder=ALL_FOLDERS_CHOICE, *current_values):
             choices = choices + [current]
         return gr.update(choices=choices, value=current if current else NONE_CHOICE)
 
-    updates = [_safe_choice_update(_folder_choices(), folder)]
+    updates = [gr.update(choices=_folder_choices(), value=folder)]
     i = 0
     for _ in range(IMAGE_ROWS):
         updates.append(row_update("image", i)); i += 1
@@ -276,20 +282,17 @@ def _trim_summary(trims, names):
     return "Trimmed: " + ", ".join(parts) if parts else ""
 
 
-# Values per picker row: mod, strength, "Send as one video", "Include audio",
-# "Max size" (fork.19).
+# Fork panel. Values per picker row: mod, strength, "Send as one video",
+# "Include audio", "Max size".
 ROW_WIDTH = 5
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
-# fit to output, mods in phase 2, shrink method, video mods on later windows.
+# fit to output, mods in phase 2, shrink method, video mods on sliding windows.
 STACK_CONTROLS = 8
 
 # "Max size" slider: short edge in pixels, in steps of 32, down to this.
 MAX_SIZE_FLOOR = 128
 MAX_SIZE_STEP = 32
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
-WINDOW_VIDEO_UI = [("Whole clip (as on window 1)", "whole"),
-                   ("First frame as a picture", "picture"),
-                   ("Window 1 only", "first")]
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
@@ -429,11 +432,12 @@ def _is_picture_mod(meta):
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
                    fit_to_output=False, phase2_mods="full", shrink_method="reencode",
-                   window_video="whole"):
+                   window_mode=WINDOW_MODE_DEFAULT):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
-    and how many frames of a video mod, the text encoder is shown. Whether a
-    mod is sent as one video is per row ("as_video" in each row)."""
+    and how many frames of a video mod, the text encoder is shown, plus the
+    panel's sizing and sliding-window options. Whether a mod is sent as one
+    video is per row ("as_video" in each row)."""
     def count(value, default):
         try:
             return max(1, int(value or default))
@@ -445,14 +449,15 @@ def _stack_payload(stack_mode, stack_n,
             "stack_pictures_n": count(stack_n, encframes.STACK_DEFAULT_N),
             "video_frames": vmode,
             "video_frames_n": count(video_n, encframes.MAX_CLIP_FRAMES_SHOWN),
-            # "Fit mods to the output size" (fork.18, off by default).
+            # "Fit mods to the output size" (off by default).
             "fit_to_output": bool(fit_to_output),
-            # "Mods in phase 2" (fork.19): full / tile / off.
+            # "Mods in phase 2": full / tile / off.
             "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
-            # "Shrink method" (fork.20): reencode / fast.
+            # "Shrink method": reencode / fast.
             "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode",
-            # "Video mods on later windows" (fork.23): whole / picture / first.
-            "window_video": window_video if window_video in ("whole", "picture", "first") else "whole"}
+            # "Video mods on sliding windows 2, 3, ...": still / full / first.
+            "window_mode": window_mode if window_mode in [v for _, v in WINDOW_MODE_CHOICES]
+            else WINDOW_MODE_DEFAULT}
 
 
 def _format_label_line(rows):
@@ -714,8 +719,9 @@ def _library_rows(folder=None):
         list_folder, recursive = None, True
     else:
         list_folder, recursive = folder, True
-    return [[i["name"], i["kind"], i["mode"], i["tokens"], i["size_mb"], i.get("frames", ""),
-             i["concept_type"], i["description"]]
+    return [[i["name"], i["kind"], i["mode"], i["tokens"],
+             (f'{i["prompt_view"]}px' if i.get("prompt_view") else "--"),
+             i["size_mb"], i["concept_type"], i["description"]]
             for i in storage.list_refmods_info(folder=list_folder, recursive=recursive)]
 
 
@@ -745,7 +751,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0-fork.23"
+        self.version = "0.38.1-fork.26"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -856,62 +862,45 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "Extract new RefMods from the **MiniMax H3 RefMods** tab. Selecting a mod here "
                 "applies immediately to generations started from *this page's* own Generate "
                 "button -- no separate submission needed.")
-            mod_rows, stack_controls = self._build_mod_picker_rows_full()
+            # Fork: the full panel (per-row options, sizing, text encoder).
+            mod_rows, panel_controls = self._build_mod_picker_rows_full()
             with gr.Row():
                 status = gr.Markdown("*No RefMods selected.*")
-                clear_btn = gr.Button("Clear armed RefMods", size="sm", scale=0)
+                clear_btn = gr.Button("Clear RefMods", size="sm", scale=0)
 
-        widgets = [c for row in mod_rows for c in row] + list(stack_controls)
+        widgets = [c for row in mod_rows for c in row] + list(panel_controls)
 
         def apply_selection(state, *vals):
             n_rows = IMAGE_ROWS + VIDEO_ROWS + AUDIO_ROWS
             rows = _rows_payload(vals[:n_rows * ROW_WIDTH])
             payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
                        **_stack_payload(*vals[n_rows * ROW_WIDTH:n_rows * ROW_WIDTH + STACK_CONTROLS])}
-            try:
-                from . import patches as _h3p
-                _h3p.set_armed_selection(json.dumps(payload) if rows else None)
-                print(f"[H3RefMod] inline panel: {len(rows)} RefMod(s) armed"
-                      if rows else "[H3RefMod] inline panel: selection cleared")
-            except Exception:
-                pass
             if not isinstance(state, dict):
                 return state, "⚠️ Could not access session state -- try reloading the page."
             if rows:
                 state[STASH_KEY] = json.dumps(payload)
                 msg = f"✅ {len(rows)} RefMod(s) armed for the next MiniMax H3 generation from this page."
             else:
-                # Clearing the pickers clears the selection. (This used to hold
-                # on to the last selection, from when the task payload was
-                # being dropped and this was the only path that worked -- an
-                # empty panel then kept injecting mods into every generation.)
                 state.pop(STASH_KEY, None)
                 msg = "*No RefMods selected.*"
             return state, msg
 
         def clear_selection(state):
-            try:
-                from . import patches as _h3p
-                _h3p.set_armed_selection(None, force=True)
-            except Exception:
-                pass
+            # Fork: empties the slots as well, so the panel never shows mods
+            # that aren't armed.
             if isinstance(state, dict):
                 state.pop(STASH_KEY, None)
-            print("[H3RefMod] inline panel: armed RefMods cleared")
-            # Empty the slots too, so the panel never shows mods that aren't
-            # armed (the next edit would otherwise silently re-arm them all).
             resets = []
             for _ in mod_rows:
                 resets += _cleared_row_updates()
-            return [state, "*No RefMods armed.*"] + resets
+            return [state, "*No RefMods selected.*"] + resets
 
         clear_btn.click(fn=clear_selection, inputs=[self.state],
-                        outputs=[self.state, status] + [c for row in mod_rows for c in row],
-                        queue=False)
+                        outputs=[self.state, status] + [c for row in mod_rows for c in row], queue=False)
 
-        # One handler for every widget (gr.on), not one per widget: each
-        # handler takes all ~160 widgets as inputs, and Gradio's first page
-        # load does work for every handler x input (see _hidden_from_api).
+        # One handler for every widget (gr.on), not one per widget: each takes
+        # every widget as input, and Gradio's first page load does work for
+        # every handler x input (see _hidden_from_api).
         gr.on(triggers=[w.change for w in widgets], fn=apply_selection,
               inputs=[self.state] + widgets, outputs=[self.state, status], queue=False)
 
@@ -946,22 +935,88 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     # ── Extract ─────────────────────────────────────────────────────────
 
-    def _build_mod_picker_rows(self=None):
-        """For OTHER plugins (fork.22). The original port's panel builder
-        returned a plain list of (mod dropdown, strength slider) rows, and
-        plugins such as "2 Phases Plus" (H3 Upscaler tab) build their own copy
-        of the panel by calling this through the class, with no plugin
-        instance: MiniMaxH3RefModsPlugin._build_mod_picker_rows(None). This
-        fork's panel returns more than that, which crashed them ("'tuple'
-        object has no attribute 'change'"). So this keeps the original shape:
-        a compact panel (fewer slots, mod + strength per row, no extra
-        options -- the caller only reads mod and strength) returned as a list
-        of 2-tuples. This plugin's own panels use _build_mod_picker_rows_full."""
-        rows, _ = _hidden_from_api(MiniMaxH3RefModsPlugin._build_mod_picker_rows_full)(self, basic=True)
-        return [tuple(row) for row in rows]
+    @_hidden_from_api
+    def _build_mod_picker_rows(self):
+        """A folder picker + "Refresh mod list" button + a live
+        reference-budget counter, followed by IMAGE_ROWS image-kind +
+        VIDEO_ROWS video-kind + AUDIO_ROWS audio-kind mod picker rows
+        (dropdown restricted to that kind, plus strength), matching MiniMax
+        H3 Ref2VA's own native reference caps. The folder picker, refresh
+        button and counter live here (above the rows, for visibility) and
+        are fully wired before returning. Returns the flat list of
+        (dropdown, strength) pairs, image rows first, then video rows, then
+        audio rows -- callers must keep that same order when reading values
+        back (_refresh_mod_dropdown_updates() above does too)."""
+        with gr.Row():
+            folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
+                                    label="Folder", scale=3,
+                                    info="Narrow the mod lists below to one subfolder of "
+                                         "loras/refmods_plugin/minimax_h3/. Pick "
+                                         f"'{ALL_FOLDERS_CHOICE}' to go back to seeing everything.")
+            refresh_btn = gr.Button("🔄 Refresh mod list", size="sm", scale=1)
+        counter = gr.Markdown(_format_ref_counter([]))
+        mod_rows = []
+        gr.Markdown(f"**Image RefMods** (up to {IMAGE_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
+        for i in range(IMAGE_ROWS):
+            with gr.Row():
+                mdd = gr.Dropdown(choices=_mod_choices("image"), value=NONE_CHOICE,
+                                  label=f"Image Mod {i + 1}", scale=3)
+                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
+                mod_rows.append((mdd, strength))
+        gr.Markdown(f"**Video RefMods** (up to {VIDEO_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
+        for i in range(VIDEO_ROWS):
+            with gr.Row():
+                mdd = gr.Dropdown(choices=_mod_choices("video"), value=NONE_CHOICE,
+                                  label=f"Video Mod {i + 1}", scale=3)
+                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
+                mod_rows.append((mdd, strength))
+        gr.Markdown(f"**Audio RefMods** (up to {AUDIO_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
+        for i in range(AUDIO_ROWS):
+            with gr.Row():
+                mdd = gr.Dropdown(choices=_mod_choices("audio"), value=NONE_CHOICE,
+                                  label=f"Audio Mod {i + 1}", scale=3)
+                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
+                mod_rows.append((mdd, strength))
 
-    def _build_mod_picker_rows_full(self, basic=False):
-        """The mod pickers: a folder picker + "Refresh mod list" button, the
+        picker_outputs = [folder_dd] + [r[0] for r in mod_rows]
+        # The current selections are passed in as well so switching folders
+        # can preserve them (see _refresh_mod_dropdown_updates) -- without
+        # that, narrowing to a folder would drop any mod picked from a
+        # different one and Gradio would reject the now-stale value.
+        picker_inputs = [folder_dd] + [r[0] for r in mod_rows]
+        refresh_btn.click(fn=_refresh_mod_dropdown_updates, inputs=picker_inputs,
+                          outputs=picker_outputs, queue=False)
+        folder_dd.change(fn=_refresh_mod_dropdown_updates, inputs=picker_inputs,
+                         outputs=picker_outputs, queue=False)
+
+        def update_counter(*vals):
+            n = len(mod_rows)
+            pairs = [(vals[i * 2], vals[i * 2 + 1]) for i in range(n)]
+            return _format_ref_counter(pairs)
+
+        row_widgets = [c for row in mod_rows for c in row]
+        for w in row_widgets:
+            w.change(fn=update_counter, inputs=row_widgets, outputs=[counter], queue=False)
+
+        window_mode = gr.Dropdown(
+            label="Video mods on sliding windows 2, 3, ...",
+            choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
+            info="Only matters when Number of frames needs more than one window. Image and "
+                 "audio mods always reach every window, exactly like a live reference does. "
+                 "Video mods have a known quirk: given whole to a later window, a few of their "
+                 "own frames can surface at the window boundary. 'First frame as a still' keeps "
+                 "the identity without the motion that causes that.")
+
+        # Appended as a one-element pseudo-row so both callers (inline panel
+        # and the plugin's own Generate tab) pick it up through the same flat
+        # widget list; each reads it back at index IMAGE_ROWS+VIDEO_ROWS+AUDIO_ROWS)*2.
+        # (Fork: this plugin's own panels use _build_mod_picker_rows_full below;
+        # this one is kept as it is for other plugins that build their own
+        # copy of the panel, e.g. 2 Phases Plus' H3 Upscaler tab.)
+        return mod_rows + [(window_mode,)]
+
+    def _build_mod_picker_rows_full(self):
+        """Fork. The mod pickers: a folder picker + "Refresh mod list" button, the
         live budget/label readout, the "Text encoder options" accordion, then
         one slot per kind (image, video, audio) with Add / Remove buttons
         revealing up to IMAGE_ROWS / VIDEO_ROWS / AUDIO_ROWS -- all wired
@@ -987,10 +1042,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # is selected (with each mod's prompt label), then the text encoder
         # options.
         counter = gr.Markdown(_format_ref_counter([]))
-        if basic:
-            stack_mode = stack_n = video_mode = video_n = None
-            fit_to_output = phase2_mods = shrink_method = None
-        with gr.Accordion("Text encoder options", open=True, visible=not basic):
+        with gr.Accordion("Text encoder options", open=True):
             gr.Markdown("How many pictures of each mod the text encoder is shown, to bind its "
                         "prompt label. The model always receives every mod in full.")
             with gr.Row():
@@ -1012,7 +1064,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                          "lighter text encode and slightly faster steps.")
                 video_n = gr.Number(value=encframes.MAX_CLIP_FRAMES_SHOWN, precision=0, minimum=1,
                                     maximum=256, label="N", scale=1)
-        with gr.Row(visible=not basic):
+        with gr.Row():
             fit_to_output = gr.Checkbox(
                 False, label="Fit mods to the output size (faster)", scale=2,
                 info="Off: every picture and video mod goes in at the size it was extracted "
@@ -1033,15 +1085,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                      "decoded, resized and re-encoded with the loaded VAE -- best quality, takes a "
                      "few seconds per mod once. Fast: the stored mod is resized directly -- "
                      "instant, no VAE, but rougher.")
-        with gr.Row(visible=not basic):
-            window_video = gr.Dropdown(
-                choices=WINDOW_VIDEO_UI, value="whole", label="Video mods on later windows",
-                info="Only matters when a generation needs more than one sliding window. Picture "
-                     "and audio mods always reach every window. Whole clip: a video mod goes into "
-                     "every window as on window 1 -- strongest, but a few of its frames can show "
-                     "at a window boundary. First frame as a picture: windows 2, 3, ... get its "
-                     "first frame as a <Picture N> -- keeps the look, nothing to show at the "
-                     "boundary. Window 1 only: later windows carry on from what window 1 made.")
+        window_mode = gr.Dropdown(
+            label="Video mods on sliding windows 2, 3, ...",
+            choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
+            info="Only matters when Number of frames needs more than one window. Image and "
+                 "audio mods always reach every window, exactly like a live reference does. "
+                 "Video mods have a known quirk: given whole to a later window, a few of their "
+                 "own frames can surface at the window boundary. 'First frame as a still' keeps "
+                 "the identity without the motion that causes that. Picture stacks sent as one "
+                 "video always go in whole.")
 
         # One slot per kind to start with; "Add" reveals the next one and
         # "Remove" clears and hides the last. Every slot is still built up
@@ -1050,26 +1102,19 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # then video rows, then audio rows, each a (dropdown, strength,
         # send-as-one-video) triple.
         mod_rows = []
-        counts = ((BASIC_IMAGE_ROWS, BASIC_VIDEO_ROWS, BASIC_AUDIO_ROWS) if basic
-                  else (IMAGE_ROWS, VIDEO_ROWS, AUDIO_ROWS))
+        counts = (IMAGE_ROWS, VIDEO_ROWS, AUDIO_ROWS)
         for kind, label, count in (("image", "Image RefMods", counts[0]),
                                    ("video", "Video RefMods", counts[1]),
                                    ("audio", "Audio RefMods", counts[2])):
             note = (" -- a mod made from several pictures also gets a **Send as one video** "
                     "box: ticked, it is one `<Video N>` in the prompt instead of one "
-                    "`<Picture N>` per picture." if kind == "image" and not basic else "")
+                    "`<Picture N>` per picture." if kind == "image" else "")
             gr.Markdown(f"**{label}**{note}")
             kind_rows, kind_ui = [], []
             for i in range(count):
                 with gr.Row(visible=i == 0) as row_ui:
                     mdd = gr.Dropdown(choices=_mod_choices(kind), value=NONE_CHOICE,
                                       label=f"{kind.capitalize()} mod {i + 1}", scale=4)
-                    if basic:
-                        strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength",
-                                             scale=3)
-                        kind_rows.append((mdd, strength))
-                        kind_ui.append(row_ui)
-                        continue
                     with gr.Column(scale=3, min_width=220):
                         strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength")
                         # "Max size" (fork.19): shown once a picture or video
@@ -1096,9 +1141,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 n = min(_count, int(n or 1) + 1)
                 return [n] + [gr.update(visible=k < n) for k in range(_count)]
 
-            _width = len(kind_rows[0]) if kind_rows else ROW_WIDTH
-
-            def remove_slot(n, _count=count, _width=_width):
+            def remove_slot(n, _count=count, _width=ROW_WIDTH):
                 n = max(1, int(n or 1))
                 last = n - 1                       # the slot being cleared
                 n = max(1, n - 1)
@@ -1126,24 +1169,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         folder_dd.change(fn=_refresh_mod_dropdown_updates, inputs=picker_inputs,
                          outputs=picker_outputs, queue=False)
 
-        width = len(mod_rows[0]) if mod_rows else ROW_WIDTH
-
         def update_counter(*vals):
-            rows = [tuple(vals[i * width:(i + 1) * width]) for i in range(len(mod_rows))]
+            rows = [tuple(vals[i * ROW_WIDTH:(i + 1) * ROW_WIDTH]) for i in range(len(mod_rows))]
             return _format_ref_counter(rows)
 
         row_widgets = [c for row in mod_rows for c in row]
         gr.on(triggers=[w.change for w in row_widgets], fn=update_counter, inputs=row_widgets,
               outputs=[counter], queue=False)
-        if basic:
-            return mod_rows, None
         stack_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[stack_mode], outputs=[stack_n], queue=False)
         video_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
         return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods,
-                          shrink_method, window_video)
+                          shrink_method, window_mode)
+
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"
@@ -1153,41 +1193,20 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     "bar for a few seconds, then **no video is produced on purpose**: the mod file "
                     "is what was created. Check the status line below for confirmation.")
         with gr.Row():
-            name = gr.Textbox(label="Mod name", value="my_concept", scale=2,
+            name = gr.Textbox(label="Mod name", value="my_concept",
                               info="A plain name saves to the main folder. Include a path "
                                    "(characters/tanya) to save into a subfolder instead -- it's "
                                    "created automatically if it doesn't exist.")
-            mode = gr.Radio(label="Mode", choices=["training", "encode"], value="training", scale=2,
+            mode = gr.Radio(label="Mode", choices=["training", "encode"], value="training",
                             info="encode = full fidelity (identical to a live reference), best for a "
                                  "precise face/identity. training = approximate (pooling discards "
                                  "fine detail), best for a general concept/style/pose where "
                                  "approximation is fine.")
-        with gr.Accordion("Description and concept type (optional labels)", open=False):
-            with gr.Row():
-                description = gr.Textbox(
-                    label="keyword - description", lines=2, scale=3,
-                    info="Text note only. The model never reads it; the Library's prompt hint "
-                         "uses it.")
-                concept_type = gr.Dropdown(
-                    label="Concept type", choices=list(core.CONCEPT_TYPES), value="generic", scale=1,
-                    info="Label only. No effect on generation.")
-
-        gr.Markdown("#### Sources\n"
-                    "*Add as many reference images and videos as you like -- every one is encoded "
-                    "and stacked into this single mod.*")
         with gr.Row():
+            ref_images = gr.Files(label="Reference image(s)", file_types=["image"], file_count="multiple")
             with gr.Column():
-                ref_images = gr.Files(label="Reference image(s)", file_types=["image"],
-                                      file_count="multiple")
-                remove_background_images_ref = gr.Dropdown(
-                    choices=[("Keep backgrounds", 0),
-                             ("Remove background behind people / objects", 1)],
-                    value=0, label="Image backgrounds",
-                    info="Same background removal as Wan2GP's own reference images. Images "
-                         "only -- not videos or pictures taken from them.")
-            with gr.Column():
-                ref_videos = gr.Files(label="Reference video(s)", file_types=["video"],
-                                      file_count="multiple")
+                ref_videos = gr.Files(label="Reference video(s)", file_types=["video"], file_count="multiple")
+                # Fork: videos as still pictures instead of clips.
                 video_as_pictures = gr.Checkbox(
                     False, label="Turn reference videos into a picture stack",
                     info="Instead of a clip, take still pictures from each video: the sharpest "
@@ -1200,11 +1219,14 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     info="1 = one picture per second (5 from a 5s span). Each picture costs about "
                          "as much as 3-4 frames of a clip, so high values approach a clip's cost.")
         stills_estimate = gr.Markdown("")
-        with gr.Accordion("Preview / trim reference videos", open=False):
+        gr.Markdown("*Add as many reference images and videos as you like -- every one is encoded "
+                   "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
+                   "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
+        with gr.Accordion("Preview / trim reference videos", open=False):   # fork
             gr.Markdown("Pick an uploaded video to watch it, and trim the span this mod is built "
                         "from. Trims are per video and remembered while the page stays open; "
-                        "untrimmed videos are used from their start as before. A trim also "
-                        "limits the soundtrack taken by *Use the clip's own audio*.")
+                        "untrimmed videos are used from their start. A trim also limits the "
+                        "soundtrack taken by *Use the clip's own audio*.")
             with gr.Row():
                 video_pick = gr.Dropdown(label="Video", choices=[], value=None, scale=2)
                 video_duration = gr.Markdown("")
@@ -1213,97 +1235,100 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 video_trim = RangeSlider(minimum=0.0, maximum=15.0, value=(0.0, 15.0), step=0.1,
                                          label="Trim (seconds)", info="Start - End")
             else:
-                video_trim = gr.Slider(0.0, 15.0, value=0.0, step=0.1,
-                                       label="Trim start (seconds)",
+                video_trim = gr.Slider(0.0, 15.0, value=0.0, step=0.1, label="Trim start (seconds)",
                                        info="gradio_rangeslider isn't installed, so only a start "
                                             "offset is available here.")
             trim_state = gr.State({})
             trim_status = gr.Markdown("")
-
-        gr.Markdown("#### Soundtrack (optional)")
         with gr.Row():
-            ref_audio = gr.Audio(label="Reference audio", type="filepath", scale=2)
+            ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath", scale=2)
             use_clip_audio = gr.Checkbox(False, label="Use the clip's own audio", scale=1,
                                          info="Take the soundtrack from the first reference video "
                                               "that has one, so a single clip of someone talking "
                                               "gives this mod both the look and the voice. Ignored "
-                                              "if you choose an audio file, or if no video source "
-                                              "has an audio track. A trimmed clip's audio starts "
-                                              "at the trim start.")
+                                              "if you choose an audio file.")
         soundtrack_seconds = gr.Slider(
             MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS, step=0.5,
-            label="Soundtrack length (seconds)",
-            info=f"How much audio this mod keeps -- an audio file, or a clip's own audio -- "
-                 f"independent of the video length. At least {MIN_AUDIO_SECONDS:g}s, H3's shortest "
-                 f"audio reference: an audio file shorter than that is refused; a clip's own audio "
-                 f"is kept with a warning. Longer gives the model more of a voice to copy, at ~80 "
-                 f"tokens per second.")
+            label="Audio length (seconds)",
+            info=f"How much audio this mod keeps, independent of the video length. At least "
+                 f"{MIN_AUDIO_SECONDS:g}s, H3's shortest audio reference: an audio file shorter "
+                 f"than that is refused; a clip's own audio is kept with a warning. ~80 tokens "
+                 f"per second.")
+        gr.Markdown("*Audio on its own makes an audio-only mod. Audio **together with** images or "
+                   "video gives that mod a soundtrack as well as a look: the two latents are stored "
+                   "side by side (their shapes can't be stacked) and the audio is injected as its own "
+                   "`<Audio N>` reference, so refer to it that way in prompts. Always extracted at "
+                   "full fidelity; 'Mode' above doesn't apply to audio. A soundtrack can also be "
+                   "added later from the Library.*")
         audio_duration_warning = gr.Markdown("")
-        with gr.Accordion("How soundtracks work", open=False):
-            gr.Markdown("*Audio on its own makes an audio-only mod. Audio **together with** images "
-                       "or video gives that mod a soundtrack as well as a look: the two latents are "
-                       "stored side by side (they can't be stacked -- their shapes differ) and the "
-                       "audio is injected as its own `<Audio N>` reference, so refer to it that way "
-                       "in prompts while `<Picture N>`/`<Video N>` stays the picture. Every "
-                       "soundtrack, and every audio-only mod, is as long as 'Soundtrack length' "
-                       "(4s by default), whatever the video length. An audio file shorter than 2s, "
-                       "H3's shortest audio reference, is refused; a clip's own audio that short is "
-                       "kept with a warning. It adds 2 tokens per audio latent "
-                       "(~80/second). Audio is always extracted at full fidelity; 'Mode' above "
-                       "doesn't apply to it. You can also add or replace a soundtrack later from the "
-                       "Library tab.*")
-
-        with gr.Accordion("Settings", open=True):
+        remove_background_images_ref = gr.Dropdown(
+            choices=[("Keep Backgrounds behind all Reference Images", 0),
+                    ("Remove Background behind People / Objects", 1)],
+            value=0,
+            label="Automatic Removal of Background behind People or Objects in Reference Images",
+            info="Same background removal Wan2GP's own Media Generator uses for reference images "
+                 "-- only applies to the image(s) above, not to reference videos.")
+        with gr.Accordion("Advanced", open=True):
             with gr.Row():
-                ref_resolution = gr.Slider(256, 2048, value=1024, step=64,
-                                           label="Ref resolution (short edge, px)",
-                                           info="Size before encoding. Smaller = faster, fewer "
-                                                "tokens, less detail.")
+                ref_resolution = gr.Slider(256, 2048, value=1024, step=64, label="Ref resolution (short edge, px)",
+                                           info="Cap, never an upscale: a source whose short edge is "
+                                                "already below this is encoded untouched. Feeds the DiT.")
+                enc_resolution = gr.Slider(256, 2048, value=core.ENC_MAX_EDGE, step=64,
+                                           label="Prompt-view resolution (long edge, px)",
+                                           info="Feeds Qwen3-VL, the channel that binds this mod to its "
+                                                "<Picture N> label in the prompt. Default matches what a "
+                                                "live reference gets. Lower = fewer vision tokens, weaker "
+                                                "recognition. Video mods are capped lower (they store "
+                                                "several frames).")
+                pool_h = gr.Slider(2, 64, value=16, step=2, label="Pool grid height (training mode)",
+                                   info="Training mode. Bigger grid = more detail, more tokens.")
+                pool_w = gr.Slider(2, 64, value=16, step=2, label="Pool grid width (training mode)",
+                                   info="Training mode. Same as height, other axis.")
+            pool_warning = gr.Markdown("")
+            encode_mode_note = gr.Markdown(
+                "ℹ️ **Mode is set to `encode`, so Pool grid and Identity refinement steps do "
+                "nothing** -- the latent is kept at full VAE resolution, there is no pooled grid "
+                "to size and nothing to refine *towards* (the full encode is already the target). "
+                "Changing them produces a byte-for-byte identical mod. Switch Mode to `training` "
+                "to use them.", visible=False)
+            with gr.Row():
                 latent_frames = gr.Slider(0.1, latent_frames_to_seconds(MAX_LATENT_FRAMES),
                                           value=latent_frames_to_seconds(16), step=0.1,
                                           label="Reference duration to use (seconds) -- video",
                                           info="Approximate real seconds kept from a video source "
                                                "(and the span pictures are taken from, for a picture "
-                                               "stack). Audio has its own 'Soundtrack length' above. "
+                                               "stack). Audio has its own 'Audio length' above. "
                                                "MiniMax H3's native 15s reference cap is a **shared** "
-                                               "budget -- **if a generation combines two video mods, "
-                                               "their durations add together, so one mod near 14.9s "
-                                               "leaves no room for a second one alongside it.**")
+                                               "budget within its own kind -- **if a generation combines "
+                                               "two video-kind (or two audio-kind) mods, their durations "
+                                               "add together, so one mod near 14.9s leaves no room for a "
+                                               "second one of the same kind alongside it.**")
+                identity = gr.Slider(0, 2000, value=500, step=50, label="Identity refinement steps (training mode)",
+                                     info="Training mode. Higher = truer to original, but it converges "
+                                          "around 200 steps and is flat after that -- 500 and 2000 give "
+                                          "the same file. 0 skips it.")
+                multiplier = gr.Slider(1, 10, value=1, step=1, label="Repeat multiplier",
+                                       info="Repeats the mod. Higher = stronger effect, bigger file.")
                 max_tokens = gr.Slider(0, 65536, value=65536, step=512, label="Max tokens (0 = no cap)",
                                        info="Max tokens allowed. 0 = unlimited.")
-            with gr.Row(visible=True) as training_row:
-                pool_h = gr.Slider(2, 64, value=16, step=2, label="Pool grid height",
-                                   info="Training mode. Bigger grid = more detail, more tokens.")
-                pool_w = gr.Slider(2, 64, value=16, step=2, label="Pool grid width",
-                                   info="Training mode. Same as height, other axis.")
-                identity = gr.Slider(0, 2000, value=500, step=50, label="Identity refinement steps",
-                                     info="Training mode. Higher = truer to original.")
-            merge = gr.Checkbox(
+            merge = gr.Checkbox(   # fork
                 False, label="Merge into one picture (training mode, several sources)",
-                visible=True,
                 info="Instead of keeping every picture, combine them into ONE small picture of "
                      "what they have in common -- one reference's tokens however many go in. "
                      "What agrees across the pictures at the same place in the frame survives; "
                      "backgrounds and unique details are averaged away. Works best on similarly "
-                     "framed shots, for a general look rather than a precise face. Identity "
-                     "refinement steps refine the merge.")
-            pool_warning = gr.Markdown("")
-            multiplier = gr.Slider(1, 10, value=1, step=1, label="Repeat multiplier",
-                                   info="Repeats the mod. Higher = stronger effect, bigger file.")
-
-        with gr.Row():
+                     "framed shots. Identity refinement steps refine the merge.")
+            description = gr.Textbox(
+                label="keyword - description", lines=2,
+                info="Text note only. Model never reads it.")
+        with gr.Accordion("Misc.", open=False):
+            concept_type = gr.Dropdown(
+                label="Concept type", choices=list(core.CONCEPT_TYPES), value="generic",
+                info="Label only. No effect on generation.")
             save = gr.Checkbox(label="Save to disk", value=True,
                                info="Off = test run, nothing saved.")
-            store_frames = gr.Checkbox(
-                label="Store encoder frames", value=True,
-                info="Saves the pictures the text encoder is shown inside the mod, so "
-                     "generations never have to decode it. Makes the file a little bigger. "
-                     "Off = decoded once per session instead; the Library can add them later.")
         extract_btn = gr.Button("Extract & Save RefMod", variant="primary")
         extract_status = gr.Textbox(label="Status", interactive=False, lines=3)
-        mode.change(fn=lambda m: (gr.update(visible=m == "training"),
-                                  gr.update(visible=m == "training")),
-                    inputs=[mode], outputs=[training_row, merge], queue=False)
 
         def update_pool_warning(concept_type, mode, pool_h, pool_w):
             w = core.identity_training_pool_warning(concept_type, mode, int(pool_h), int(pool_w))
@@ -1312,6 +1337,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         for w in (concept_type, mode, pool_h, pool_w):
             w.change(fn=update_pool_warning, inputs=[concept_type, mode, pool_h, pool_w],
                     outputs=[pool_warning], queue=False)
+
+        def update_mode_controls(mode_value):
+            # These three are read only on the "training" branch of the
+            # extractor (see patches._run_extraction: encode keeps the raw VAE
+            # latent and records optimize_steps=0). Showing them as live
+            # controls in encode mode invites setting them and getting an
+            # identical file back, so hide them and say why.
+            training = mode_value == "training"
+            return (gr.update(visible=training), gr.update(visible=training),
+                    gr.update(visible=training), gr.update(visible=not training))
+
+        mode.change(fn=update_mode_controls, inputs=[mode],
+                    outputs=[pool_h, pool_w, identity, encode_mode_note], queue=False)
+        mode.change(fn=lambda m: gr.update(visible=m == "training"), inputs=[mode],   # fork
+                    outputs=[merge], queue=False)
 
         def update_audio_duration_warning(audio_path, current_seconds):
             real_seconds = _audio_file_seconds(audio_path)
@@ -1322,7 +1362,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                         f"{MIN_AUDIO_SECONDS:g}s of audio to use it as a reference, so extraction "
                         f"will be refused -- use a longer clip.")
             if real_seconds > float(current_seconds) + 0.15:
-                return (f"⚠️ This audio file is ~{real_seconds:.1f}s long, but 'Soundtrack length' "
+                return (f"⚠️ This audio file is ~{real_seconds:.1f}s long, but 'Audio length' "
                         f"is set to {float(current_seconds):.1f}s -- only the first "
                         f"{float(current_seconds):.1f}s will be kept. Raise it (up to 15s) to use "
                         f"more of this recording.")
@@ -1424,9 +1464,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             return trims, _trim_summary(trims, list(lookup))
 
         def do_extract(model_type, name, mode, concept_type, ref_images, ref_videos, ref_audio,
-                       remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                       identity, multiplier, max_tokens, use_clip_audio, description, save,
-                       store_frames=True, trims=None, as_pictures=False, per_second=1.0,
+                       remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
+                       latent_frames, identity, multiplier, max_tokens, description, save,
+                       use_clip_audio=False, trims=None, as_pictures=False, per_second=1.0,
                        merge_refs=False, audio_seconds=DEFAULT_AUDIO_SECONDS):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
@@ -1434,9 +1474,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             video_paths = [f.name if hasattr(f, "name") else f for f in (ref_videos or [])]
             if not image_paths and not video_paths and not ref_audio:
                 return "Add at least one reference image, video, or audio file."
-            # Refuse an audio file too short to use before running anything
-            # (a clip's own audio is checked by the task, also before any
-            # slow encoding).
+            # Fork: audio with images/video becomes the mod's soundtrack. An
+            # audio file too short to use is refused before anything runs.
             audio_len = _audio_file_seconds(ref_audio)
             if audio_len is not None and audio_len < MIN_AUDIO_SECONDS - 0.05:
                 return (f"Extraction refused: the reference audio is only ~{audio_len:.1f}s long. "
@@ -1447,15 +1486,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "image_paths": image_paths, "video_paths": video_paths,
                 "audio_path": ref_audio,
                 "remove_background_images_ref": int(remove_background_images_ref or 0),
-                "ref_resolution": int(ref_resolution), "pool_h": int(pool_h), "pool_w": int(pool_w),
+                "ref_resolution": int(ref_resolution), "enc_resolution": int(enc_resolution),
+                "pool_h": int(pool_h), "pool_w": int(pool_w),
                 "latent_frames": seconds_to_latent_frames(latent_frames), "identity": int(identity),
                 "multiplier": int(multiplier), "max_tokens": int(max_tokens),
+                "description": description or "", "save": bool(save),
+                # fork
                 "use_clip_audio": bool(use_clip_audio),
                 "video_trims": {k: list(v) for k, v in (trims or {}).items()},
-                "description": description or "", "save": bool(save),
-                "store_encoder_frames": bool(store_frames),
-                "video_as_pictures": bool(as_pictures),
-                "pictures_per_second": float(per_second or 1.0),
+                "video_as_pictures": bool(as_pictures), "pictures_per_second": float(per_second or 1.0),
                 "merge": bool(merge_refs),
                 "audio_seconds": max(MIN_AUDIO_SECONDS, float(audio_seconds or DEFAULT_AUDIO_SECONDS)),
             }
@@ -1469,72 +1508,64 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 def on_progress(self, update):
                     pass
 
-            spec_json = json.dumps(spec)
-            # Wan2GP strips unknown custom settings on the way to the queue in
-            # some setups, and an extract task that loses its payload renders a
-            # video instead. patched_generate picks this up only if the payload
-            # is missing, consumes it once, and expires it.
-            set_pending_extract(spec_json)
             try:
                 self._submit(api_session, model_type,
                             {"video_length": 107,
-                             "custom_settings": {SETTING_COMBINED:
-                                                 pack_refmod_setting(extract_json=spec_json)}},
+                             # Rides inside the single declared slot: Wan2GP keeps only the
+                             # first 5 custom settings per model and MiniMax H3 now declares
+                             # 4 of its own, so a second slot of ours would be dropped.
+                             "custom_settings": {SETTING_GENERATE: json.dumps({EXTRACT_WRAPPER_KEY: spec})}},
                             ExtractCallbacks())
             except Exception as e:
-                set_pending_extract(None)
                 return f"Extraction task failed to run: {e!r}"
-            finally:
-                set_pending_extract(None)
             lines = log["lines"]
-            refused = [l for l in lines if "extraction refused" in l.lower()]
+            refused = [l for l in lines if "extraction refused" in l.lower()]   # fork
             if refused:
                 return refused[-1]
-            # Warnings stay visible however many lines follow them.
-            warnings = [l for l in lines if "⚠️" in l]
-            tail = [l for l in lines[-6:] if l not in warnings]
+            warnings = [l for l in lines if "⚠️" in l]   # fork: kept visible however many follow
+            tail = "\n".join(warnings + [l for l in lines[-6:] if l not in warnings])
             ok = ("Done -- check the Library tab (Refresh) to see the saved mod." if any(
-                    "saved" in l.lower() for l in lines) else
+                    "saved" in l.lower() for l in log["lines"]) else
                   "Task finished, but no confirmation line was captured -- check the terminal log.")
-            return "\n".join(warnings + tail + [ok])
-
-        estimate_inputs = [video_as_pictures, pictures_per_second, ref_videos, ref_images,
-                           trim_state, latent_frames, mode, ref_resolution, pool_h, pool_w,
-                           max_tokens, merge]
-        for w in (video_as_pictures, pictures_per_second, ref_videos, ref_images, trim_state,
-                  latent_frames, mode, ref_resolution, pool_h, pool_w, max_tokens, merge):
-            w.change(fn=update_stills_estimate, inputs=estimate_inputs, outputs=[stills_estimate],
-                     queue=False)
-        video_as_pictures.change(fn=lambda on: gr.update(visible=bool(on)),
-                                 inputs=[video_as_pictures], outputs=[pictures_per_second],
-                                 queue=False)
-
-        ref_videos.change(fn=on_videos_uploaded, inputs=[ref_videos, trim_state],
-                          outputs=[video_pick, video_preview, video_duration, trim_state,
-                                   trim_status], queue=False)
-        video_pick.change(fn=on_video_picked, inputs=[video_pick, ref_videos, trim_state],
-                          outputs=[video_preview, video_duration, video_trim], queue=False)
-        video_trim.change(fn=on_trim_changed, inputs=[video_trim, video_pick, ref_videos, trim_state],
-                          outputs=[trim_state, trim_status], queue=False)
+            return (tail + ("\n" if tail else "") + ok) if tail else ok
 
         extract_btn.click(
             fn=do_extract,
             inputs=[model_dd, name, mode, concept_type, ref_images, ref_videos, ref_audio,
-                   remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                   identity, multiplier, max_tokens, use_clip_audio, description, save,
-                   store_frames, trim_state, video_as_pictures, pictures_per_second, merge,
+                   remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
+                   latent_frames, identity, multiplier, max_tokens, description, save,
+                   use_clip_audio, trim_state, video_as_pictures, pictures_per_second, merge,
                    soundtrack_seconds],
             outputs=[extract_status],
             queue=False,
         )
 
+        # Fork: picture-stack estimate, and the video preview / trim.
+        estimate_inputs = [video_as_pictures, pictures_per_second, ref_videos, ref_images,
+                           trim_state, latent_frames, mode, ref_resolution, pool_h, pool_w,
+                           max_tokens, merge]
+        gr.on(triggers=[w.change for w in estimate_inputs], fn=update_stills_estimate,
+              inputs=estimate_inputs, outputs=[stills_estimate], queue=False)
+        video_as_pictures.change(fn=lambda on: gr.update(visible=bool(on)),
+                                 inputs=[video_as_pictures], outputs=[pictures_per_second], queue=False)
+        ref_videos.change(fn=on_videos_uploaded, inputs=[ref_videos, trim_state],
+                          outputs=[video_pick, video_preview, video_duration, trim_state, trim_status],
+                          queue=False)
+        video_pick.change(fn=on_video_picked, inputs=[video_pick, ref_videos, trim_state],
+                          outputs=[video_preview, video_duration, video_trim], queue=False)
+        video_trim.change(fn=on_trim_changed, inputs=[video_trim, video_pick, ref_videos, trim_state],
+                          outputs=[trim_state, trim_status], queue=False)
+
     # ── Library ─────────────────────────────────────────────────────────
 
     def _build_library_section(self, api_session=None, model_dd=None):
         gr.Markdown("### Saved RefMods\n"
-                    "Mods live in `loras/refmods_plugin/minimax_h3/` (subfolders are supported, "
-                    "and mods in them are named by their path, e.g. `characters/tanya`). Mods "
-                    "from the ComfyUI RefMod packs can be dropped in directly.")
+                    "Mods live in `loras/refmods_plugin/minimax_h3/`. "
+                    "Mods produced by the ComfyUI-MiniMaxH3Mod pack use the same file format and "
+                    "can be dropped into that folder directly. **Subfolders are supported** -- "
+                    "make any folder structure you like inside that directory to sort your mods, "
+                    "and use the Folder picker below (here and in the mod pickers) to browse it. "
+                    "Mods in subfolders are named by their relative path (`characters/tanya`).")
         with gr.Row():
             library_folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
                                             label="Folder", scale=3,
@@ -1542,31 +1573,142 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                  f"seeing every mod again.")
             refresh_btn = gr.Button("Refresh", scale=1)
         table = gr.Dataframe(
-            headers=["name", "kind", "mode", "tokens", "size (MB)", "encoder frames", "concept type",
-                     "description"],
+            headers=["name", "kind", "mode", "DiT tokens", "prompt view", "size (MB)",
+                     "concept type", "description"],
             value=_library_rows(), interactive=False, wrap=True)
-        with gr.Accordion("Prompt hint", open=False):
-            gr.Markdown("Builds a prompt line from the *keyword - description* of one or more "
-                        "mods (`concept_type: description; ...`), since the model never reads "
-                        "those descriptions by itself.")
-            with gr.Row():
-                hint_names = gr.Textbox(label="Mod name(s), comma-separated, in the order you want them combined",
-                                        scale=2)
-                hint_btn = gr.Button("Build Prompt Hint")
-            hint_output = gr.Textbox(label="Prompt hint -- copy this into your prompt", interactive=False, lines=2)
-        with gr.Accordion("Rename or edit a description", open=False):
-            gr.Markdown("Pick a mod, click Load, edit, then Save. A plain name keeps the mod in "
-                        "its folder; a path (`characters/tanya`) moves it there, and a leading "
-                        "`/` moves it back to the main folder. Only the name and description "
-                        "change.")
-            with gr.Row():
-                edit_name_dd = gr.Dropdown(label="Mod to edit", choices=_library_mod_names(), scale=2)
-                edit_load_btn = gr.Button("Load")
-            with gr.Row():
-                edit_name_field = gr.Textbox(label="Name (optionally with a folder path)")
-                edit_description_field = gr.Textbox(label="Description", lines=2)
-            edit_save_btn = gr.Button("Save changes", variant="primary")
-            edit_status = gr.Textbox(label="", interactive=False, show_label=False)
+        with gr.Row():
+            delete_name = gr.Textbox(label="Mod name to delete (include its folder, e.g. characters/tanya)",
+                                     scale=2)
+            delete_btn = gr.Button("Delete", variant="stop")
+        delete_status = gr.Textbox(label="", interactive=False, show_label=False)
+        gr.Markdown(
+            "Mods extracted purely from several still images (no video source) used to be "
+            "wrongly saved as `video` kind if more than one image was stacked together -- the "
+            "button below rescans every saved mod's own extraction record and corrects it in "
+            "place (the latent data itself is untouched, only the `kind` label). Safe to run "
+            "anytime, including on mods that are already correct. Covers every subfolder too.")
+        with gr.Row():
+            fix_btn = gr.Button("Fix classification (image vs video)")
+            fix_status = gr.Markdown("")
+
+        gr.Markdown(
+            "**Rename, move, or edit a mod's description.** Pick a mod, click Load, edit either "
+            "field, then Save -- the latent data itself is never touched, only the "
+            "name/description. Typing a plain name keeps the mod in its current folder; typing a "
+            "path (`characters/tanya`) moves it there, creating the folder if needed, and a "
+            "leading `/` moves it back to the main folder. "
+            "Both fields are plain editable text boxes, so you can also just click into either one, "
+            "select the text (e.g. double/triple-click, or Ctrl+A), and copy it (Ctrl+C) to reuse "
+            "elsewhere -- no separate copy button needed.")
+        with gr.Row():
+            edit_name_dd = gr.Dropdown(label="Mod to edit", choices=_library_mod_names(), scale=2)
+            edit_load_btn = gr.Button("Load")
+        with gr.Row():
+            edit_name_field = gr.Textbox(label="Name (optionally with a folder path)")
+            edit_description_field = gr.Textbox(label="Description", lines=2)
+        edit_save_btn = gr.Button("Save changes", variant="primary")
+        edit_status = gr.Textbox(label="", interactive=False, show_label=False)
+
+        # ── wiring (all components above already exist) ──
+        def _names_keeping(folder, current):
+            """Mod names for the chosen folder, with the currently-selected
+            one force-included even if it lives elsewhere -- otherwise
+            switching folders would leave a stale value Gradio rejects."""
+            names = _library_mod_names(folder)
+            if current and current not in names:
+                names = names + [current]
+            return names
+
+        def do_refresh(folder, current):
+            return (_library_rows(folder),
+                    gr.update(choices=_folder_choices(), value=folder),
+                    gr.update(choices=_names_keeping(folder, current), value=current or None))
+
+        refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
+                          outputs=[table, library_folder_dd, edit_name_dd], queue=False)
+        library_folder_dd.change(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
+                                 outputs=[table, library_folder_dd, edit_name_dd], queue=False)
+
+        def do_delete(name, folder):
+            if not name:
+                return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), "Enter a mod name first."
+            ok = storage.delete_refmod(name)
+            return (_library_rows(folder), gr.update(choices=_library_mod_names(folder)),
+                   (f"Deleted '{name}'." if ok else f"No mod named '{name}' found."))
+
+        delete_btn.click(fn=do_delete, inputs=[delete_name, library_folder_dd],
+                         outputs=[table, edit_name_dd, delete_status], queue=False)
+
+        def do_fix(folder):
+            fixed, checked = storage.reclassify_all_mods()
+            msg = (f"Checked {checked} mod(s), fixed {fixed}." if fixed else
+                  f"Checked {checked} mod(s), all already correctly classified.")
+            return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), msg
+
+        fix_btn.click(fn=do_fix, inputs=[library_folder_dd],
+                      outputs=[table, edit_name_dd, fix_status], queue=False)
+
+        def do_load_for_edit(name):
+            if not name:
+                return "", "", "Pick a mod first."
+            meta = storage.read_refmod_meta(storage.mod_path(name))
+            if meta is None:
+                return "", "", f"No mod named '{name}' found."
+            # Show the full folder-relative path, not the metadata's bare
+            # "name" field, so editing it can move the mod (and so a plain
+            # save round-trips without silently relocating anything).
+            return name, meta.get("description", "") or "", ""
+
+        edit_load_btn.click(fn=do_load_for_edit, inputs=[edit_name_dd],
+                            outputs=[edit_name_field, edit_description_field, edit_status], queue=False)
+
+        def do_save_edit(old_name, new_name, new_description, folder):
+            if not old_name:
+                return _library_rows(folder), gr.update(), gr.update(), "Pick a mod first (use Load)."
+            try:
+                final_name = storage.rename_and_update_mod(old_name, new_name=new_name,
+                                                            new_description=new_description)
+            except Exception as e:
+                return _library_rows(folder), gr.update(), gr.update(), f"Could not save: {e!r}"
+            msg = f"Saved as '{final_name}'." if final_name != old_name else "Saved."
+            names = _library_mod_names(folder)
+            return (_library_rows(folder), gr.update(choices=_folder_choices()),
+                    gr.update(choices=names, value=final_name if final_name in names else None), msg)
+
+        edit_save_btn.click(fn=do_save_edit,
+                            inputs=[edit_name_dd, edit_name_field, edit_description_field, library_folder_dd],
+                            outputs=[table, library_folder_dd, edit_name_dd, edit_status], queue=False)
+
+        gr.Markdown(
+            "**Build prompt hint.** The `keyword - description` field you set at extraction is "
+            "never read by the model automatically -- there's no image-embedding channel on H3's "
+            "Ref2VA path to hang an automatic clue off of, so a mod file's description only reaches "
+            "the model if you type it into your prompt yourself. This builds that string for you "
+            "from one or more saved mods (`concept_type: description; concept_type: description...`) "
+            "so you can copy it into your prompt instead of retyping it by hand -- mirrors the "
+            "ComfyUI pack's own \"prompt hint\" loader output.")
+        with gr.Row():
+            hint_names = gr.Textbox(label="Mod name(s), comma-separated, in the order you want them combined",
+                                    scale=2)
+            hint_btn = gr.Button("Build Prompt Hint")
+        hint_output = gr.Textbox(label="Prompt hint -- copy this into your prompt", interactive=False, lines=2)
+
+        def do_build_hint(names_str):
+            names = [n.strip() for n in (names_str or "").split(",") if n.strip()]
+            if not names:
+                return "Enter at least one mod name."
+            metas = []
+            for n in names:
+                meta = storage.read_refmod_meta(storage.mod_path(n))
+                if meta is None:
+                    return f"No mod named '{n}' found."
+                metas.append(meta)
+            hint = core.build_prompt_hint(metas)
+            return hint or "(none of the selected mod(s) have a description set -- nothing to hint)"
+
+        hint_btn.click(fn=do_build_hint, inputs=[hint_names], outputs=[hint_output], queue=False)
+
+        # ── Fork: folders, soundtracks and encoder frames ──
         with gr.Accordion("Folders and moving", open=False):
             gr.Markdown("Folders are subfolders of the mods directory. A move rewrites the mod "
                         "in place, keeping everything in it, and never overwrites a mod of the "
@@ -1593,317 +1735,146 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                         "skipped. Runs a short task on the model selected at the top of this tab.")
             with gr.Row():
                 audio_target_dd = gr.Dropdown(label="Mods to update", choices=_library_mod_names(),
-                                              value=[], multiselect=True, scale=2,
-                                              info="Pick one or more image/video mods.")
+                                              value=[], multiselect=True, scale=2)
                 attach_btn = gr.Button("Apply soundtrack", variant="primary")
             with gr.Row():
                 audio_file = gr.File(label="Audio or video file (a video's soundtrack is used)",
                                      file_types=["audio", "video"], type="filepath", scale=2)
                 audio_seconds = gr.Slider(MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS,
                                           step=0.5, label="Seconds to use", scale=1,
-                                          info=f"At least {MIN_AUDIO_SECONDS:g}s; a clip shorter "
-                                               f"than that is refused.")
+                                          info=f"At least {MIN_AUDIO_SECONDS:g}s; shorter is refused.")
                 audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")
             audio_status = gr.Textbox(label="", interactive=False, show_label=False)
         with gr.Accordion("Encoder frames", open=False):
-            gr.Markdown("Stores the pictures the text encoder is shown inside mods that don't "
-                        "have them yet (older mods, or ones from other tools), so generations "
-                        "never decode them. Nothing else in the mod changes. The table's "
-                        "*encoder frames* column shows which have them. Runs a short task on the "
-                        "model selected at the top of this tab.")
+            gr.Markdown("Mods saved without prompt-view frames (older mods, or ones from other "
+                        "tools) are decoded once per session to get their `<Picture N>` / "
+                        "`<Video N>` label. This stores those frames in the mod instead -- the "
+                        "*prompt view* column shows which have them. Nothing else in the mod "
+                        "changes. Runs a short task on the model selected at the top of this tab.")
             with gr.Row():
                 frames_target_dd = gr.Dropdown(label="Mods to update", choices=_library_mod_names(),
                                                value=[], multiselect=True, scale=2)
                 frames_btn = gr.Button("Store for selected")
                 frames_all_btn = gr.Button("Store for every mod missing them", variant="primary")
             frames_status = gr.Textbox(label="", interactive=False, show_label=False)
-        with gr.Accordion("Maintenance", open=False):
-            gr.Markdown("Older versions saved mods made only from several still images as "
-                        "`video`. This rescans every mod (all folders) and corrects the label in "
-                        "place; the latent is untouched. Safe to run anytime.")
-            with gr.Row():
-                fix_btn = gr.Button("Fix classification (image vs video)")
-                fix_status = gr.Markdown("")
-        with gr.Accordion("Delete mods", open=False):
-            with gr.Row():
-                delete_dd = gr.Dropdown(label="Mods to delete", choices=_library_mod_names(),
-                                        value=[], multiselect=True, scale=2,
-                                        info="Pick one or more from the list above. Follows the "
-                                             "Folder picker; deletion is permanent.")
-                delete_btn = gr.Button("Delete selected", variant="stop")
-            delete_confirm = gr.Checkbox(False, label="Yes, delete permanently",
-                                         info="Required, since deletion can't be undone. Resets "
-                                              "after each delete.")
-            delete_status = gr.Textbox(label="", interactive=False, show_label=False)
 
-        # ── wiring (all components above already exist) ──
-        def _names_keeping(folder, current):
-            """Mod names for the chosen folder, with the currently-selected
-            one force-included even if it lives elsewhere -- otherwise
-            switching folders would leave a stale value Gradio rejects."""
-            names = _library_mod_names(folder)
-            if current and current not in names:
-                names = names + [current]
-            return names
+        def run_job(spec, model_type):
+            """Run a Library job as a short task on the chosen model (it needs
+            the model's VAEs). Returns its last status line."""
+            if api_session is None or not model_type:
+                return ("Pick a model at the top of this tab first -- this needs the model's "
+                        "VAEs, so it runs as a task.")
+            log = {"lines": []}
+
+            class JobCallbacks:
+                def on_status(self, message):
+                    if message:
+                        log["lines"].append(str(message))
+
+                def on_progress(self, update):
+                    pass
+
+            try:
+                self._submit(api_session, model_type,
+                             {"video_length": 107,
+                              "custom_settings": {SETTING_GENERATE: json.dumps({EXTRACT_WRAPPER_KEY: spec})}},
+                             JobCallbacks())
+            except Exception as e:
+                return f"The task failed to run: {e!r}"
+            done = [l for l in log["lines"] if "finished" in l.lower() or "nothing to do" in l.lower()]
+            return done[-1] if done else (log["lines"][-1] if log["lines"] else "Finished -- see the console.")
+
+        def picked(names):
+            return [n for n in (names if isinstance(names, list) else [names]) if n]
+
+        fork_lists = [move_dd, move_target, delete_folder_dd, audio_target_dd, frames_target_dd]
+
+        def fork_list_updates(folder):
+            names, folders = _library_mod_names(folder), storage.list_mod_folders()
+            return [gr.update(choices=names, value=[]),
+                    _safe_choice_update([ROOT_FOLDER_CHOICE] + folders, ROOT_FOLDER_CHOICE),
+                    gr.update(choices=folders, value=None),
+                    gr.update(choices=names, value=[]), gr.update(choices=names, value=[])]
+
+        def after_change(folder, message):
+            return [_library_rows(folder), _safe_choice_update(_folder_choices(), folder),
+                    *fork_list_updates(folder), message]
+
+        change_outputs = [table, library_folder_dd] + fork_lists
+
+        def do_create_folder(new_name, folder):
+            try:
+                return after_change(folder, f"Created '{storage.create_mod_folder(new_name)}'.")
+            except Exception as e:
+                return after_change(folder, f"Could not create the folder: {e}")
+
+        def do_move_mods(names, destination, folder):
+            names = picked(names)
+            if not names:
+                return after_change(folder, "Pick at least one mod to move.")
+            target = "" if destination in (None, ROOT_FOLDER_CHOICE) else destination
+            moved, skipped = storage.move_mods(names, target)
+            parts = [f"Moved {len(moved)} mod(s) to " + ("the main folder." if not target else f"'{target}'.")] \
+                if moved else []
+            if skipped:
+                parts.append("Skipped: " + "; ".join(f"'{n}' ({why})" for n, why in skipped))
+            return after_change(folder, " ".join(parts) or "Nothing to do.")
+
+        def do_delete_folder(name, folder):
+            if not name:
+                return after_change(folder, "Pick a folder to delete.")
+            try:
+                return after_change(folder, f"Deleted '{storage.delete_mod_folder(name)}'.")
+            except Exception as e:
+                return after_change(folder, f"Could not delete the folder: {e}")
+
+        create_folder_btn.click(fn=do_create_folder, inputs=[new_folder_name, library_folder_dd],
+                                outputs=change_outputs + [folder_status], queue=False)
+        move_btn.click(fn=do_move_mods, inputs=[move_dd, move_target, library_folder_dd],
+                       outputs=change_outputs + [folder_status], queue=False)
+        delete_folder_btn.click(fn=do_delete_folder, inputs=[delete_folder_dd, library_folder_dd],
+                                outputs=change_outputs + [folder_status], queue=False)
 
         def do_attach_audio(names, audio_path, seconds, remove, folder, model_type=None):
-            names = [n for n in (names if isinstance(names, list) else [names]) if n]
+            names = picked(names)
             if not names:
                 return gr.update(), "Pick at least one mod first."
             if not audio_path and not remove:
                 return gr.update(), "Choose an audio file, or tick 'Remove existing soundtrack'."
-            if api_session is None or not model_type:
-                return gr.update(), ("Pick a model at the top of this tab first -- encoding audio "
-                                     "needs the model's audio VAE, so this runs as a task.")
-            spec = {"op": "attach_audio", "names": names, "audio_path": audio_path,
-                    "seconds": float(seconds), "remove": bool(remove)}
-            log = {"lines": []}
-
-            class AttachCallbacks:
-                def on_status(self, message):
-                    log["lines"].append(str(message))
-                def on_error(self, message):
-                    log["lines"].append(f"error: {message}")
-
-            spec_json = json.dumps(spec)
-            set_pending_extract(spec_json)   # same payload-loss guard extraction uses
-            try:
-                self._submit(api_session, model_type,
-                             {"video_length": 107,
-                              "custom_settings": {SETTING_COMBINED:
-                                                  pack_refmod_setting(extract_json=spec_json)}},
-                             AttachCallbacks())
-            except Exception as e:
-                return gr.update(), f"Soundtrack update failed to run: {e!r}"
-            finally:
-                set_pending_extract(None)
-            tail = [line for line in log["lines"] if "Attach audio finished" in line]
-            return (gr.update(choices=_library_mod_names(folder), value=[]),
-                    tail[-1] if tail else (log["lines"][-1] if log["lines"]
-                                           else "Finished -- see the console for details."))
+            message = run_job({"op": "attach_audio", "names": names, "audio_path": audio_path,
+                               "seconds": float(seconds), "remove": bool(remove)}, model_type)
+            return gr.update(choices=_library_mod_names(folder), value=[]), message
 
         def do_store_frames(names, all_missing, folder, model_type=None):
-            names = [n for n in (names if isinstance(names, list) else [names]) if n]
+            names = picked(names)
             if not all_missing and not names:
                 return _library_rows(folder), gr.update(), "Pick at least one mod first."
-            if api_session is None or not model_type:
-                return (_library_rows(folder), gr.update(),
-                        "Pick a model at the top of this tab first -- decoding needs the "
-                        "model's video VAE, so this runs as a task.")
             if all_missing and not storage.list_refmods_missing_frames():
                 return _library_rows(folder), gr.update(), "Every mod already has encoder frames."
-            spec = {"op": "store_frames", "names": names, "all_missing": bool(all_missing)}
-            log = {"lines": []}
+            message = run_job({"op": "store_frames", "names": names, "all_missing": bool(all_missing)},
+                              model_type)
+            return _library_rows(folder), gr.update(choices=_library_mod_names(folder), value=[]), message
 
-            class FramesCallbacks:
-                def on_status(self, message):
-                    log["lines"].append(str(message))
-                def on_error(self, message):
-                    log["lines"].append(f"error: {message}")
-                def on_progress(self, update):
-                    pass
-
-            spec_json = json.dumps(spec)
-            set_pending_extract(spec_json)
-            try:
-                self._submit(api_session, model_type,
-                             {"video_length": 107,
-                              "custom_settings": {SETTING_COMBINED:
-                                                  pack_refmod_setting(extract_json=spec_json)}},
-                             FramesCallbacks())
-            except Exception as e:
-                return _library_rows(folder), gr.update(), f"Storing encoder frames failed to run: {e!r}"
-            finally:
-                set_pending_extract(None)
-            tail = [line for line in log["lines"] if "Encoder frames finished" in line
-                    or "nothing to do" in line]
-            return (_library_rows(folder), gr.update(choices=_library_mod_names(folder), value=[]),
-                    tail[-1] if tail else (log["lines"][-1] if log["lines"]
-                                           else "Finished -- see the console for details."))
-
-        frames_inputs = [frames_target_dd, gr.State(False), library_folder_dd] + \
-            ([model_dd] if model_dd is not None else [])
-        frames_all_inputs = [frames_target_dd, gr.State(True), library_folder_dd] + \
-            ([model_dd] if model_dd is not None else [])
-        frames_btn.click(fn=do_store_frames, inputs=frames_inputs,
-                         outputs=[table, frames_target_dd, frames_status], queue=False)
-        frames_all_btn.click(fn=do_store_frames, inputs=frames_all_inputs,
-                             outputs=[table, frames_target_dd, frames_status], queue=False)
-
+        model_input = [model_dd] if model_dd is not None else []
         attach_btn.click(fn=do_attach_audio,
-                         inputs=([audio_target_dd, audio_file, audio_seconds, audio_remove,
-                                  library_folder_dd, model_dd] if model_dd is not None else
-                                 [audio_target_dd, audio_file, audio_seconds, audio_remove,
-                                  library_folder_dd]),
+                         inputs=[audio_target_dd, audio_file, audio_seconds, audio_remove,
+                                 library_folder_dd] + model_input,
                          outputs=[audio_target_dd, audio_status], queue=False)
-
-        def _folder_refresh(message, folder):
-            """Everything that depends on the folder list or the mod list."""
-            folders = storage.list_mod_folders()
-            names = _library_mod_names(folder)
-            return (_library_rows(folder),
-                    _safe_choice_update(_folder_choices(), folder),
-                    _safe_choice_update([ROOT_FOLDER_CHOICE] + folders, ROOT_FOLDER_CHOICE),
-                    gr.update(choices=folders, value=None),
-                    gr.update(choices=names, value=[]),
-                    gr.update(choices=names, value=[]),
-                    gr.update(choices=names, value=[]),
-                    _safe_choice_update(_names_keeping(folder, None)),
-                    gr.update(choices=names, value=[]),
-                    message)
-
-        def do_create_folder(name, folder):
-            try:
-                created = storage.create_mod_folder(name)
-            except Exception as e:
-                return _folder_refresh(f"Could not create the folder: {e}", folder)
-            return _folder_refresh(f"Created '{created}'.", folder)
-
-        def do_move_mods(names, destination, folder):
-            names = [n for n in (names if isinstance(names, list) else [names]) if n]
-            if not names:
-                return _folder_refresh("Pick at least one mod to move.", folder)
-            target = "" if destination in (None, ROOT_FOLDER_CHOICE) else destination
-            moved, skipped = storage.move_mods(names, target)
-            where = "the top level" if not target else f"'{target}'"
-            parts = []
-            if moved:
-                parts.append(f"Moved {len(moved)} mod(s) to {where}.")
-            if skipped:
-                parts.append("Skipped: " + "; ".join(f"'{n}' ({why})" for n, why in skipped))
-            return _folder_refresh(" ".join(parts) or "Nothing to do.", folder)
-
-        def do_delete_folder(name, folder):
-            if not name:
-                return _folder_refresh("Pick a folder to delete.", folder)
-            try:
-                removed = storage.delete_mod_folder(name)
-            except Exception as e:
-                return _folder_refresh(f"Could not delete the folder: {e}", folder)
-            return _folder_refresh(f"Deleted '{removed}'.", folder)
-
-        def do_refresh(folder, current):
-            # Every picker that lists mods or folders. (The move picker and the
-            # two folder pickers used to be missing here, so a newly extracted
-            # mod or new folder didn't show up in them until a restart.)
-            names = _library_mod_names(folder)
-            folders = storage.list_mod_folders()
-            return (_library_rows(folder),
-                    _safe_choice_update(_folder_choices(), folder),
-                    _safe_choice_update(_names_keeping(folder, current), current),
-                    gr.update(choices=names, value=[]),
-                    gr.update(choices=names, value=[]),
-                    gr.update(choices=names, value=[]),
-                    gr.update(choices=names, value=[]),
-                    _safe_choice_update([ROOT_FOLDER_CHOICE] + folders, ROOT_FOLDER_CHOICE),
-                    gr.update(choices=folders, value=None))
-
-        create_folder_btn.click(fn=do_create_folder, inputs=[new_folder_name, library_folder_dd],
-                                outputs=[table, library_folder_dd, move_target, delete_folder_dd, delete_dd, move_dd, audio_target_dd, edit_name_dd, frames_target_dd, folder_status], queue=False)
-        move_btn.click(fn=do_move_mods, inputs=[move_dd, move_target, library_folder_dd],
-                       outputs=[table, library_folder_dd, move_target, delete_folder_dd, delete_dd, move_dd, audio_target_dd, edit_name_dd, frames_target_dd, folder_status], queue=False)
-        delete_folder_btn.click(fn=do_delete_folder, inputs=[delete_folder_dd, library_folder_dd],
-                                outputs=[table, library_folder_dd, move_target, delete_folder_dd, delete_dd, move_dd, audio_target_dd, edit_name_dd, frames_target_dd, folder_status], queue=False)
-
-        refresh_outputs = [table, library_folder_dd, edit_name_dd, delete_dd, audio_target_dd,
-                           frames_target_dd, move_dd, move_target, delete_folder_dd]
-        refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
-                          outputs=refresh_outputs, queue=False)
-        library_folder_dd.change(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
-                                 outputs=refresh_outputs, queue=False)
-
-        def do_delete(names, folder, confirmed):
-            names = [n for n in (names if isinstance(names, list) else [names]) if n]
-            if not names:
-                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
-                        "Pick at least one mod to delete.")
-            if not confirmed:
-                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
-                        f"Tick 'Yes, delete permanently' to delete {len(names)} mod(s).")
-            deleted = [n for n in names if storage.delete_refmod(n)]
-            missing = [n for n in names if n not in deleted]
-            remaining = _library_mod_names(folder)
-            parts = []
-            if deleted:
-                parts.append(f"Deleted {len(deleted)}: " + ", ".join(f"'{n}'" for n in deleted) + ".")
-            if missing:
-                parts.append("Not found: " + ", ".join(f"'{n}'" for n in missing) + ".")
-            return (_library_rows(folder),
-                    gr.update(choices=remaining, value=[]),          # delete picker
-                    _safe_choice_update(remaining),                  # edit picker
-                    gr.update(value=False),                          # re-arm the confirmation
-                    " ".join(parts))
-
-        delete_btn.click(fn=do_delete, inputs=[delete_dd, library_folder_dd, delete_confirm],
-                         outputs=[table, delete_dd, edit_name_dd, delete_confirm, delete_status],
-                         queue=False)
-
-        def do_fix(folder):
-            fixed, checked = storage.reclassify_all_mods()
-            msg = (f"Checked {checked} mod(s), fixed {fixed}." if fixed else
-                  f"Checked {checked} mod(s), all already correctly classified.")
-            names = _library_mod_names(folder)
-            return (_library_rows(folder), _safe_choice_update(names),
-                    gr.update(choices=names, value=[]), msg)
-
-        fix_btn.click(fn=do_fix, inputs=[library_folder_dd],
-                      outputs=[table, edit_name_dd, delete_dd, fix_status], queue=False)
-
-        def do_load_for_edit(name):
-            if not name:
-                return "", "", "Pick a mod first."
-            meta = storage.read_refmod_meta(storage.mod_path(name))
-            if meta is None:
-                return "", "", f"No mod named '{name}' found."
-            # Show the full folder-relative path, not the metadata's bare
-            # "name" field, so editing it can move the mod (and so a plain
-            # save round-trips without silently relocating anything).
-            return name, meta.get("description", "") or "", ""
-
-        edit_load_btn.click(fn=do_load_for_edit, inputs=[edit_name_dd],
-                            outputs=[edit_name_field, edit_description_field, edit_status], queue=False)
-
-        def do_save_edit(old_name, new_name, new_description, folder):
-            if not old_name:
-                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
-                        "Pick a mod first (use Load).")
-            try:
-                final_name = storage.rename_and_update_mod(old_name, new_name=new_name,
-                                                            new_description=new_description)
-            except Exception as e:
-                return (_library_rows(folder), gr.update(), gr.update(), gr.update(),
-                        f"Could not save: {e!r}")
-            msg = f"Saved as '{final_name}'." if final_name != old_name else "Saved."
-            names = _library_mod_names(folder)
-            return (_library_rows(folder), _safe_choice_update(_folder_choices(), folder),
-                    gr.update(choices=names, value=final_name if final_name in names else None),
-                    gr.update(choices=names, value=[]), msg)
-
-        edit_save_btn.click(fn=do_save_edit,
-                            inputs=[edit_name_dd, edit_name_field, edit_description_field, library_folder_dd],
-                            outputs=[table, library_folder_dd, edit_name_dd, delete_dd, edit_status],
-                            queue=False)
-
-
-        def do_build_hint(names_str):
-            names = [n.strip() for n in (names_str or "").split(",") if n.strip()]
-            if not names:
-                return "Enter at least one mod name."
-            metas = []
-            for n in names:
-                meta = storage.read_refmod_meta(storage.mod_path(n))
-                if meta is None:
-                    return f"No mod named '{n}' found."
-                metas.append(meta)
-            hint = core.build_prompt_hint(metas)
-            return hint or "(none of the selected mod(s) have a description set -- nothing to hint)"
-
-        hint_btn.click(fn=do_build_hint, inputs=[hint_names], outputs=[hint_output], queue=False)
+        frames_btn.click(fn=do_store_frames,
+                         inputs=[frames_target_dd, gr.State(False), library_folder_dd] + model_input,
+                         outputs=[table, frames_target_dd, frames_status], queue=False)
+        frames_all_btn.click(fn=do_store_frames,
+                             inputs=[frames_target_dd, gr.State(True), library_folder_dd] + model_input,
+                             outputs=[table, frames_target_dd, frames_status], queue=False)
+        # Keep these lists in step whenever the Library is refreshed or browsed.
+        refresh_btn.click(fn=fork_list_updates, inputs=[library_folder_dd], outputs=fork_lists, queue=False)
+        library_folder_dd.change(fn=fork_list_updates, inputs=[library_folder_dd], outputs=fork_lists,
+                                 queue=False)
         return table
 
     # ── Generate ────────────────────────────────────────────────────────
 
-    def _build_decompile_section(self, api_session, model_dd):
+    def _build_decompile_section(self, api_session, model_dd):   # fork
         gr.Markdown("### Decompile a RefMod\n"
                     "See what a mod holds: its pictures, video and audio, rebuilt as ordinary "
                     "files you can view, play and save. These are **reconstructions of what the "
@@ -1941,9 +1912,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 return (f"Could not read this mod: {e}", "", gr.update(visible=False), "",
                         *show_outputs(None))
             if mod.has_encoder_frames():
-                frames = mod.encoder_frames_uint8().numpy()
-                times = list(mod.enc_times)
-                label = ("picture {}" if mod.encoder_layout() == encframes.LAYOUT_STILLS
+                frames = (mod.enc_frames * 255).round().clamp(0, 255).byte().numpy()
+                times = list(mod.enc_times) or list(range(len(frames)))
+                label = ("picture {}" if mod.enc_layout == core.ENC_LAYOUT_STILLS
                          else "{:.1f}s")
                 items = [(frames[i], label.format(i + 1 if "picture" in label else times[i]))
                          for i in range(len(frames))]
@@ -1952,7 +1923,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 gallery = gr.update(value=items, visible=True)
             else:
                 note = ("*No stored encoder frames"
-                        + (" -- audio mods have none." if mod.kind == "audio"
+                        + (" -- audio mods have none.*" if mod.kind == "audio"
                            else ". Decompile below, or store them from the Library.*"))
                 gallery = gr.update(value=None, visible=False)
             already = any(storage.list_decompiled(name))
@@ -1977,18 +1948,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 def on_progress(self, update):
                     pass
 
-            spec_json = json.dumps(spec)
-            set_pending_extract(spec_json)
             try:
                 self._submit(api_session, model_type,
                              {"video_length": 107,
-                              "custom_settings": {SETTING_COMBINED:
-                                                  pack_refmod_setting(extract_json=spec_json)}},
+                              "custom_settings": {SETTING_GENERATE: json.dumps({EXTRACT_WRAPPER_KEY: spec})}},
                              DecompileCallbacks())
             except Exception as e:
                 return (f"Decompile failed to run: {e!r}", *show_outputs(name))
-            finally:
-                set_pending_extract(None)
             done = [l for l in log["lines"] if "Decompile" in l]
             return ((done[-1] if done else
                      (log["lines"][-1] if log["lines"] else "Finished -- see the console.")),
@@ -2042,7 +2008,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                  label="Reference image budget (% of output pixels)",
                                                  info="Higher = more reference detail kept, slower.")
 
-        mod_rows, stack_controls = self._build_mod_picker_rows_full()
+        mod_rows, panel_controls = self._build_mod_picker_rows_full()   # fork: the full panel
 
         with gr.Accordion("Advanced Mode", open=False):
             with gr.Tab("LoRAs"):
@@ -2128,8 +2094,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "skip_steps_start_step_perc": int(skip_steps_start_step_perc),
                 "sliding_window_size": int(sliding_window_size), "sliding_window_overlap": int(sliding_window_overlap),
                 "override_attention": override_attention, "attention_sparsity": float(attention_sparsity),
-                "custom_settings": {SETTING_COMBINED:
-                                    pack_refmod_setting(state_json=json.dumps(state_payload))},
+                "custom_settings": {SETTING_GENERATE: json.dumps(state_payload)},
             })
 
             log = {"lines": []}
@@ -2165,7 +2130,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         )
         refresh_loras_btn.click(fn=do_refresh_loras, inputs=[model_dd], outputs=[lora_choices, activated_loras],
                                queue=False)
-        flat_rows = [c for row in mod_rows for c in row] + list(stack_controls)
+        flat_rows = [c for row in mod_rows for c in row] + list(panel_controls)
         generate_btn.click(
             fn=do_generate,
             inputs=[model_dd, synced, prompt, resolution, video_length, seed, repeat_generation,
@@ -2205,7 +2170,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     self._build_extract_section(api_session, model_dd)
                 with gr.Tab("Library"):
                     self._build_library_section(api_session, model_dd)
-                with gr.Tab("Decompile"):
+                with gr.Tab("Decompile"):   # fork
                     self._build_decompile_section(api_session, model_dd)
                 with gr.Tab("Generate"):
                     self._build_generate_section(api_session, model_dd)

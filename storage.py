@@ -185,21 +185,26 @@ def list_refmods_info(folder: Optional[str] = None, recursive: bool = False) -> 
             else:
                 tokens = (latent_h // 2) * (latent_w // 2) * latent_t
             size_mb = os.path.getsize(mod_path(name) + ".safetensors") / (1024 * 1024)
+            # The "tokens" column counts the DiT channel only (the VAE latent).
+            # A mod also feeds Qwen3-VL through its stored prompt-view frames,
+            # which is a different budget entirely -- surface it so raising the
+            # prompt-view resolution is visible somewhere in the UI. Mods from
+            # before that setting existed report the old fixed 512.
+            prompt_view = int(meta.get("enc_max_edge", 512)) if meta.get("enc_layout") else 0
             out.append({
                 "name": name,
                 "kind": meta.get("kind", "?"),
                 "mode": meta.get("mode", "?"),
                 "tokens": tokens,
+                "prompt_view": prompt_view,
                 "source": meta.get("source", ""),
                 "description": meta.get("description", ""),
                 "concept_type": meta.get("concept_type", "generic"),
                 "size_mb": round(size_mb, 3),
-                "frames": encoder_frames_status(meta),
             })
         except Exception as e:
             print(f"[H3RefMod] could not read {name}: {e}")
     return out
-
 
 
 def list_refmods_missing_frames() -> List[str]:
@@ -655,6 +660,30 @@ def ensure_min_size(video: torch.Tensor, min_edge: int = 32) -> torch.Tensor:
 AUDIO_SAMPLE_RATE = 32000  # MiniMax H3's own audio VAE sample rate (models/minimax_h3/pipeline.py)
 
 
+def load_audio_waveform(path: str, max_seconds: Optional[float] = None) -> torch.Tensor:
+    """Load an audio file -> [1, 2, samples] float32 at 32kHz stereo --
+    exactly Wan2GP's own pipeline.py ``_waveform()``/``_load_audio_reference()``
+    conventions (mono duplicated to stereo, >2 channels truncated to the
+    first 2, resampled to 32kHz if the source differs)."""
+    import soundfile as sf
+
+    audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    waveform = torch.as_tensor(audio, dtype=torch.float32).transpose(0, 1)  # [channels, samples]
+    if waveform.shape[0] == 1:
+        waveform = waveform.repeat(2, 1)
+    elif waveform.shape[0] != 2:
+        waveform = waveform[:2]
+    sample_rate = int(sample_rate or AUDIO_SAMPLE_RATE)
+    if sample_rate != AUDIO_SAMPLE_RATE:
+        import torchaudio.functional as audio_F
+        waveform = audio_F.resample(waveform, sample_rate, AUDIO_SAMPLE_RATE)
+    if max_seconds is not None:
+        max_samples = int(max_seconds * AUDIO_SAMPLE_RATE)
+        if waveform.shape[-1] > max_samples:
+            waveform = waveform[..., :max_samples]
+    return waveform.unsqueeze(0)  # [1, 2, samples]
+
+
 def video_has_audio(path: str) -> bool:
     """True if a container looks like it carries an audio stream."""
     try:
@@ -715,30 +744,6 @@ def extract_audio_from_video(path: str, max_seconds: Optional[float] = None,
                 os.remove(temp_wav)
             except OSError:
                 pass
-
-
-def load_audio_waveform(path: str, max_seconds: Optional[float] = None) -> torch.Tensor:
-    """Load an audio file -> [1, 2, samples] float32 at 32kHz stereo --
-    exactly Wan2GP's own pipeline.py ``_waveform()``/``_load_audio_reference()``
-    conventions (mono duplicated to stereo, >2 channels truncated to the
-    first 2, resampled to 32kHz if the source differs)."""
-    import soundfile as sf
-
-    audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
-    waveform = torch.as_tensor(audio, dtype=torch.float32).transpose(0, 1)  # [channels, samples]
-    if waveform.shape[0] == 1:
-        waveform = waveform.repeat(2, 1)
-    elif waveform.shape[0] != 2:
-        waveform = waveform[:2]
-    sample_rate = int(sample_rate or AUDIO_SAMPLE_RATE)
-    if sample_rate != AUDIO_SAMPLE_RATE:
-        import torchaudio.functional as audio_F
-        waveform = audio_F.resample(waveform, sample_rate, AUDIO_SAMPLE_RATE)
-    if max_seconds is not None:
-        max_samples = int(max_seconds * AUDIO_SAMPLE_RATE)
-        if waveform.shape[-1] > max_samples:
-            waveform = waveform[..., :max_samples]
-    return waveform.unsqueeze(0)  # [1, 2, samples]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

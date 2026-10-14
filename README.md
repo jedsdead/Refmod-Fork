@@ -1,124 +1,149 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.31.0-fork.23** · based on the original port's 0.31.0 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.26** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
-It fixes several problems that stopped RefMods working reliably in Wan2GP, adds
-FL2VA support, and makes a few quality-of-life changes. Mod files are unchanged,
-so mods are still interchangeable with the original port and with ComfyUI.
+
+Since fork.24 it is the original port's 0.38.1 **with the fork's features added
+on top**, rather than a separate line of development. Where the port and the
+fork had each built the same thing (encoder frames and prompt labels, fitting
+mods to phase 1, image output, video mods on later windows, the hidden
+`dtype` fix), the port's version is the one used, unchanged. Everything the
+fork adds is either new code (`encframes.py`, the "Fork additions" sections of
+`patches.py`, new UI builders in `plugin.py`, new helpers in `core.py` and
+`storage.py`) or a short, commented insertion into the port's own functions
+(marked `fork`). A plain `{"rows": [{"mod", "strength"}]}` selection behaves
+exactly as it does in the port.
+
+Mod files are unchanged: mods move freely between this fork, the original port
+and the ComfyUI packs.
 
 The original port's documentation follows below the line; this section lists
-what's different.
+what the fork adds.
 
-## What this fork changes
+## What this fork adds
 
-### Fixes
+### Models
 
-- **RefMods now reach the prompt.** In the original, a mod's latent went to the
-  model with nothing in the prompt tying it to your text, so mods often had
-  little visible effect. Each mod now gets its own `<Picture N>`, `<Video N>` or
-  `<Audio N>` entry in the prompt, the same as a live reference does.
-- **Mods apply on every sliding window**, matching how Wan2GP treats its own
-  references. The original injected them into the first window only, so
-  anything longer than one window lost them.
-- **Your mod selection is no longer lost before generation.** Root cause: Wan2GP
-  keeps only the first 5 custom settings a model declares and Ref2VA declares 4,
-  so the plugin's second setting was truncated away. Both payloads now share one
-  setting. An in-memory fallback remains as a backstop, used only when a task
-  genuinely arrives without its payload, and it follows the panel exactly —
-  clearing the pickers clears it. Wan2GP can drop
-  the plugin's custom setting between the form and the queue. The inline
-  panel's selection is now kept and re-applied when that happens, and Wan2GP's
-  own form refreshes no longer wipe it. A **Clear armed RefMods** button
-  replaces "pick nothing" as the way to turn mods off.
-- **Extract no longer renders a video by mistake.** Root cause: Wan2GP keeps
-  only the first 5 custom settings a model declares, Ref2VA declares 4, and
-  the plugin added 2 — so the extraction key was silently dropped and the
-  task ran as a normal render. Both payloads now share one setting, and the
-  job is also staged in memory as a backstop.
-- **Two-phase generation.** Phase 1 renders at half resolution, and live
-  references are shrunk to match; mods weren't. They're now fitted to the
-  phase-1 canvas — only ever shrunk, never enlarged — and single-phase runs
-  are untouched.
-- **Newer Wan2GP's reference-video time budget.** When several reference
-  videos together run over Wan2GP's 15-second budget, it trims each one. Mods
-  are now trimmed to match instead of crashing the generation.
-- **Less repeated work at window boundaries.** Mod files, strength-weighted
-  latents and prompt previews are cached instead of being rebuilt every window.
+- **FL2VA**, including FL2VA finetunes such as VDN. FL2VA has no reference
+  inputs, so the mods go straight into the transformer's reference list, the
+  mechanism the ComfyUI original's Apply node uses. Every mod gets its prompt
+  label, as in Ref2VA: `<Picture N>` / `<Video N>` for picture and video mods
+  (numbered after FL2VA's own start/end frames) and `<Audio N>` for audio.
+  The FL2VA checkpoint wasn't trained with references, so expect results to
+  vary more than in Ref2VA.
+- **FL2VA ControlNet-Union.** Its control rows are padded for the mods, which
+  would otherwise stop the run with a row-count mismatch.
 
-### New
+### Making mods (Extract and Library tabs)
 
-- **FL2VA support**, including FL2VA finetunes such as VDN. In FL2VA the mods
-  go straight into the transformer's reference list, the same mechanism the
-  ComfyUI original's Apply node uses. Visual mods carry no `<Picture N>` label,
-  as in ComfyUI; audio mods are labelled `<Audio N>` (see
-  `FL2VA_PROMPT_LABELS`) because a voice reference has little to anchor it
-  otherwise. The FL2VA ControlNet model takes mods too (since fork.18); Viggle and TTS models are excluded. The FL2VA
-  checkpoint wasn't trained with references, so expect results to vary more
-  than in Ref2VA.
-- **Mods with both visuals and audio.** A mod can carry a soundtrack as well
-  as a look. The audio is injected as its own `<Audio N>` reference, so refer
-  to it that way in prompts (`<Video 1>` is the picture; `<Audio 1>` is the
-  voice). Set `ATTACHED_AUDIO_AS_SEPARATE_REF = False` to merge it into the
-  visual reference as H3's `video_audio` kind instead — that shape means "this
-  footage's own soundtrack" rather than a voice to reuse. Attach one at
-  extraction time, or from the Library tab's
-  **Soundtrack** section for mods you already built. The extra audio counts
-  toward the mod's token total (2 tokens per audio latent, ~80 per second).
+- **Mods with a voice as well as a look.** Audio given together with images or
+  video becomes the mod's soundtrack — stored beside the visual latent and
+  injected as its own `<Audio N>` reference. Or tick **Use the clip's own
+  audio** to take it from the reference video.
+- **Audio length** slider (4 s by default, 2 s minimum). Audio shorter than
+  H3's 2-second minimum is refused with a clear message; a clip's own audio is
+  kept with a warning instead.
+- **Turn reference videos into a picture stack**: the sharpest frame from each
+  slot of time, with a pictures-per-second setting — a clip's identity at a
+  fraction of its tokens.
+- **Merge into one picture** (training mode): several sources become one small
+  picture of what they have in common.
+- **Preview and trim** reference videos before extracting.
+- **Library**: folders (create, move mods between them, delete empty ones),
+  add / replace / remove a soundtrack on existing mods, and store prompt-view
+  frames in mods saved without them.
+- **Decompile tab**: turns a mod back into viewable pictures, video and audio,
+  with a summary of what it holds.
 
-### Stacked still images: one reference per image
+### The RefMods panel
 
-A mod extracted from several stills becomes one image reference *per still*, so
-a 3-image mod gets `<Picture 1>`, `<Picture 2>` and `<Picture 3>` and uses three
-of the nine image slots. That is the original port's deliberate design, and this
-fork keeps it. MiniMax H3's packer gives every "image" reference a single-frame
-position grid, so a multi-frame image reference either fails outright or leaves
-every frame at the same position, indistinguishable to the model.
+- **Send as one video**, per mod: a multi-picture mod becomes one
+  `<Video N>` instead of one `<Picture N>` per picture.
+- **Include audio**, per mod.
+- **Max size**, per mod (short edge in pixels), with the saving shown in the
+  readout.
+- **Text encoder options**: how many pictures of a stack, and how many frames
+  of a video mod, the text encoder is shown.
+- **Live readout** of each mod's prompt label, audio seconds and budget.
+- **Add / Remove slot** buttons, and **Clear RefMods**, which empties the slots.
+- The plugin's custom setting is hidden from the Media Generator form.
 
-ComfyUI behaves differently — there a refmod is one latent block with one tag —
-so prompts written for ComfyUI need adjusting. To refer to a stacked mod, name
-its pictures together: `<Subject 1> is the man in <Picture 1>, <Picture 2> and
-<Picture 3>.` Video mods are already a single `<Video N>`, because the packer's
-video branch is built for multi-frame references.
+### Speed and sizing
 
-### Quality of life
+- **Fit mods to the output size.**
+- **Mods in phase 2**: Full, Fit to tile (with phase 2 tiling) or Off.
+- **Shrink method** for the above: Re-encode (best quality) or Fast.
+- **FL2VA mods are fitted to phase 1** of two-phase runs, as Ref2VA mods are.
+- **Faster startup**: the plugin's own event handlers are kept out of
+  Gradio's API listing, which avoids the "localhost is not accessible"
+  launch failure with large panels.
 
-- Folder management in the Library tab: create folders (`characters/female`
-  nests), move any number of selected mods between them, and delete empty ones.
-  A move rewrites the mod in place, so the latent, description and any attached
-  soundtrack survive, and a name clash is refused rather than overwriting.
-- Reference videos have a preview and a trim range in the extractor. With one
-  video uploaded it is selected automatically; with several, a picker chooses
-  which to preview. A trim limits both the frames encoded and the audio taken
-  from that clip, and leaving the range at the full span records no trim.
-- Image, video and audio pickers start with one slot each, with buttons to
-  add and remove slots, in both the inline panel and the plugin's own tab.
-- Delete mods by picking them from a list (several at once if you like), with
-  a confirmation tick, instead of typing their paths.
-- Every generation logs what happened to your mods, e.g.
-  `[H3RefMod] generate(): Ref2VA, window 2, task payload=no, armed=yes`.
+### Smaller things
+
+- Mods saved **without prompt-view frames** (older mods, other tools) are
+  decoded once per session so they still get a prompt label.
+- **Stable labels on later windows**: picture mods keep the same
+  `<Picture N>` on every sliding window instead of shifting by one behind the
+  carried-over frame.
+- **Image output** splits a picture stack sent as one video back into its
+  pictures.
+- A video mod trimmed by Wan2GP's 15-second reference budget **keeps its
+  prompt label** (cut to what's left).
+- ComfyUI picture stacks (saved as kind `video`) are treated as pictures.
+- Mods, weighted latents and shrunk mods are **cached** across windows.
+- Selections and queued tasks saved by earlier fork builds still load.
 
 ### Settings
 
-These live at the top of `patches.py`. The defaults are what this fork ships with.
+At the top of the "Fork additions" section of `patches.py`, and near the top
+of the file for the model switches.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `PROMPT_LABELS_FOR_REFMODS` | `True` | Give each mod a `<Picture N>`/`<Video N>`/`<Audio N>` prompt entry. `False` reproduces the original port's behaviour. |
-| `INJECT_ON_EVERY_WINDOW` | `True` | Apply mods to every sliding window rather than only the first. |
-| `FIT_REFMODS_TO_PHASE_1_CANVAS` | `True` | In two-phase runs, shrink mods to phase 1's half-resolution canvas. |
-| `ATTACHED_AUDIO_AS_SEPARATE_REF` | `True` | Inject a mod's soundtrack as its own `<Audio N>` reference. `False` merges it into the visual reference (`video_audio`). |
 | `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. |
-| `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model (pads its control rows for the mods). |
-| `FL2VA_PROMPT_LABELS` | `"audio"` | Which mods get a prompt label in FL2VA. `"audio"` labels audio mods as `<Audio N>`; `"none"` matches the ComfyUI original. |
-| `STABLE_REFMOD_LABELS` | `True` | In windows 2+, number mods ahead of the carried-over frame so their `<Picture N>` stays the same as in window 1. |
-| `RESCALE_REFMODS_IN_PHASE_2` | `False` | Experimental: rebuild image mods at phase 2's full resolution. |
-| `RESCALE_REFMOD_VIDEOS_IN_PHASE_2` | `False` | Same for video mods. Expensive: token cost grows with every latent frame. |
-| `REFMOD_RESCALE_MAX_TOKEN_GROWTH` | `2.0` | Cap on how much a phase-2 rebuild may grow a mod's token count. |
-| `DISABLE_SOL_WITH_REFMODS` | `False` | Fall back from Sol-Attn to normal attention when mods are in use. |
+| `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model. |
+| `FL2VA_PROMPT_LABELS` | `"on"` | Every mod gets its prompt label in FL2VA, as in Ref2VA. `"none"` labels nothing, like the ComfyUI original. |
+| `STABLE_REFMOD_LABELS` | `True` | On windows 2+, picture mods are numbered ahead of the carried-over frame, so their labels match window 1. |
 
 ### Release history
+
+- **0.38.1-fork.26** — FL2VA prompt labels for picture and video mods are
+  now standard: fork.25's checkbox is gone, and every FL2VA run labels every
+  mod.
+
+- **0.38.1-fork.25** — **prompt labels for picture and video mods in FL2VA.**
+  Until now only audio mods were labelled there, so a prompt's `<Video 1>` or
+  `<Picture N>` pointed at nothing and the model had no text tying the mod to
+  your subject. Mods now carry their prompt-view frames, so in FL2VA, FL2VA
+  ControlNet and VDN each picture or video mod is shown to the text encoder
+  and labelled exactly as in Ref2VA.
+  A start or end frame is numbered first, so with a start image the first
+  picture mod is `<Picture 2>`; video mods start at `<Video 1>`. The console
+  logs which label each mod got.
+
+- **0.38.1-fork.24** — rebuilt on the original port's 0.38.1, so the two can
+  be merged. Where both had the same feature, the port's version is used:
+  - prompt labels and stored prompt-view frames (the port's format and
+    extraction, including its *Prompt-view resolution* setting);
+  - fitting mods to phase 1 of two-phase runs (the port's latent resample —
+    previously the fork re-encoded);
+  - image output and **video mods on sliding windows 2, 3, ...** — the port's
+    setting, whose default is *First frame as a still* (the fork's default
+    was the whole clip; choose *Whole clip* to keep that behaviour);
+  - the stand-ins' `dtype`, and the port's own Library (delete by name, edit,
+    prompt hint) and Generate tab.
+  Dropped as no longer needed: the in-memory fallbacks for a lost task
+  payload (the one-setting fix made them redundant), the phase-2 rebuild
+  experiment, the Sol-Attn bypass and the "store encoder frames" checkbox (the
+  port always stores them). Other plugins that build the panel through
+  `_build_mod_picker_rows(None)` (2 Phases Plus) get the port's own builder
+  again. Fixed along the way: an image mod's soundtrack was injected twice in
+  FL2VA; RefMod pictures could swap labels on later windows; mixed-size
+  pictures in training mode could fail to extract; a budget-trimmed video mod
+  lost its prompt label.
+
 
 - **0.31.0-fork.23** — ideas from the original port's 0.35-0.38 updates,
   built this fork's own way:
@@ -444,7 +469,7 @@ Releases below were based on the original port's 0.30.2.
 ### Versioning
 
 Fork versions take the form `<original port version>-fork.<fork release>`, so
-`0.30.2-fork.1` is this fork's first release built on the original's 0.30.2.
+`0.30.2-fork.1` is this fork's first release built on the original's 0.30.2 (and `0.38.1-fork.24` is fork release 24, built on 0.38.1).
 Wan2GP's plugin manager sorts it above 0.30.2 and below the next original
 release, and compares fork releases numerically, so `fork.10` is newer than
 `fork.9`.
@@ -530,10 +555,13 @@ No extra Python dependencies beyond what Wan2GP already ships (torch,
 safetensors, numpy, Pillow). `requirements.txt` only lists an optional video
 decoding backend as a nice-to-have.
 
-The plugin stores the current selection in one custom setting on MiniMax H3's
-model definition, so it travels with every task, queue entry and saved
-settings file. Since fork.12 that setting is hidden on Wan2GP's Media
-Generator form -- there is no text box to leave blank any more.
+You may notice two extra, normally-empty text boxes named "RefMods selection
+(managed by the MiniMax H3 RefMods plugin -- leave blank)" and "RefMod
+extraction job (...)" under **Custom Settings** on Wan2GP's own Media
+Generator tab whenever a MiniMax H3 Ref2VA model is selected. That's
+expected -- see "How the injection actually works" below for why they exist.
+Leave them blank; this plugin's own Extract/Generate buttons fill them in on
+submission.
 
 ## Using it
 
@@ -575,9 +603,9 @@ actually ends up in the saved tensor, unlike the metadata-only fields below:
   -- identical to what a live reference would produce. Best for a person's
   precise face/identity. Bigger file, more tokens spent at generation time
   (same cost as a live reference), and the "Identity refinement steps"
-  option is hidden in encode mode -- there's nothing left to refine.
+  option (Advanced) is ignored -- there's nothing left to refine.
 - **`training`**: the latent is average-pooled down to a tiny grid (the
-  "Pool grid" sliders under Settings) and optionally refined with a few hundred
+  "Pool grid" sliders, Advanced) and optionally refined with a few hundred
   gradient steps against the full encode ("Identity refinement steps",
   Advanced -- optimizing only the small saved latent's own values, no model
   weights involved). Pooling is genuinely lossy: fine detail (eyes, nose,
@@ -649,14 +677,13 @@ image(s), not to reference videos, matching Wan2GP's own behavior. Applied
 in pixel space before encoding, so it works the same in both `training` and
 `encode` mode.
 
-**`keyword - description` and `Concept type`** (in the *Description and concept
-type* accordion under the mod name) are the
+**`keyword - description` and `Concept type`** (under Advanced) are the
 opposite of Mode: **pure metadata with no effect on generation whatsoever**.
 Nothing in a mod file is ever read by the model automatically -- MiniMax
 H3's Ref2VA path has no image-embedding / CLIP-Vision-style channel to hang
 an automatic clue off of, so text typed into your prompt is the only
 channel that actually reaches the model. They only become useful through
-the Library tab's **Prompt hint** section (or by copying them into your
+the Library tab's **Build Prompt Hint** tool (or by copying them into your
 prompt yourself):
 - `keyword - description`, written the same way you'd write a LoRA training
   caption, is the text that gets used.
@@ -999,20 +1026,33 @@ load time:
    re-wraps the result back into a sentinel so `_add_audio_reference`
    downstream still recognizes it. Every non-sentinel source is delegated
    to the untouched original per-source logic, unchanged.
-13. `_inject_refmods` itself checks `kwargs.get("window_no")` before doing
-   anything else, and skips RefMod injection entirely when it's an int
-   greater than 1. Wan2GP's own sliding-window loop (also used by
-   **Continue Video**) calls `generate()` once per window, passing
-   `custom_settings` (carrying the RefMod selection) unconditionally every
-   time -- but its own *native* references (`image_refs`, `prefix_video`,
-   a reference video's own frames) are only fed into `window_no==1`; every
-   later window continues from the previous window's own tail frames
-   instead, never the original reference again. Without this check, a
-   RefMod -- having no visibility into which window it's on from inside
-   `generate()` itself -- would get re-injected as a "reference" on every
-   single window, so a few frames of it would visibly appear at every
-   window boundary in the output. A plain, single-window generation never
-   sets `window_no` above 1 either, so this never affects normal use.
+13. **Sliding windows.** WanGP calls `generate()` once per window and passes
+   `custom_settings` (carrying the RefMod selection) every time, so a mod is
+   in principle available to every window. What its own live references do,
+   checked in `wgp.py`: `src_ref_images` and `audio_guide` are both assigned
+   *before* the window loop and handed to every `generate()` call, and a
+   reference video (`-`) is re-extracted from frame 0 on every window
+   (`guide_frames_extract_start = 0 if reference_videos`). The `window_no ==
+   1` gates nearby only skip *re-preprocessing* them; they do not stop them
+   being passed. So **image and audio mods are injected on every window**,
+   matching that exactly -- which is what keeps an identity stable instead of
+   drifting into a different face a window or two in.
+
+   Video mods are the one case with a real trade-off, and the inline panel
+   exposes it as **"Video mods on sliding windows 2, 3, ..."**:
+
+   - **First frame as a still** (default) -- the mod's first latent frame
+     goes in as an image reference, labelled `<Picture N>`. Keeps the
+     identity; cannot reproduce the clip's motion, so none of its frames can
+     surface at the window boundary.
+   - **Whole clip, like a live reference video** -- full parity with a live
+     reference video. Strongest conditioning, but a few of the mod's own
+     frames can show up at the boundary.
+   - **Not at all** -- the mod applies to the first window only (what
+     v0.30-v0.35 did for every mod kind).
+
+   A plain single-window generation never sets `window_no` above 1, so none
+   of this affects it.
 
 14. `_prepare_condition_rows` is wrapped to lift Wan2GP's own reference
    caps for RefMods. `generate()` enforces "at most 12 references: 9
@@ -1048,6 +1088,162 @@ load time:
    compression) and a trimmed sentinel is returned. Without it, two or more
    long video RefMods raise "'_RefModVideoSentinel' object is not
    subscriptable".
+
+17. The plugin declares **one** custom setting (`h3_refmod_state`), not two.
+   Wan2GP keeps only the first `CUSTOM_SETTINGS_MAX` (5) custom settings a
+   model declares -- `get_model_custom_settings` truncates with
+   `custom_settings[:MAX]` -- and MiniMax H3 Ref2VA now declares four of its
+   own (Mask Denoising Mode, Audio Refinement, and the two excerpt-position
+   settings). A second slot would be the sixth and get dropped silently,
+   which is what made RefMod *extraction* run as an ordinary generation.
+   Extraction jobs therefore travel inside that same slot, wrapped under an
+   `__h3refmod_extract__` key; the old two-slot form is still read so tasks
+   queued by an earlier version keep working. If a future Wan2GP build
+   declares enough settings to squeeze the slot out anyway, the plugin says
+   so loudly in the console instead of failing silently.
+
+18. `_add_image_reference` also tolerates a **video**-kind RefMod being
+   handed to it, and `_add_video_reference` an image-kind one. This plugin
+   never routes them that way, but another plugin can: MiniMax H3 Image
+   Mode folds reference videos into reference images for single-frame
+   (text-to-image) output, where a moving reference has no meaning. The
+   native image path would then crash in `_to_pil`
+   ("int() argument must be ... not '_RefModVideoSentinel'"), so the clip's
+   first frame is used as a still reference instead (logged once), and a
+   still on the video path is treated as the one-frame clip it already is.
+
+19. **RefMods now reach the prompt.** A reference that arrives natively
+   travels two paths: its VAE latent conditions the DiT, *and* its pixels go
+   through Qwen3-VL to be embedded in the text stream at a `<Picture N>: ` /
+   `<Video N>: ` label (`<Audio N>: ` is text-only). A mod file holds only a
+   latent, so mods used to get no label -- and H3's own prompt structure
+   (`subject_definitions: <Subject 1> is the violinist from <Picture 1>`)
+   had nothing to bind to, which is why a mod's effect could be weaker than
+   the same reference supplied live. Extraction now stores a few frames
+   beside the latent as JPEGs (`enc_0..enc_N`, plus `enc_times` /
+   `enc_layout` / `enc_fps` metadata -- the same layout
+   ComfyUI-Fantastic-MiniMaxH3-PromptBuilder and the Refmod fork use, so
+   mods stay interchangeable), and each reference contributes its own
+   presentation entry at generation time. **Numbering follows the picker
+   rows, one label per image**: a two-image mod in Image Mod 1 becomes
+   `<Picture 1>` and `<Picture 2>`, a one-image mod in Image Mod 2 becomes
+   `<Picture 3>`. Live references from the main form are added first and
+   take the lower numbers. Frames are dimmed toward mid-grey in step with
+   a mod's Strength, so the encoder is never shown a stronger reference
+   than the DiT gets. Mods extracted before this still work -- they simply
+   get no label until re-extracted. Costs: the vision encoder adds tokens
+   per labelled image/video mod, and mod files grow by roughly 10-30 KB per
+   stored frame (audio mods pay neither -- their label carries no pixels).
+
+20. **Mods are fitted to the canvas each phase renders at.** Two-phase
+   generation renders phase 1 at half resolution (`H3_TWO_PHASE_SCALE`), and
+   every live reference is fitted to that smaller canvas before being
+   encoded -- `_prepare_image_reference` resizes to a pixel budget of
+   `target_w * target_h * relative_size / 100`, reference videos go through
+   `_resize_video`. A RefMod arrives already encoded, so nothing used to fit
+   it, and phase 1 received a reference several times larger than the frame
+   it was conditioning. The latent is now resampled on its spatial axes only
+   (time and the 24 channels untouched), aspect ratio kept, both axes kept
+   even for the DiT's 2x2 patching, and **only ever made smaller** -- a mod
+   extracted below the canvas is left exactly as it is rather than blown up
+   into detail it never had. The fit is gated on the canvas actually being
+   reduced (compared against the full `width`/`height` this generate() call
+   was given), so **single-phase runs and phase 2 are untouched**.
+
+21. **Image / single-frame output handles video mods itself.** Recent WanGP
+   builds fold reference videos into the image references natively when the
+   output is a single frame: `input_ref_images = [..., guide_to_float(
+   input_frames)]`, then `video_references = False`. Two consequences for
+   RefMods: `guide_to_float()` reads `.dtype` (every sentinel now reports its
+   latent's, so the helper returns it untouched instead of raising
+   `AttributeError`), and only the *first* reference video survives that
+   fold. So on image output the plugin converts **every** video-kind mod to a
+   still reference itself -- first latent frame each -- before the native
+   slots are ever filled, and relabels its prompt entry `<Picture N>` rather
+   than `<Video N>`, matching the single still the DiT actually receives.
+
+## The two channels a RefMod feeds, and what each one's resolution control does
+
+A mod conditions the model through **two separate circuits**, and each has its
+own resolution control in Advanced.
+
+**Ref resolution (short edge)** -> the VAE latent -> the DiT. This is a *cap,
+never an upscale* (`resize_cthw` does `min(1.0, cap / short_edge)`): a source
+whose short edge already sits below it is encoded untouched. A 2560x1440
+photo with the cap at 2048 is encoded at 2560x1440, and raising the cap to
+4096 would change nothing. Aspect ratio is preserved, so only the short edge
+is compared: an 8000x2048 panorama passes through whole, at 500x128 latent
+cells (16000 tokens, a 3 MB latent).
+
+**Prompt-view resolution (long edge)** -> JPEG frames -> Qwen3-VL. This is the
+channel that binds the mod to its `<Picture N>` label, which is how the prompt
+can say "the woman from `<Picture 1>`". A *live* reference is shown the whole
+image at the generation canvas; mods used to be capped at 512 px, which is a
+6x deficit in vision tokens on the circuit that carries recognition:
+
+| stored long edge | JPEG size | vision tokens |
+|---|---|---|
+| 512 (old default) | 83 KB | 144 |
+| **1024 (new default)** | **237 KB** | **576** |
+| 1536 | 440 KB | 1296 |
+| 2048 | 687 KB | 2304 |
+| *live reference, 1280x720 canvas* | - | *880* |
+| *live reference, 1344x768 canvas* | - | *1008* |
+
+Qwen3-VL's own ceiling for a still is 16.7 Mpixels, far above anything offered
+here, so this slider is purely a cost dial: a few hundred KB of mod file and a
+few hundred tokens through the text encoder, paid once per generation. Video
+mods keep a lower per-frame cap (`ENC_MAX_EDGE_CLIP`), since a clip stores up
+to 8 views. JPEG is written at quality 96 with `subsampling=0`, because the
+default 4:2:0 halves color detail and that is where skin tone and eye color
+live.
+
+Existing mods are unaffected and keep working; they carry whatever prompt-view
+they were extracted with. Re-extract to benefit.
+
+VAE tiling is now enabled before extraction encodes anything. Extraction runs
+before the pipeline's own `_configure_tiling()`, so on the first task after a
+model load the VAE was still untiled and a large source could exhaust VRAM in
+a single encode.
+
+## Mode, Pool grid and Identity refinement: what actually applies
+
+`Mode` decides which of the two extraction branches runs, and three Advanced
+controls only exist on one of them:
+
+| Control | `training` | `encode` |
+|---|---|---|
+| Ref resolution | used | used |
+| Pool grid H / W | used | **ignored** |
+| Identity refinement steps | used | **ignored** |
+
+In `encode` the latent is kept exactly as the VAE produced it: there is no
+pooled grid to size, and nothing to refine *towards*, because the full encode
+is already the target the refinement would aim at. The saved metadata shows
+it (`"pool": "full-res ...", "optimize_steps": 0`), and two `encode` mods that
+differ only in those settings come out byte-for-byte identical. The extract
+form now hides both controls when Mode is `encode` and says so, instead of
+leaving them there to be set to no effect.
+
+Measured on a real 1440p portrait (full-res latent 90x160, 3600 tokens),
+relative error of the mod's reconstruction against that full latent:
+
+| Setting | Grid | Tokens | Rel. error |
+|---|---|---|---|
+| training, pool 16, 0 steps | 8x16 | 32 | 0.551 |
+| training, pool 16, 500 steps | 8x16 | 32 | 0.525 |
+| training, pool 64, 0 steps | 36x64 | 576 | 0.358 |
+| training, pool 64, 500 steps | 36x64 | 576 | 0.319 |
+| encode | 90x160 | 3600 | 0.000 |
+
+So Pool grid is the parameter that matters in training mode (it sets both the
+detail kept and the token cost), refinement buys roughly another 5-11% on top
+of whatever grid was chosen, and `encode` makes both irrelevant by keeping
+everything. Note the grid is adjusted to the source's aspect ratio, so "64" on
+a 16:9 source becomes 36x64, not 64x64.
+
+Refinement converges: error stops moving at about 200 steps (0.3190 at 200,
+0.3190 at 2000), so values above a few hundred cost time and change nothing.
 
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
@@ -1147,19 +1343,4 @@ model catalog an extra time; it doesn't indicate anything went wrong.
 This plugin's `core.py` is a close port of `core.py` from
 [ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod)
 by Luisa (luisacaotica), MIT License, (c) 2026. The rest of this plugin
-(`storage.py`, `patches.py`, `plugin.py`, `encframes.py`) is new code written
-for Wan2GP.
-
-The encoder frames stored inside mod files, the option to send a multi-picture
-mod as one video reference, and the choice of how many pictures the prompt
-encoder is shown (fork.8) are inspired by the RefMod implementation in
-[ComfyUI-Fantastic-MiniMaxH3-PromptBuilder](https://github.com/Adudeguyman/ComfyUI-Fantastic-MiniMaxH3-PromptBuilder)
-by Adudeguyman. The code here is written for Wan2GP rather than copied, and
-the stored frames use the same file keys (`enc_0`, `enc_1`, ... with
-`enc_times` / `enc_fps`), so they carry over between the two tools.
-
-Original Wan2GP port by [g3n3rativ3](https://github.com/g3n3rativ3).
-
-Forked from: https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP
-
-Fork maintained by [jedsdead](https://github.com/jedsdead): https://github.com/jedsdead/Refmod-Fork
+(`storage.py`, `patches.py`, `plugin.py`) is new code written for Wan2GP.

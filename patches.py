@@ -51,98 +51,41 @@ time to the already-loaded ``MiniMaxH3Pipeline`` class, and is idempotent
 
 from __future__ import annotations
 
+import collections
 import functools
 import json
+import math
 import os
 import random
-import time
 import traceback
 from typing import Optional
 
-import collections
-import math
 import torch
 import torch.nn.functional as F
 
 from . import core, encframes, storage
 
 SETTING_GENERATE = "h3_refmod_state"     # custom_settings key: mods to inject into a real render
-SETTING_EXTRACT = "h3_refmod_extract"    # custom_settings key: "run an extraction, not a render"
-
-# Both payloads now travel in ONE custom setting, because Wan2GP only keeps the
-# first CUSTOM_SETTINGS_MAX (5) settings a model declares:
-# get_model_custom_settings() slices custom_settings[:5], and the strict
-# collection that builds a task's custom_settings iterates that truncated list.
-# Ref2VA already declares 4 of its own (mask mode, audio refinement, and the
-# two excerpt-position settings), so the plugin's two made 6 and the last was
-# silently dropped -- which is why extraction ran as an ordinary render and why
-# the mod selection could vanish on the way to the queue. One setting fits.
-# A character Wan2GP never uses in a video prompt type, so a custom setting
-# keyed to it is never shown (see install_model_def_patch).
-HIDDEN_SETTING_FLAG = "\u00a7"
-# The one custom setting this plugin declares. Since fork.22 its id is
-# "h3_refmod_state" -- the id the original port uses -- so other plugins that
-# hand a RefMod selection to a task under that key (e.g. 2 Phases Plus' H3
-# Upscaler tab) are understood, and Wan2GP keeps the key because it is
-# declared. It holds either this fork's {"state": ..., "extract": ...} blob,
-# a plain selection ({"rows": [...]}) from another plugin, or the original
-# port's {"__h3refmod_extract__": spec}. Forks 12-21 used "h3_refmod"; that
-# key is still read.
-SETTING_COMBINED = "h3_refmod_state"
-LEGACY_SETTING_COMBINED = "h3_refmod"
-UPSTREAM_EXTRACT_WRAPPER_KEY = "__h3refmod_extract__"
-CUSTOM_SETTINGS_MAX_ASSUMED = 5
-
-
-def pack_refmod_setting(state_json=None, extract_json=None) -> str:
-    payload = {}
-    if state_json:
-        payload["state"] = state_json
-    if extract_json:
-        payload["extract"] = extract_json
-    return json.dumps(payload) if payload else ""
-
-
-def unpack_refmod_setting(custom_settings):
-    """(selection json, extraction job json) from a task's custom_settings.
-    Reads the declared key in any of the shapes it can hold (see
-    SETTING_COMBINED), the fork.12-21 key, and the original two legacy keys,
-    so tasks queued by older builds -- or settings saved from one -- keep
-    working."""
-    if not isinstance(custom_settings, dict):
-        return None, None
-    state = None
-    extract = custom_settings.get(SETTING_EXTRACT) or None
-    for key in (LEGACY_SETTING_COMBINED, SETTING_COMBINED):   # the declared key wins
-        blob = custom_settings.get(key)
-        if not blob:
-            continue
-        try:
-            parsed = json.loads(blob) if isinstance(blob, str) else blob
-        except Exception:
-            _log(f"could not parse {key}; ignoring it:\n" + traceback.format_exc())
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        if "state" in parsed or "extract" in parsed:
-            state = parsed.get("state") or state
-            extract = parsed.get("extract") or extract
-        elif UPSTREAM_EXTRACT_WRAPPER_KEY in parsed:
-            job = parsed[UPSTREAM_EXTRACT_WRAPPER_KEY]
-            extract = (job if isinstance(job, str) else json.dumps(job)) or extract
-        elif "rows" in parsed:
-            # A plain selection, as the original port and other plugins send it.
-            state = blob if isinstance(blob, str) else json.dumps(parsed)
-    return state, extract
-
-
+SETTING_EXTRACT = "h3_refmod_extract"    # legacy custom_settings key, still read for queued tasks
+EXTRACT_WRAPPER_KEY = "__h3refmod_extract__"  # extraction spec carried inside SETTING_GENERATE
+_CUSTOM_SETTINGS_MAX_GUESS = 5           # Wan2GP's own CUSTOM_SETTINGS_MAX, for the warning below
 STASH_KEY = "_h3refmod_selection"        # key inside the session `state` dict for the inline panel
-# Audio in a mod (an audio mod, or a visual mod's soundtrack): how much is kept
-# by default, and the shortest allowed -- H3 documents 2s as the minimum
+
+# Fork: a letter Wan2GP never puts in a video prompt type. A custom setting
+# keyed to it is never shown on the Media Generator form, but still travels
+# with every task, queue entry and saved settings file.
+HIDDEN_SETTING_FLAG = "§"
+# Fork: earlier fork builds (up to fork.23) wrote {"state": ..., "extract": ...}
+# into SETTING_GENERATE, and forks 12-21 used the key "h3_refmod". Both are
+# still read (see read_refmod_payload) so their saved settings and queued
+# tasks keep working; nothing writes them any more.
+LEGACY_FORK_SETTING = "h3_refmod"
+
+# Fork: audio in a mod (an audio mod, or a visual mod's soundtrack) -- how much
+# is kept by default, and the shortest allowed. H3 documents 2s as the minimum
 # length of an audio reference, so a shorter clip is refused at extraction.
 DEFAULT_AUDIO_SECONDS = 4.0
 MIN_AUDIO_SECONDS = 2.0
-MIN_SOUNDTRACK_SECONDS = MIN_AUDIO_SECONDS   # name used by earlier forks
 
 
 class ExtractionBlocked(ValueError):
@@ -150,25 +93,41 @@ class ExtractionBlocked(ValueError):
     shown in the status box instead of a traceback."""
 
 
-def _require_audio_length(waveform, what: str) -> float:
-    """Refuse audio shorter than MIN_AUDIO_SECONDS; returns its length."""
-    seconds = waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
-    if seconds < MIN_AUDIO_SECONDS - 0.05:
-        raise ExtractionBlocked(
-            f"{what} is only ~{seconds:.1f}s long. H3 needs at least {MIN_AUDIO_SECONDS:g}s of "
-            f"audio to use it as a reference -- use a longer clip, or a longer part of it.")
-    return seconds
+def read_refmod_payload(custom_settings):
+    """(selection json, extraction spec) from a task's custom_settings.
 
-
-def _audio_seconds(spec: dict, fallback: float) -> float:
-    """The extraction's "Soundtrack length", never under the minimum. Specs
-    from before fork.16 have none and keep their old length (``fallback``)."""
-    value = spec.get("audio_seconds")
-    try:
-        value = float(value) if value is not None else float(fallback)
-    except (TypeError, ValueError):
-        value = float(fallback)
-    return max(MIN_AUDIO_SECONDS, value)
+    The current form is the one generate() writes and reads below: a plain
+    selection, or {EXTRACT_WRAPPER_KEY: spec}, in SETTING_GENERATE (plus the
+    legacy SETTING_EXTRACT key). Also accepted, for tasks and settings saved
+    by earlier fork builds: {"state": ..., "extract": ...} in either
+    SETTING_GENERATE or LEGACY_FORK_SETTING."""
+    if not isinstance(custom_settings, dict):
+        return None, None
+    state, extract = None, custom_settings.get(SETTING_EXTRACT) or None
+    for key in (LEGACY_FORK_SETTING, SETTING_GENERATE):   # the declared key wins
+        blob = custom_settings.get(key)
+        if not blob:
+            continue
+        try:
+            parsed = json.loads(blob) if isinstance(blob, str) else blob
+        except Exception:
+            _log(f"could not parse {key}; ignoring it")
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if EXTRACT_WRAPPER_KEY in parsed:
+            extract = parsed[EXTRACT_WRAPPER_KEY] or extract
+        elif "state" in parsed or "extract" in parsed:
+            state = parsed.get("state") or state
+            extract = parsed.get("extract") or extract
+        elif "rows" in parsed:
+            state = blob if isinstance(blob, str) else json.dumps(parsed)
+    if isinstance(extract, str):
+        try:
+            extract = json.loads(extract)
+        except Exception:
+            pass
+    return state, extract
 FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24   # matches plugin.py's own constant of the same name --
                                          # MiniMax H3's own default fps, used only to turn a
                                          # latent frame count into an estimated-seconds figure
@@ -213,24 +172,26 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
     return model_type.startswith("minimax_h3_ref2va")
 
 
+# Fork: RefMods on FL2VA (and finetunes built on it, e.g. VDN), and on the
+# FL2VA ControlNet-Union model, which is FL2VA plus a control branch. See the
+# "FL2VA support" section below for how mods reach a model with no reference
+# inputs of its own.
+FL2VA_REFMODS = True
+CONTROLNET_REFMODS = True
+
+
 def _fl2va_family_prefixes():
-    """Architectures that take RefMods through the FL2VA route: FL2VA itself
-    (and finetunes built on it, e.g. VDN) and, since fork.18, the FL2VA
-    ControlNet-Union model, which is FL2VA plus a control branch."""
     return ("minimax_h3_fl2va",) + (("minimax_h3_control",) if CONTROLNET_REFMODS else ())
 
 
 def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
-    """Models RefMods can be used with: Ref2VA, plus FL2VA, its finetunes
-    (e.g. VDN) and the FL2VA ControlNet model when FL2VA_REFMODS is on.
-    Resolves finetunes to their architecture exactly as is_minimax_h3_ref2va
-    does."""
+    """Models RefMods can be used with: Ref2VA, plus (fork) FL2VA, its
+    finetunes and the FL2VA ControlNet model. Resolves finetunes to their
+    architecture exactly as is_minimax_h3_ref2va does."""
     if is_minimax_h3_ref2va(model_type, get_base_model_type_fn):
         return True
-    if not FL2VA_REFMODS:
-        return False
     model_type = str(model_type or "")
-    if not model_type:
+    if not FL2VA_REFMODS or not model_type:
         return False
     if callable(get_base_model_type_fn):
         try:
@@ -242,51 +203,29 @@ def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> boo
     return model_type.startswith(_fl2va_family_prefixes())
 
 
-class _LatentStandIn:
-    """Shared by the picture and video stand-ins (fork.23). Wan2GP's own
-    helpers sometimes look at a reference before handing it on -- newer
-    builds, for one, check `.dtype` to decide whether a guide needs
-    converting to float -- and a stand-in that has no such attribute stops
-    the run with AttributeError. These answer from the stored latent, which
-    is already floating point, so such helpers pass the stand-in straight
-    through untouched to the hooks below."""
-    __slots__ = ()
+class _RefModImageSentinel:
+    """Stands in for a single-frame ("image kind") reference. Carries an
+    already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
+    __slots__ = ("latent", "hide_ref", "enc", "max_short", "label_first")
+
+    def __init__(self, latent: torch.Tensor):
+        self.latent = latent
+        self.hide_ref = False
+        self.enc = None   # presentation payload: dict or None
+        self.max_short = None     # fork: the row's "Max size" (short edge, px)
+        self.label_first = False  # fork: see STABLE_REFMOD_LABELS
 
     @property
     def dtype(self):
+        # Wan2GP's shared guide_to_float()/guide_to_dtype() helpers probe
+        # `.dtype` to decide whether a reference is a uint8 control guide
+        # that needs converting; reporting the latent's own (floating) dtype
+        # makes them treat a sentinel as an already-float tensor and hand it
+        # straight back untouched, instead of raising AttributeError.
         return self.latent.dtype
 
-    @property
-    def device(self):
-        return self.latent.device
 
-    def float(self):
-        return self   # already floating point; nothing to convert
-
-
-
-class _RefModImageSentinel(_LatentStandIn):
-    """Stands in for a single-frame ("image kind") reference. Carries an
-    already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "audio_latent",
-                 "mod", "still_index", "enc_strength", "max_short")
-
-    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None,
-                 audio_latent=None, mod=None, still_index=0, enc_strength=1.0):
-        self.latent = latent
-        self.hide_ref = False
-        self.audio_latent = audio_latent
-        self.preview_latent = latent if preview_latent is None else preview_latent
-        self.preview_key = preview_key
-        # What the text encoder is shown: picture `still_index` of `mod`'s
-        # encoder frames, softened to `enc_strength` (see _presentation_frames).
-        self.mod = mod
-        self.still_index = int(still_index)
-        self.enc_strength = float(enc_strength)
-        self.max_short = None   # the row's "Max size" (short edge, px), fork.19
-
-
-class _RefModVideoSentinel(_LatentStandIn):
+class _RefModVideoSentinel:
     """Stands in for a multi-frame ("video kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, T, H, W].
 
@@ -301,45 +240,39 @@ class _RefModVideoSentinel(_LatentStandIn):
     [C, T, H, W] shape derived from the latent's own dims (undoing the video
     VAE's causal 4:1 temporal compression and 16x spatial downsampling), not
     real pixel data (there is none for a RefMod)."""
-    __slots__ = ("latent", "hide_ref", "preview_latent", "preview_key", "rescale_to",
-                 "audio_latent", "mod", "enc_strength", "is_stack", "stack_mode", "stack_n",
-                 "enc_time_limit", "clip_mode", "clip_n", "max_short")
+    __slots__ = ("latent", "hide_ref", "enc", "is_stack", "max_short", "picture_encs")
 
-    def __init__(self, latent: torch.Tensor, preview_latent=None, preview_key=None,
-                 audio_latent=None, mod=None, enc_strength=1.0, is_stack=False,
-                 stack_mode=encframes.STACK_ALL, stack_n=encframes.STACK_DEFAULT_N):
+    def __init__(self, latent: torch.Tensor):
         self.latent = latent
         self.hide_ref = False
-        self.rescale_to = None
-        self.audio_latent = audio_latent
-        self.preview_latent = latent if preview_latent is None else preview_latent
-        self.preview_key = preview_key
-        self.mod = mod
-        self.enc_strength = float(enc_strength)
-        # A multi-picture mod sent as ONE video reference (the panel's "send as
-        # one video reference" option): its latent frames are separate
-        # pictures, not a clip -- shown to the encoder one picture per block,
-        # rebuilt per picture, and never trimmed by the reference-video budget.
-        self.is_stack = bool(is_stack)
-        self.stack_mode = stack_mode
-        self.stack_n = int(stack_n or encframes.STACK_DEFAULT_N)
-        self.enc_time_limit = None   # seconds of a clip still present after a budget trim
-        # How many of a clip's frames the encoder is shown (panel setting).
-        self.clip_mode = encframes.STACK_UP_TO_N
-        self.clip_n = encframes.MAX_CLIP_FRAMES_SHOWN
-        self.max_short = None   # the row's "Max size" (short edge, px), fork.19
+        self.enc = None   # presentation payload: dict or None
+        # Fork: a multi-picture mod sent as ONE video reference ("Send as one
+        # video"). Its latent frames are separate pictures, not footage: no
+        # duration, never trimmed by the reference-video budget, and split
+        # back into pictures where a video can't go.
+        self.is_stack = False
+        self.picture_encs = None  # fork: a stack's per-picture prompt entries
+        self.max_short = None     # fork: the row's "Max size" (short edge, px)
+
+    @property
+    def dtype(self):
+        # See _RefModImageSentinel.dtype. This one matters in practice: on
+        # image/single-frame output WanGP itself now folds the first
+        # reference video into the image references with
+        # guide_to_float(input_frames), which reads `.dtype` first.
+        return self.latent.dtype
 
     @property
     def shape(self):
-        h_px = self.latent.shape[3] * 16
-        w_px = self.latent.shape[4] * 16
         if self.is_stack:
-            # A stack of pictures has no duration. Report the shortest valid
-            # reference (5 frames) so Wan2GP's 15-second reference-video budget
-            # neither counts it as footage nor trims pictures off its end.
-            return (3, 5, h_px, w_px)
+            # Fork: pictures have no duration. Report the shortest valid
+            # reference (5 frames) so Wan2GP's 15-second reference-video
+            # budget neither counts a stack as footage nor trims it.
+            return (3, 5, self.latent.shape[3] * 16, self.latent.shape[4] * 16)
         t = self.latent.shape[2]
         t_px = (t - 1) * 4 + 1 if t > 1 else 1
+        h_px = self.latent.shape[3] * 16
+        w_px = self.latent.shape[4] * 16
         return (3, t_px, h_px, w_px)
 
     def __getitem__(self, key):
@@ -359,131 +292,14 @@ class _RefModVideoSentinel(_LatentStandIn):
             keep_t = max(1, (int(stop_px) - 1) // 4 + 1)
             if keep_t >= self.latent.shape[2]:
                 return self
-            # Carry this fork's extra fields across the trim: the preview
-            # latent/key, the attached soundtrack and any phase-2 rescale
-            # target would otherwise be dropped, silently losing a mod's
-            # audio the moment the budget kicks in.
-            same_length = (self.preview_latent is not None
-                           and self.preview_latent.shape[2] == self.latent.shape[2])
-            trimmed = _RefModVideoSentinel(
-                self.latent[:, :, :keep_t],
-                self.preview_latent[:, :, :keep_t] if same_length else self.preview_latent,
-                None if self.preview_key is None else tuple(self.preview_key) + ("trim", keep_t),
-                audio_latent=self.audio_latent, mod=self.mod, enc_strength=self.enc_strength)
+            trimmed = _RefModVideoSentinel(self.latent[:, :, :keep_t])
             trimmed.hide_ref = self.hide_ref
-            trimmed.rescale_to = self.rescale_to
-            trimmed.clip_mode, trimmed.clip_n = self.clip_mode, self.clip_n
+            # Fork: keep the prompt entry (only the frames still present) and
+            # the row's Max size across the trim.
+            trimmed.enc = _enc_trimmed(self.enc, ((keep_t - 1) * 4 + 1) / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
             trimmed.max_short = self.max_short
-            # The encoder is shown only what is left of the clip.
-            trimmed.enc_time_limit = (((keep_t - 1) * 4 + 1)
-                                      / float(FPS_ASSUMED_FOR_DURATION_ESTIMATE))
-            _log(f"reference-video budget: trimmed a video RefMod to {keep_t} of "
-                 f"{self.latent.shape[2]} latent frames to share Wan2GP's time budget")
             return trimmed
         raise TypeError(f"_RefModVideoSentinel supports only [:, :n] slicing, got {key!r}")
-
-
-def _video_sentinel_as_still(video, quiet=False):
-    """A video-kind RefMod as a one-picture reference: its first latent frame,
-    shown to the text encoder as its first stored frame."""
-    still = _RefModImageSentinel(
-        video.latent[:, :, :1],
-        None if video.preview_latent is None else video.preview_latent[:, :, :1],
-        None if video.preview_key is None else tuple(video.preview_key) + ("still",),
-        audio_latent=None, mod=video.mod, still_index=0, enc_strength=video.enc_strength)
-    still.hide_ref = video.hide_ref
-    still.max_short = getattr(video, "max_short", None)
-    if not quiet and not _VIDEO_AS_STILL_LOGGED["done"]:
-        _VIDEO_AS_STILL_LOGGED["done"] = True
-        _log("a video RefMod was handed to the picture path (image output); using its first frame "
-             "as a picture reference")
-    return still
-
-
-WINDOW_VIDEO_WHOLE, WINDOW_VIDEO_PICTURE, WINDOW_VIDEO_FIRST = "whole", "picture", "first"
-WINDOW_VIDEO_CHOICES = (WINDOW_VIDEO_WHOLE, WINDOW_VIDEO_PICTURE, WINDOW_VIDEO_FIRST)
-
-
-def _stack_as_pictures(stack):
-    """A picture stack sent as one video, split back into its pictures."""
-    pictures = []
-    for j in range(stack.latent.shape[2]):
-        still = _RefModImageSentinel(
-            stack.latent[:, :, j:j + 1],
-            None if stack.preview_latent is None or stack.preview_latent.shape[2] <= j
-            else stack.preview_latent[:, :, j:j + 1],
-            None if stack.preview_key is None else tuple(stack.preview_key) + ("pic", j),
-            audio_latent=None, mod=stack.mod, still_index=j, enc_strength=stack.enc_strength)
-        still.hide_ref = stack.hide_ref
-        still.max_short = getattr(stack, "max_short", None)
-        pictures.append(still)
-    return pictures
-
-
-def _reshape_video_mods(image_sentinels, video_sentinels, window_no=1, image_output=False,
-                        window_mode=WINDOW_VIDEO_WHOLE):
-    """Decide what each video-kind mod becomes for this generate() call
-    (fork.23). Returns new (image_sentinels, video_sentinels) lists; audio,
-    including a video mod's own soundtrack, is never touched.
-
-    * Image (single-frame) output: every video mod becomes pictures -- a clip
-      its first frame, a picture stack its pictures. Wan2GP itself only folds
-      the first reference video into the pictures there, so the rest would be
-      dropped.
-    * Sliding windows 2, 3, ... ("Video mods on later windows"):
-        whole   -- the clip again, as on window 1 (default; can show a few of
-                   its frames at the window boundary)
-        picture -- its first frame as a picture: keeps the identity, no clip
-                   frames to surface at the boundary
-        first   -- left out; the mod shapes window 1 only
-      Picture stacks are pictures, not footage, so they always stay whole.
-    """
-    if image_output:
-        pictures = list(image_sentinels)
-        for video in video_sentinels:
-            pictures += (_stack_as_pictures(video) if getattr(video, "is_stack", False)
-                         else [_video_sentinel_as_still(video)])
-        if video_sentinels:
-            _log(f"image output: {len(video_sentinels)} video mod(s) given as picture references")
-        return pictures, []
-    if window_no <= 1 or window_mode == WINDOW_VIDEO_WHOLE:
-        return list(image_sentinels), list(video_sentinels)
-    pictures, videos, changed = list(image_sentinels), [], 0
-    for video in video_sentinels:
-        if getattr(video, "is_stack", False):
-            videos.append(video)
-        elif window_mode == WINDOW_VIDEO_PICTURE:
-            pictures.append(_video_sentinel_as_still(video, quiet=True))
-            changed += 1
-        else:   # WINDOW_VIDEO_FIRST
-            changed += 1
-    if changed:
-        _log(f"window {window_no}: {changed} video mod(s) "
-             + ("given as their first frame" if window_mode == WINDOW_VIDEO_PICTURE else "left out")
-             + " (Video mods on later windows)")
-    return pictures, videos
-
-
-def _window_mode_requested(state_json) -> str:
-    try:
-        mode = str(json.loads(state_json).get("window_video") or WINDOW_VIDEO_WHOLE).lower()
-    except Exception:
-        return WINDOW_VIDEO_WHOLE
-    return mode if mode in WINDOW_VIDEO_CHOICES else WINDOW_VIDEO_WHOLE
-
-
-def _image_sentinel_as_clip(image):
-    """A picture RefMod on the video path: a one-picture stack."""
-    clip = _RefModVideoSentinel(
-        image.latent, image.preview_latent,
-        None if image.preview_key is None else tuple(image.preview_key) + ("clip",),
-        audio_latent=None, mod=image.mod, enc_strength=image.enc_strength, is_stack=True)
-    clip.hide_ref = image.hide_ref
-    clip.max_short = getattr(image, "max_short", None)
-    return clip
-
-
-_VIDEO_AS_STILL_LOGGED = {"done": False}
 
 
 class _RefModAudioSentinel:
@@ -504,11 +320,17 @@ class _RefModAudioSentinel:
     ``_prepare_audio_references`` itself to recognize this sentinel by
     ``isinstance`` *before* any of its tensor-vs-path logic runs sidesteps
     both problems -- see install_patches() below."""
-    __slots__ = ("latent", "hide_ref")
+    __slots__ = ("latent", "hide_ref", "enc")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
         self.hide_ref = False
+        self.enc = None   # presentation payload: dict or None
+
+    @property
+    def dtype(self):
+        # See _RefModImageSentinel.dtype.
+        return self.latent.dtype
 
 
 def _log(msg: str) -> None:
@@ -522,763 +344,15 @@ def _log(msg: str) -> None:
 # install_patches() so injection uses whatever exists and falls back to
 # direct injection for the rest.
 _generate_params = set()
-# Wan2GP passes native image refs / reference videos to *every* sliding window
-# (src_ref_images is set once in window 1 and reused for the rest), so RefMods
-# must be injected in every window too.
-INJECT_ON_EVERY_WINDOW = True
-
-# In windows 2+ the frame carried over from the previous window is added to the
-# prompt as an image BEFORE any reference, so it takes <Picture 1> and pushes
-# every reference's label up by one -- a prompt written for window 1 then points
-# at the wrong picture. Set this to True to insert RefMod images ahead of that
-# carried-over frame instead, keeping their labels identical in every window.
-# Only applied when the generation has no live reference images of its own.
-# On by default since fork.8: a prompt written once then means the same mod in
-# every window. (A multi-picture mod sent as one <Video N> -- the panel's
-# "send as one video reference" option -- isn't affected either way, because
-# the carried-over frame is a picture, not a video.)
-STABLE_REFMOD_LABELS = True
-
-# Escape hatch, OFF by default: when True, generations that inject RefMods fall
-# back to normal attention instead of Sol-Attn (attention mode "sol").
-#
-# It is off because the evidence doesn't implicate RefMods. The reported crash
-# ("Triton Error [CUDA]: an illegal memory access was encountered") came from
-# reduce_quantize_k, which takes only K and V -- it never sees the sink range,
-# the reference list, or anything else a RefMod changes. Sink blocks go only to
-# the separate forward kernel, and are range-checked in Python first, so a bad
-# sink raises ValueError rather than corrupting memory. The fault also surfaced
-# inside Triton's _init_handles while loading a kernel, which is where an
-# *earlier* async fault gets reported, so the named kernel is probably a
-# bystander. Turning Sol-Attn off costs real speed for every step.
-#
-# The one honest RefMod connection is token count: references lengthen the
-# sequence, and Sol-Attn only engages at >= SOL_ATTN_MIN_TOKENS (8192), with a
-# different inline-Q path above 4096 tokens. So adding RefMods can *start*
-# using Sol-Attn, or switch which path runs, on a generation that stayed below
-# those thresholds before. That's worth knowing if the crash tracks with adding
-# mods, but it points at the kernels, not at what this plugin feeds them.
-DISABLE_SOL_WITH_REFMODS = False
-
-_REFMODS_ACTIVE = {"on": False, "logged": False}
-
-# Give RefMods a <Picture N> / <Video N> / <Audio N> entry in the prompt, the
-# same as a live reference gets, so the model has something binding the
-# reference to the prompt. This is the core fix for "RefMods have no effect",
-# but it is also the only change here that alters what the model sees on an
-# ordinary single-phase run. Set it to False to get the published plugin's
-# prompt behaviour back, for an A/B.
-PROMPT_LABELS_FOR_REFMODS = True
-
-# An extraction job waiting to be picked up, for when Wan2GP drops the
-# custom_settings payload that carries it. Without this the extract task falls
-# through to generate() as an ordinary render -- i.e. it produces a video
-# instead of a mod. Consume-once and time-limited, so a stale job can never
-# hijack a later render.
-_PENDING_EXTRACT = {"spec": None, "at": 0.0}
-_PENDING_EXTRACT_TTL_SECONDS = 600.0
-
-
-def set_pending_extract(spec_json):
-    _PENDING_EXTRACT["spec"] = spec_json or None
-    _PENDING_EXTRACT["at"] = time.time() if spec_json else 0.0
-
-
-def _take_pending_extract():
-    """Pop a pending extraction job if one is fresh enough to still be ours."""
-    spec = _PENDING_EXTRACT.get("spec")
-    if not spec:
-        return None
-    age = time.time() - float(_PENDING_EXTRACT.get("at") or 0.0)
-    set_pending_extract(None)
-    if age > _PENDING_EXTRACT_TTL_SECONDS:
-        _log(f"ignoring a pending extraction job that is {age:.0f}s old -- too late to be "
-             f"this task; nothing was extracted")
-        return None
-    return spec
-
-
-# The inline panel's current selection, kept at module level so generate() can
-# fall back to it when a task reaches the pipeline without its custom_settings
-# payload (Wan2GP's settings/validation round-trip dropped it).
-_ARMED = {"json": None}
-
-
-def set_armed_selection(state_json, force=False):
-    """Remember the panel's selection as a fallback for a task that arrives
-    without its payload.
-
-    This used to LATCH -- a blank selection was ignored -- because Wan2GP's
-    form refreshes fire the pickers with empty values and would wipe it, and
-    at the time the fallback was the only thing making RefMods work at all.
-    That is no longer true: the payload is dropped only when the plugin's
-    custom setting doesn't fit Wan2GP's 5-setting limit, fixed by merging both
-    payloads into one key. Latching outlived its purpose and became a trap --
-    an empty panel kept injecting whatever was last selected, silently taking
-    reference slots from the generation's own references. Clearing the pickers
-    clears the selection again; `force` is kept for the explicit Clear button."""
-    _ARMED["json"] = state_json or None
-
-
-def _sync_armed_with_panel(stash):
-    """Make the fallback copy match the panel this form actually shows.
-
-    The armed selection is one server-wide value, while the panel's selection
-    lives in the browser session. A page reload (or a rebuilt panel) shows
-    empty slots without any picker firing a change, so the old value used to
-    survive -- and generate()'s fallback then injected mods the panel no
-    longer showed. Every time Wan2GP saves the form or builds a task for a
-    RefMod-capable model, the session's own selection (or its absence) now
-    overwrites it, so an empty panel always means no mods."""
-    if (_ARMED["json"] or None) != (stash or None):
-        _ARMED["json"] = stash or None
-        if not stash:
-            _log("the panel has no RefMods selected -- cleared the armed selection so none are "
-                 "injected")
-
-
-def _is_ref2va_pipeline(pipeline_self):
-    return bool(getattr(pipeline_self, "reference_mode", False)) and \
-        getattr(pipeline_self, "fixed_prompt", None) is None and \
-        not getattr(pipeline_self, "audio_only", False)
-
-
-_PREVIEW_CACHE = collections.OrderedDict()
-_PREVIEW_CACHE_MAX = 8
-# Caps on what is kept for the text encoder, per mod. Qwen3-VL resizes to its
-# own pixel budget anyway, so more than this is memory spent for nothing.
-_PREVIEW_MAX_PIXELS_IMAGE = 1 << 20   # ~1 MP for a single-frame mod
-_PREVIEW_MAX_PIXELS_VIDEO = 1 << 18   # ~0.26 MP per sampled video frame
-_PREVIEW_MAX_VIDEO_FRAMES = 8
-
-# Every sliding window is its own generate() call, so without these each window
-# re-read every mod off disk, re-ran the blur in weighted_latent(), and could
-# re-decode the prompt preview -- all of it identical work, and the decode also
-# made the offloader swap the VAE in and out again. Keyed by file mtime, so
-# re-extracting a mod under the same name still picks up the new file.
-# Two-phase generation renders phase 1 at a lower resolution, upscales the
-# latent, then runs phase 2 at the target resolution -- and it REBUILDS its
-# references for phase 2: every live image ref is re-prepared at the phase-2
-# size (_prepare_image_reference -> _encode_video) and every reference video is
-# re-resized to the target before being re-encoded. A RefMod is a stored latent,
-# so it alone stayed at its extraction resolution while keyframes and live refs
-# doubled, leaving it at the wrong spatial scale exactly when fine detail is
-# being added. With this True, RefMods are rebuilt for phase 2 the same way:
-# decode the stored latent, resize the pixels to the phase-2 reference size,
-# re-encode. Cached per mod per target size, so it costs one decode + one encode
-# per mod per session. Phase 1 is untouched -- its resolution is the token
-# budget you chose at extraction time.
-RESCALE_REFMODS_IN_PHASE_2 = False
-
-# (Kept as an opt-in experiment only -- see FIT_REFMODS_TO_PHASE_1_CANVAS
-# below, which is where the two-phase scale mismatch actually is.)
-#
-# Video mods are excluded by default. An image mod is one latent frame, so
-# rebuilding it costs a bounded amount. A video mod multiplies by every latent
-# frame: rebuilding a 68x38 mod to a 106x44 phase-2 size took it from ~10k to
-# ~19k reference tokens, on top of an already large phase-2 sequence -- and
-# attention cost grows with the square of the sequence, so phase 2 crawls. The
-# decode alone (every frame at full target resolution) is close to a gigabyte
-# of intermediates. A mod is supposed to have a fixed, small token cost; this
-# would throw that budget away. Turn it on only if you know the mod is short.
-RESCALE_REFMOD_VIDEOS_IN_PHASE_2 = False
-
-# Hard ceiling on a rebuild regardless of kind: if the phase-2 size would give
-# a mod more than this many times its stored token count, the rebuild is scaled
-# back to fit rather than skipped, so it still gains scale without the blowup.
-REFMOD_RESCALE_MAX_TOKEN_GROWTH = 2.0
-
-# The real two-phase mismatch is in phase 1, not phase 2. With two phases the
-# pipeline renders phase 1 at target / H3_TWO_PHASE_SCALE (half), and prepares
-# every live reference at that reduced size (pipeline.py: _add_image_reference
-# is called with the reduced width/height, and reference videos are resized to
-# it). A RefMod is a stored latent, so it alone stays at its extraction size --
-# oversized against a half-resolution canvas and against every live reference
-# next to it. Phase 2 then sees the mod at its stored scale, which is the same
-# configuration as a single-phase run at the target resolution, i.e. the case
-# that already works.
-#
-# So: shrink a mod to the phase-1 canvas when it is bigger than it, and never
-# grow one. Downscaling costs fewer reference tokens than the stored latent, so
-# phase 1 also gets slightly cheaper rather than more expensive.
-#
-# This applies ONLY when the run really has two phases (guide_phases > 1). A
-# single-phase run is also "phase 1" as far as the phase counter is concerned,
-# and mods must go in at their stored scale there -- that is the configuration
-# single-phase runs already work in.
-#
-# Fork.8 turned this off, reasoning that H3 tolerates references larger than
-# the canvas. That was untested, and Wan2GP itself sizes every live reference
-# to the phase-1 canvas, so fork.9 restores fork.7's behaviour as the default.
-FIT_REFMODS_TO_PHASE_1_CANVAS = True
-
-_RESCALE_CACHE = collections.OrderedDict()
-_RESCALE_CACHE_MAX = 16
-
-_MOD_CACHE = collections.OrderedDict()
-_MOD_CACHE_MAX = 8
-_WEIGHTED_CACHE = collections.OrderedDict()
-_WEIGHTED_CACHE_MAX = 16
-
-
-def _cache_put(cache, key, value, limit):
-    cache[key] = value
-    while len(cache) > limit:
-        cache.popitem(last=False)
-    return value
-
-
-def _latent_stamp(latent):
-    """Fallback identity for a mod whose file mtime can't be read."""
-    try:
-        return (tuple(latent.shape), round(float(latent.float().sum()), 4))
-    except Exception:
-        return None
-
-
-def _load_refmod_cached(name):
-    try:
-        stamp = os.path.getmtime(storage.mod_path(name) + ".safetensors")
-    except Exception:
-        stamp = None
-    key = (name, stamp)
-    mod = _MOD_CACHE.get(key)
-    if mod is None:
-        mod = _cache_put(_MOD_CACHE, key, storage.load_refmod(name), _MOD_CACHE_MAX)
-    else:
-        _MOD_CACHE.move_to_end(key)
-    # A readable mtime makes the preview cache stable across windows; without
-    # one, fall back to the latent's own fingerprint rather than giving up on
-    # caching (which would re-decode the preview on every single window).
-    mod._h3_preview_key = key if stamp is not None else (name, _latent_stamp(mod.latent))
-    return mod
-
-
-def _weighted_latent_cached(mod, strength, curve):
-    key = (getattr(mod, "_h3_preview_key", None), round(float(strength), 6),
-           tuple(curve) if isinstance(curve, (list, tuple)) else curve)
-    if key[0] is not None and key in _WEIGHTED_CACHE:
-        _WEIGHTED_CACHE.move_to_end(key)
-        return _WEIGHTED_CACHE[key]
-    latent = mod.weighted_latent(strength, curve=curve)
-    if key[0] is not None and latent is not None:
-        _cache_put(_WEIGHTED_CACHE, key, latent, _WEIGHTED_CACHE_MAX)
-    # Clone on the way out: at strength 1.0 weighted_latent() returns the mod's
-    # own stored tensor, and the mod is itself cached for the session now, so a
-    # single in-place write anywhere downstream would quietly corrupt the mod
-    # for every later generation -- which would look exactly like a face slowly
-    # degrading run after run. Latents are a few MB; this is cheap insurance.
-    return None if latent is None else latent.clone()
-
-
-def _preview_key(mod, kind, index):
-    base = getattr(mod, "_h3_preview_key", None)
-    return None if base is None else tuple(base) + (kind, index)
-
-
-def _decode_preview(pipeline_self, sentinel, kind="image", fps=None):
-    """Prompt-side preview frames for a RefMod, ready for _qwen_frames, plus
-    their timestamps (video only). Cached per mod.
-
-    Only the handful of frames the text encoder actually consumes are kept,
-    downscaled first: caching the whole decoded video meant hundreds of MB of
-    float32 per video mod held for the session, which is what pushed phase 2
-    into swapping on later windows. The encoder resizes to its own pixel budget
-    anyway (_visual_patches), so the detail was never used."""
-    key = getattr(sentinel, "preview_key", None)
-    cache_key = None if key is None else (key, kind, round(float(fps or 0.0), 3))
-    if cache_key is not None and cache_key in _PREVIEW_CACHE:
-        _PREVIEW_CACHE.move_to_end(cache_key)
-        return _PREVIEW_CACHE[cache_key]
-    from models.minimax_h3 import pipeline as h3_pipeline
-    _log(f"decoding a RefMod preview for the text encoder (once per mod per session; "
-         f"key={'ok' if cache_key is not None else 'UNCACHEABLE -- this will repeat every window'})")
-    decoded = pipeline_self.vae.decode(
-        sentinel.preview_latent.to(device=pipeline_self.device, dtype=torch.float32))
-    video = decoded.float().clamp(-1.0, 1.0)[0].cpu()
-    decoded = None
-    if kind == "image":
-        frames, timestamps, budget = video[:, :1].clone(), None, _PREVIEW_MAX_PIXELS_IMAGE
-    else:
-        rate = float(fps or FPS_ASSUMED_FOR_DURATION_ESTIMATE)
-        indices, cursor = [], 0.0
-        while round(cursor) < video.shape[1]:
-            if not indices or round(cursor) > indices[-1]:
-                indices.append(round(cursor))
-            cursor += rate / 2
-        if len(indices) > _PREVIEW_MAX_VIDEO_FRAMES:  # thin out evenly, keep the ends
-            step = (len(indices) - 1) / (_PREVIEW_MAX_VIDEO_FRAMES - 1)
-            indices = [indices[round(i * step)] for i in range(_PREVIEW_MAX_VIDEO_FRAMES)]
-        frames = video[:, indices].clone()
-        timestamps = [i / rate for i in indices]
-        budget = _PREVIEW_MAX_PIXELS_VIDEO
-    video = None
-    height, width = int(frames.shape[-2]), int(frames.shape[-1])
-    if height * width > budget:
-        shrink = (budget / float(height * width)) ** 0.5
-        frames = h3_pipeline._resize_video(frames, max(32, int(height * shrink) // 2 * 2),
-                                           max(32, int(width * shrink) // 2 * 2))
-    result = (h3_pipeline._qwen_frames(frames.contiguous()), timestamps)
-    frames = None
-    if cache_key is not None:
-        _cache_put(_PREVIEW_CACHE, cache_key, result, _PREVIEW_CACHE_MAX)
-    return result
-
-
-# ── Encoder frames (see encframes.py) ─────────────────────────────────────
-#
-# The pictures a mod is shown to the text encoder as. Taken from the mod file
-# when it stores them (no decode at all), otherwise decoded once per session
-# and kept here. Kept as uint8 at their stored size; softening, picking and
-# resizing happen per use, which is cheap.
-_ENC_CACHE = collections.OrderedDict()
-_ENC_CACHE_MAX = 16
-
-
-def _decode_cthw(pipeline_self, latent):
-    """VAE-decode a latent to [C, T, H, W] float in [-1, 1] on the CPU."""
-    decoded = pipeline_self.vae.decode(latent.to(device=pipeline_self.device, dtype=torch.float32))
-    video = decoded.float().clamp(-1.0, 1.0)[0].cpu()
-    decoded = None
-    return video
-
-
-def _cthw_to_thwc01(video):
-    return video.permute(1, 2, 3, 0).add(1.0).mul(0.5).clamp(0.0, 1.0)
-
-
-def decode_encoder_frames(pipeline_self, mod, fps=None):
-    """Decode a visual mod into its encoder frames: ([N, H, W, 3] float 0..1,
-    timestamps, fps, layout). Pictures (single or stacked) are decoded one
-    latent frame at a time, each on its own -- they were encoded separately, so
-    decoding them as one clip would smear them into each other. A video mod is
-    decoded as a clip and sampled at two frames a second."""
-    layout = mod.wanted_layout()
-    if layout == encframes.LAYOUT_STILLS:
-        pictures = []
-        for j in range(mod.latent.shape[2]):
-            video = _decode_cthw(pipeline_self, mod.latent[:, :, j:j + 1])
-            pictures.append(encframes.cap_pixels(_cthw_to_thwc01(video[:, :1]),
-                                                 encframes.MAX_PIXELS_STILL))
-            video = None
-        frames = torch.cat(pictures)
-        return frames, [float(j) for j in range(frames.shape[0])], encframes.ENC_FPS, layout
-    rate = float(fps or encframes.ENC_FPS)
-    video = _decode_cthw(pipeline_self, mod.latent)
-    indices, times = encframes.clip_picks(video.shape[1], rate)
-    frames = encframes.cap_pixels(_cthw_to_thwc01(video[:, indices]), encframes.MAX_PIXELS_CLIP)
-    video = None
-    return frames, times, rate, layout
-
-
-def _encoder_frames(pipeline_self, mod, fps=None):
-    """A mod's encoder frames as ([N, H, W, 3] uint8, timestamps, layout):
-    stored in the file when usable, else decoded once and cached."""
-    layout = mod.wanted_layout()
-    rate = None if layout == encframes.LAYOUT_STILLS else float(fps or encframes.ENC_FPS)
-    base = getattr(mod, "_h3_preview_key", None)
-    key = None if base is None else (base, layout, rate)
-    if key is not None and key in _ENC_CACHE:
-        _ENC_CACHE.move_to_end(key)
-        return _ENC_CACHE[key]
-    if mod.encoder_frames_usable(rate):
-        frames, times, how = mod.encoder_frames_uint8(), list(mod.enc_times), "stored in the mod"
-    else:
-        frames, times, _rate, _layout = decode_encoder_frames(pipeline_self, mod, rate)
-        frames = (frames * 255).round().clamp(0, 255).to(torch.uint8)
-        how = ("decoded (no stored frames -- Library > Encoder frames can store them)"
-               if not mod.has_encoder_frames() else
-               "decoded (the stored frames don't match how this mod is used here)")
-    _log(f"encoder frames for '{mod.name}': {frames.shape[0]} {layout} frame(s), {how}"
-         + ("" if key is not None else " -- uncacheable, this repeats every window"))
-    result = (frames, times, layout)
-    if key is not None:
-        _cache_put(_ENC_CACHE, key, result, _ENC_CACHE_MAX)
-    return result
-
-
-def _presentation_frames(pipeline_self, sentinel, kind, fps=None):
-    """What the text encoder is shown for a RefMod sentinel, ready for a
-    presentation item: (frames [N, H, W, 3] float 0..1, timestamps or None).
-
-      * a picture: that one picture
-      * a stack sent as one video: its pictures (all, or up to N), each
-        duplicated to fill a two-frame block on its own
-      * a clip: its two-a-second frames, thinned to 8 (and cut to what a
-        budget trim left)
-
-    Softened when the mod is used below strength 1, the same way its latent
-    is, so the encoder isn't shown a stronger reference than the DiT gets."""
-    mod = sentinel.mod
-    frames, times, layout = _encoder_frames(pipeline_self, mod, fps)
-    strength = float(getattr(sentinel, "enc_strength", 1.0))
-    if kind == "image":
-        index = min(int(getattr(sentinel, "still_index", 0)), frames.shape[0] - 1)
-        chosen = encframes.to_float01(frames[index:index + 1])
-        return encframes.soften(chosen, strength, mod.latent_h, mod.latent_w), None
-    if getattr(sentinel, "is_stack", False):
-        picks = encframes.stack_picks(frames.shape[0], sentinel.stack_mode, sentinel.stack_n)
-        chosen, stamps = encframes.stack_presentation(frames, picks)
-        return encframes.soften(encframes.to_float01(chosen), strength, mod.latent_h, mod.latent_w), stamps
-    keep = list(range(frames.shape[0]))
-    limit = getattr(sentinel, "enc_time_limit", None)
-    if limit is not None:
-        keep = [i for i in keep if times[i] < limit + 1e-6] or [0]
-    available = len(keep)
-    if getattr(sentinel, "clip_mode", encframes.STACK_UP_TO_N) != encframes.STACK_ALL:
-        limit_n = int(getattr(sentinel, "clip_n", encframes.MAX_CLIP_FRAMES_SHOWN) or 1)
-        keep = [keep[i] for i in encframes.thin_evenly(len(keep), max(1, limit_n))]
-    _log(f"'{mod.name}': text encoder shown {len(keep)} of {available} clip frame(s)")
-    chosen = encframes.to_float01(frames[keep])
-    return (encframes.soften(chosen, strength, mod.latent_h, mod.latent_w),
-            [float(times[i]) for i in keep])
-
-
-_VAE_SPATIAL_FACTOR = 16  # pixels per latent cell, both axes
-
-
-def _would_shrink(sentinel, kind, pipeline_self, target_width, target_height, relative):
-    """Resolve the size a live reference would get here, and report it only if
-    it is SMALLER than the mod's stored latent (never upscale). Cheap: works
-    from shapes, so nothing is decoded unless a rebuild is actually happening."""
-    try:
-        lat_h, lat_w = int(sentinel.latent.shape[-2]), int(sentinel.latent.shape[-1])
-        if kind == "image":
-            from models.minimax_h3 import pipeline as h3_pipeline
-            stored_w, stored_h = lat_w * _VAE_SPATIAL_FACTOR, lat_h * _VAE_SPATIAL_FACTOR
-            ratio = stored_w / max(1, stored_h)
-            budget = int(target_width) * int(target_height) * float(relative or 100.0) / 100.0
-            new_h, new_w = h3_pipeline._resolve_canvas(
-                stored_w, stored_h, math.sqrt(budget / max(ratio, 1 / ratio)))
-        else:
-            # fork.20: a video mod keeps its own shape (fitted to the canvas's
-            # pixel area) instead of being stretched to the canvas -- so
-            # phase 1 matches phase 2, where it is never stretched.
-            new_w, new_h = _fit_output_dims(sentinel.latent, target_width, target_height)
-            if new_w is None:
-                return None, None
-        if (new_h // _VAE_SPATIAL_FACTOR) * (new_w // _VAE_SPATIAL_FACTOR) >= lat_h * lat_w:
-            return None, None  # same size or larger -- leave the stored latent alone
-        return int(new_w), int(new_h)
-    except Exception:
-        return None, None
-
-
-def _fit_output_dims(latent, target_width, target_height):
-    """Size (width, height) in pixels that brings a mod down to the output's
-    pixel area, keeping its own aspect ratio -- or (None, None) when the mod
-    is already that size or smaller (never upscale)."""
-    try:
-        lat_h, lat_w = int(latent.shape[-2]), int(latent.shape[-1])
-        out_w, out_h = int(target_width), int(target_height)
-    except Exception:
-        return None, None
-    if out_w <= 0 or out_h <= 0 or lat_h <= 0 or lat_w <= 0:
-        return None, None
-    stored = lat_h * lat_w
-    canvas = (out_w / _VAE_SPATIAL_FACTOR) * (out_h / _VAE_SPATIAL_FACTOR)
-    if stored <= canvas:
-        return None, None
-    scale = math.sqrt(canvas / stored)
-    new_w = max(32, int(lat_w * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
-    new_h = max(32, int(lat_h * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
-    if (new_w // _VAE_SPATIAL_FACTOR) * (new_h // _VAE_SPATIAL_FACTOR) >= stored:
-        return None, None
-    return new_w, new_h
-
-
-def _dims_for_short_edge(latent, short_px):
-    """(width, height) in pixels that bring a mod's short edge down to
-    `short_px`, keeping its shape -- or (None, None) if it is already there
-    or smaller."""
-    try:
-        lat_h, lat_w = int(latent.shape[-2]), int(latent.shape[-1])
-        short_px = int(short_px)
-    except Exception:
-        return None, None
-    if short_px <= 0 or lat_h <= 0 or lat_w <= 0:
-        return None, None
-    stored_short = min(lat_h, lat_w) * _VAE_SPATIAL_FACTOR
-    if stored_short <= short_px:
-        return None, None
-    scale = short_px / float(stored_short)
-    new_w = max(32, int(lat_w * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
-    new_h = max(32, int(lat_h * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
-    if (new_w // _VAE_SPATIAL_FACTOR) * (new_h // _VAE_SPATIAL_FACTOR) >= lat_h * lat_w:
-        return None, None
-    return new_w, new_h
-
-
-PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF = "full", "tile", "off"
-PHASE2_MODS_CHOICES = (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF)
-
-
-def _phase_1_canvas(width, height):
-    """The half-size picture phase 1 of a two-phase run renders at
-    (pipeline.py: round(target / H3_TWO_PHASE_SCALE / 32) * 32)."""
-    try:
-        from models.minimax_h3 import pipeline as h3_pipeline
-        scale = float(getattr(h3_pipeline, "H3_TWO_PHASE_SCALE", 2.0))
-    except Exception:
-        scale = 2.0
-    return (max(32, round(int(width) / scale / 32) * 32),
-            max(32, round(int(height) / scale / 32) * 32))
-
-
-def _phase_2_tile(width, height):
-    """(width, height) of one tile of a tiled phase 2, or None."""
-    try:
-        from models.minimax_h3 import pipeline as h3_pipeline
-        return (int(h3_pipeline._spatial_tiles(int(width))[0][1]),
-                int(h3_pipeline._spatial_tiles(int(height))[0][1]))
-    except Exception:
-        return None
-
-
-def _shrink_target(pipeline_self, sentinel, latent, canvas_w, canvas_h, pass_no):
-    """The smallest of the sizes that apply to this mod on this pass, as
-    (width, height, reason), or None to leave `latent` as it is:
-      * its row's "Max size" (short edge in pixels),
-      * "Fit mods to the output size" -- the canvas of this pass,
-      * phase 1 of a two-phase run -- the half-size phase-1 canvas,
-      * "Mods in phase 2: Fit to tile" -- one tile of a tiled phase 2.
-    Only ever shrinks."""
-    candidates = []
-    cap = getattr(sentinel, "max_short", None)
-    if cap:
-        w, h = _dims_for_short_edge(latent, cap)
-        if w is not None:
-            candidates.append((w, h, f"max size {int(cap)}px"))
-    two_phase = bool(getattr(pipeline_self, "_h3_two_phase", False))
-    if canvas_w and canvas_h:
-        if getattr(pipeline_self, "_h3_fit_output", False):
-            w, h = _fit_output_dims(latent, canvas_w, canvas_h)
-            if w is not None:
-                candidates.append((w, h, "fit to output"))
-        if two_phase and pass_no == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS:
-            w, h = _fit_output_dims(latent, canvas_w, canvas_h)
-            if w is not None:
-                candidates.append((w, h, "phase-1 canvas"))
-        if (two_phase and pass_no == 2 and getattr(pipeline_self, "_h3_tiled_p2", False)
-                and getattr(pipeline_self, "_h3_p2_mode", PHASE2_MODS_FULL) == PHASE2_MODS_TILE):
-            tile = _phase_2_tile(canvas_w, canvas_h)
-            if tile:
-                w, h = _fit_output_dims(latent, tile[0], tile[1])
-                if w is not None:
-                    candidates.append((w, h, "phase-2 tile"))
-    if not candidates:
-        return None
-    return min(candidates, key=lambda c: c[0] * c[1])
-
-
-def _shrink_mod(pipeline_self, sentinel, kind, latent, canvas_w=None, canvas_h=None, pass_no=1):
-    """Rebuild a visual mod smaller when a size limit applies (see
-    _shrink_target). Uses the generation's own, already-loaded VAE: the
-    stored latent is decoded, resized and re-encoded once, then cached for
-    later windows and runs. Returns the rebuilt latent, or None to keep the
-    one given."""
-    if not canvas_w or not canvas_h:
-        canvas_w, canvas_h = getattr(pipeline_self, "_h3_out_size", (None, None))
-    target = _shrink_target(pipeline_self, sentinel, latent, canvas_w, canvas_h, pass_no)
-    if target is None:
-        return None
-    new_w, new_h, reason = target
-    rebuilt = _rescaled_refmod_latent(pipeline_self, sentinel, kind, target_width=new_w,
-                                      target_height=new_h, relative=100.0, force=True)
-    if rebuilt is not None:
-        if rebuilt.shape[-2] * rebuilt.shape[-1] >= latent.shape[-2] * latent.shape[-1]:
-            return None
-        name = getattr(getattr(sentinel, "mod", None), "name", "?")
-        _log(f"shrink ({reason}, pass {pass_no}): '{name}' ({kind}) "
-             f"{latent.shape[-1] * _VAE_SPATIAL_FACTOR}x{latent.shape[-2] * _VAE_SPATIAL_FACTOR} -> "
-             f"{rebuilt.shape[-1] * _VAE_SPATIAL_FACTOR}x{rebuilt.shape[-2] * _VAE_SPATIAL_FACTOR}px "
-             f"(~{100.0 * rebuilt.shape[-2] * rebuilt.shape[-1] / (latent.shape[-2] * latent.shape[-1]):.0f}% "
-             f"of its tokens)")
-    return rebuilt
-
-
-def _fit_to_output(pipeline_self, sentinel, kind, latent, target_width=None, target_height=None):
-    """fork.18 name, kept for anything calling it: the generic shrink."""
-    return _shrink_mod(pipeline_self, sentinel, kind, latent, target_width, target_height,
-                       _gen_state(pipeline_self)["phase"])
-
-
-def _capped_rescale_size(sentinel, kind, target_width, target_height):
-    """Shrink the requested phase-2 size until the rebuilt mod costs at most
-    REFMOD_RESCALE_MAX_TOKEN_GROWTH times its stored token count. Returns
-    (None, None) if there is nothing worth rebuilding."""
-    try:
-        stored_h, stored_w = int(sentinel.latent.shape[-2]), int(sentinel.latent.shape[-1])
-        want_h = max(1, int(target_height) // _VAE_SPATIAL_FACTOR)
-        want_w = max(1, int(target_width) // _VAE_SPATIAL_FACTOR)
-        growth = (want_h * want_w) / float(max(1, stored_h * stored_w))
-        if growth <= 1.0:
-            return None, None  # already at or above the phase-2 scale
-        cap = float(REFMOD_RESCALE_MAX_TOKEN_GROWTH)
-        if cap > 0 and growth > cap:
-            shrink = (cap / growth) ** 0.5
-            target_height = max(_VAE_SPATIAL_FACTOR,
-                                int(round(int(target_height) * shrink / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
-            target_width = max(_VAE_SPATIAL_FACTOR,
-                               int(round(int(target_width) * shrink / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
-            _log(f"phase 2: capping the {kind}-kind RefMod rebuild at {cap:g}x its stored token "
-                 f"count -- {target_width}x{target_height} instead of the full phase-2 size "
-                 f"(see REFMOD_RESCALE_MAX_TOKEN_GROWTH)")
-        return int(target_width), int(target_height)
-    except Exception:
-        return None, None
-
-
-def _rescaled_refmod_latent(pipeline_self, sentinel, kind, target_width=None,
-                            target_height=None, relative=100.0, force=False):
-    """Rebuild a RefMod at a given reference size, the way the pipeline rebuilds
-    a live reference: decode the stored latent, resize the pixels, re-encode.
-    force=True is the phase-1 downscale-to-canvas path; without it this is the
-    opt-in phase-2 upscale. Returns None to keep the stored latent."""
-    if not target_width or not target_height:
-        return None
-    if force and getattr(pipeline_self, "_h3_shrink_fast", False):
-        # "Shrink method: Fast" (fork.20): resize the stored latent itself.
-        return _resample_latent(sentinel.latent, target_width, target_height, kind)
-    if not force:
-        # phase-2 upscale path (opt-in)
-        if not RESCALE_REFMODS_IN_PHASE_2:
-            return None
-        if kind != "image" and not RESCALE_REFMOD_VIDEOS_IN_PHASE_2:
-            return None
-        target_width, target_height = _capped_rescale_size(sentinel, kind, target_width, target_height)
-        if target_width is None:
-            return None
-    try:
-        base = getattr(sentinel, "preview_key", None)
-        # The stored latent already has strength/curve baked in, so decode that
-        # one (not the unweighted preview) and stamp the cache with it.
-        stamp = _latent_stamp(sentinel.latent)
-        key = None if (base is None or stamp is None) else \
-            (base, stamp, kind, int(target_width), int(target_height), round(float(relative or 100.0), 3))
-        if key is not None and key in _RESCALE_CACHE:
-            _RESCALE_CACHE.move_to_end(key)
-            return _RESCALE_CACHE[key]
-        from models.minimax_h3 import pipeline as h3_pipeline
-        if getattr(sentinel, "is_stack", False):
-            # A stack's latent frames are separate pictures: rebuild each one
-            # on its own, as an image, never as frames of one clip.
-            parts = []
-            for j in range(sentinel.latent.shape[2]):
-                picture = _decode_cthw(pipeline_self, sentinel.latent[:, :, j:j + 1])[:, :1]
-                picture = h3_pipeline._resize_video(picture, int(target_height), int(target_width))
-                parts.append(pipeline_self._encode_video(picture))
-                picture = None
-            latent = torch.cat(parts, dim=2)
-            _log(f"phase {_gen_state(pipeline_self)['phase']}: rebuilt a {latent.shape[2]}-picture "
-                 f"stack at latent {tuple(latent.shape[-2:])} "
-                 f"(was {tuple(sentinel.latent.shape[-2:])})")
-            if key is not None:
-                _cache_put(_RESCALE_CACHE, key, latent, _RESCALE_CACHE_MAX)
-            return latent
-        decoded = pipeline_self.vae.decode(
-            sentinel.latent.to(device=pipeline_self.device, dtype=torch.float32))
-        video = decoded.float().clamp(-1.0, 1.0)[0].cpu()
-        decoded = None
-        if kind == "image":
-            # _prepare_image_reference -> _to_pil already takes a CTHW float
-            # tensor in [-1, 1] and does the byte conversion itself.
-            pixels = pipeline_self._prepare_image_reference(
-                video[:, :1].clone(), target_width, target_height, relative)
-        else:
-            pixels = h3_pipeline._resize_video(video.clone(), int(target_height), int(target_width))
-        if pixels is None:
-            return None
-        video = None
-        latent = pipeline_self._encode_video(pixels)
-        _log(f"phase {_gen_state(pipeline_self)['phase']}: rebuilt a {kind}-kind RefMod at "
-             f"{tuple(pixels.shape[-2:])} -> latent {tuple(latent.shape[-2:])} "
-             f"(was {tuple(sentinel.latent.shape[-2:])} in latent space)")
-        pixels = None
-        if key is not None:
-            _cache_put(_RESCALE_CACHE, key, latent, _RESCALE_CACHE_MAX)
-        return latent
-    except Exception:
-        _log("could not rebuild a RefMod at this size; using its stored latent as before:\n"
-             + traceback.format_exc())
-        return None
-
-
-def _resample_latent(latent, target_width, target_height, kind=""):
-    """Shrink a stored latent to (width, height) pixels by averaging latent
-    cells -- spatial axes only (time and the 24 channels untouched), both axes
-    even for the DiT's 2x2 patches, never enlarged. No VAE is involved, so it
-    is near-instant and needs no model swap, but averaging latent cells is
-    rougher than decoding, resizing the pixels and re-encoding."""
-    try:
-        lat_t, lat_h, lat_w = int(latent.shape[2]), int(latent.shape[-2]), int(latent.shape[-1])
-        new_h = max(2, (int(target_height) // _VAE_SPATIAL_FACTOR) // 2 * 2)
-        new_w = max(2, (int(target_width) // _VAE_SPATIAL_FACTOR) // 2 * 2)
-        if new_h * new_w >= lat_h * lat_w or new_h > lat_h or new_w > lat_w:
-            return None
-        out = F.interpolate(latent.float(), size=(lat_t, new_h, new_w), mode="area")
-        _log(f"fast shrink: {kind}-kind RefMod latent {lat_h}x{lat_w} -> {new_h}x{new_w} cells "
-             f"(resampled, not re-encoded)")
-        return out.to(latent.dtype)
-    except Exception:
-        _log("fast shrink failed; keeping the stored latent:\n" + traceback.format_exc())
-        return None
-
-
-def _log_label(pipeline_self, presentation, entry, label):
-    """Report which <Picture N> / <Video N> the text encoder will give this
-    RefMod, per window -- the numbering shifts between windows (see
-    STABLE_REFMOD_LABELS), so this is what to compare across windows."""
-    try:
-        seen = 0
-        for item in presentation:
-            if item.get("type") == entry["type"]:
-                seen += 1
-            if item is entry:
-                break
-        _log(f"window {int(getattr(pipeline_self, '_h3_window_no', 1) or 1)}: "
-             f"RefMod bound to <{label} {seen}>")
-    except Exception:
-        pass
-
-
-def _present_refmod(pipeline_self, presentation, kind, sentinel, fps=None):
-    """Give a RefMod the same text-side entry a live reference gets, so the
-    Qwen3-VL prompt contains '<Picture N>: [image]' / '<Video N>: ...' for it.
-    Without this the latent sits in the sequence with no label binding it to
-    the prompt, and the model largely ignores it."""
-    if presentation is None or not PROMPT_LABELS_FOR_REFMODS \
-            or getattr(pipeline_self, "fixed_prompt", None) is not None:
-        return
-    try:
-        if getattr(sentinel, "mod", None) is not None:
-            frames, timestamps = _presentation_frames(pipeline_self, sentinel, kind, fps)
-        else:
-            frames, timestamps = _decode_preview(pipeline_self, sentinel, kind, fps)
-        if kind == "image":
-            entry = {"type": "image", "frames": frames}
-            window_no = int(getattr(pipeline_self, "_h3_window_no", 1) or 1)
-            live_refs = int(getattr(pipeline_self, "_h3_live_image_refs", 0) or 0)
-            at = None
-            if STABLE_REFMOD_LABELS and window_no > 1 and live_refs == 0:
-                # put it ahead of the carried-over frame added by the keyframes
-                at = next((i for i, item in enumerate(presentation)
-                           if item.get("type") == "image"), None)
-            if at is None:
-                presentation.append(entry)
-            else:
-                presentation.insert(at, entry)
-            _log_label(pipeline_self, presentation, entry, "Picture")
-            return
-        entry = {"type": "video", "frames": frames, "timestamps": timestamps}
-        presentation.append(entry)
-        _log_label(pipeline_self, presentation, entry, "Video")
-    except Exception:
-        _log(f"could not build the prompt-side preview for a {kind}-kind RefMod; it is still "
-             f"injected, but without a label the model may ignore it:\n" + traceback.format_exc())
 
 
 _STATE_ATTR = "_h3refmod_gen_state"
+
+# The pipeline currently inside generate(). _resize_video is a module-level
+# helper with no `self`, so this is how the video path reaches that call's
+# bookkeeping. Generation is single-threaded per pipeline, so one slot is
+# enough; it is only ever read, never trusted to exist.
+_ACTIVE = {"pipeline": None}
 
 # Wan2GP's own native reference caps, enforced inline in generate() between
 # the reference-building loop and the point where `refs` is read. They are a
@@ -1287,6 +361,7 @@ _STATE_ATTR = "_h3refmod_gen_state"
 # <Picture N> labels, and the ComfyUI community verified 15 image refs
 # working. RefMods are kept out of this check -- live references are not.
 _NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 3, 3
+
 
 def _reset_gen_state(pipeline_self) -> dict:
     """Fresh per-generate() bookkeeping. Called at the top of every
@@ -1375,7 +450,7 @@ def _restore_hidden_refs(pipeline_self, visual_latents, audio_latents) -> None:
                  f"{len(state['overflow_audio'])} audio beyond its two native slots each")
     elif not state["phase2_overflow_done"] and state["overflow_visual"]:
         state["phase2_overflow_done"] = True
-        if _phase2_mods_off(pipeline_self):
+        if _phase2_mods_off(pipeline_self):   # fork: "Mods in phase 2: Off"
             return
         refs2 = state["refs2"]
         if refs2 is None:
@@ -1406,7 +481,6 @@ def _count_refmod_visual_refs(state_json: str) -> int:
     except Exception:
         return 0
     total = 0
-    stack_as_video = bool(state.get("stack_as_video", False))
     for row in state.get("rows") or []:
         name = row.get("mod")
         strength = float(row.get("strength", 1.0) or 0)
@@ -1418,10 +492,12 @@ def _count_refmod_visual_refs(state_json: str) -> int:
             continue
         kind = meta.get("kind", "image")
         latent_t = max(1, int(meta.get("latent_t", 1)))
+        # Fork: a picture stack (including one saved as "video" by ComfyUI)
+        # is pictures -- unless the row sends it as one video reference.
         pictures = kind == "image" or core.is_still_stack(kind, latent_t, meta.get("tags"),
                                                           meta.get("source", ""))
-        if pictures and bool(row.get("as_video", stack_as_video)) and latent_t > 1:
-            total += 1   # the whole stack is one video reference
+        if pictures and row.get("as_video") and latent_t > 1:
+            total += 1
         elif pictures:
             total += latent_t * copies
         elif kind == "video":
@@ -1451,10 +527,13 @@ def _install_model_def_patch() -> None:
     like it worked -- no error anywhere -- generate() just silently runs a
     completely normal render instead of seeing our payload).
 
-    This adds one plain "text" custom setting (id SETTING_COMBINED, holding
-    both the selection and any extraction job) to MiniMax H3's model
-    definition. Since fork.12 it is hidden on Wan2GP's Media Generator form
-    (see HIDDEN_SETTING_FLAG); it still travels with every task.
+    This adds two plain "text" custom settings (ids ``h3_refmod_state`` /
+    ``h3_refmod_extract``, matching the SETTING_GENERATE / SETTING_EXTRACT
+    keys above) to MiniMax H3 Ref2VA's model definition. They will show up
+    as two extra (normally empty) text boxes under "Custom Settings" on
+    Wan2GP's own Media Generator form for this model -- harmless, and not
+    meant to be hand-edited there; this plugin's own Generate/Extract
+    buttons fill them in on submission.
     """
     try:
         from models.minimax_h3 import minimax_h3_handler
@@ -1469,16 +548,21 @@ def _install_model_def_patch() -> None:
 
     _orig_query_model_def = FamilyHandler.query_model_def
 
+    # ONE declared slot, not two. Wan2GP keeps only the first
+    # CUSTOM_SETTINGS_MAX (5) custom settings of a model
+    # (get_model_custom_settings truncates with `custom_settings[:MAX]`), and
+    # MiniMax H3 Ref2VA now declares four of its own (Mask Denoising Mode,
+    # Audio Refinement, plus the two excerpt-position settings). Declaring two
+    # here made six, so the last one -- the extraction job -- was silently
+    # dropped and an extraction ran as an ordinary generation instead.
+    # Extraction jobs now travel inside this same slot (see EXTRACT_WRAPPER_KEY).
     extra_settings = [
-        # Hidden on the form: Wan2GP shows a custom setting only when the
-        # video prompt type contains one of the letters in "video_prompt_type",
-        # and this one never appears in it. The setting still exists, so the
-        # selection still travels with every task, queue entry and saved
-        # settings file -- it just no longer shows up as a text box nobody is
-        # meant to touch.
-        {"id": SETTING_COMBINED, "name": "H3RefMod",
-         "label": "RefMods (managed by the MiniMax H3 RefMods plugin)",
-         "type": "text", "default": "", "video_prompt_type": HIDDEN_SETTING_FLAG},
+        {"id": SETTING_GENERATE, "name": "H3RefModState",
+         "label": "RefMods selection (managed by the MiniMax H3 RefMods plugin -- leave blank)",
+         "type": "text", "default": "",
+         # Fork: hidden on the Media Generator form (see HIDDEN_SETTING_FLAG);
+         # it still travels with every task.
+         "video_prompt_type": HIDDEN_SETTING_FLAG},
     ]
 
     @staticmethod
@@ -1489,18 +573,19 @@ def _install_model_def_patch() -> None:
             existing = list(existing) if isinstance(existing, list) else []
             existing_ids = {e.get("id") for e in existing if isinstance(e, dict)}
             merged = existing + [s for s in extra_settings if s["id"] not in existing_ids]
-            if len(merged) > CUSTOM_SETTINGS_MAX_ASSUMED:
-                _log(f"WARNING: {base_model_type} declares {len(existing)} custom settings and "
-                     f"Wan2GP keeps only the first {CUSTOM_SETTINGS_MAX_ASSUMED}, so the plugin's "
-                     f"setting is being dropped. RefMods will rely on the in-memory fallbacks; "
-                     f"extraction and mod selection may be unreliable.")
             result["custom_settings"] = merged
+            # Loud warning rather than another silent drop if Wan2GP ever
+            # declares enough of its own settings to push ours past the cap.
+            if len(merged) > _CUSTOM_SETTINGS_MAX_GUESS and not getattr(patched_query_model_def, "_warned", False):
+                patched_query_model_def._warned = True
+                _log(f"warning: this model declares {len(merged)} custom settings and Wan2GP keeps "
+                     f"only the first {_CUSTOM_SETTINGS_MAX_GUESS}; RefMods may be ignored. "
+                     f"Please report this -- the plugin needs to claim its slot differently.")
         return result
 
     FamilyHandler.query_model_def = patched_query_model_def
     setattr(FamilyHandler, _MODEL_DEF_PATCH_MARKER, True)
-    _log(f"declared the {SETTING_COMBINED} custom setting on MiniMax H3's model definition "
-         f"(one slot, so it fits inside Wan2GP's limit of {CUSTOM_SETTINGS_MAX_ASSUMED})")
+    _log("declared the h3_refmod_state custom setting on MiniMax H3's model definition")
 
     if getattr(FamilyHandler, _VALIDATE_PATCH_MARKER, False):
         return
@@ -1511,14 +596,6 @@ def _install_model_def_patch() -> None:
     @staticmethod
     def patched_validate_generative_settings(base_model_type, model_def, inputs):
         error = _orig_validate(base_model_type, model_def, inputs)
-        try:
-            if _ARMED["json"] and is_minimax_h3_refmod_capable(base_model_type):
-                attached = bool(unpack_refmod_setting(inputs.get("custom_settings"))[0])
-                _log("task submission: RefMod selection " + ("attached to the task." if attached else
-                     "NOT in the task's custom_settings -- generate() will re-apply the inline "
-                     "panel's selection."))
-        except Exception:
-            pass
         # Wan2GP's own pre-flight check (called before pipeline.generate() ever
         # runs) only counts *native* image_refs/video_guide fields -- it has no
         # visibility into RefMods, which only turn into visual references much
@@ -1528,10 +605,7 @@ def _install_model_def_patch() -> None:
         # if RefMods would supply enough visual references to satisfy it, clear
         # it; every other check the original function performs is untouched.
         if error and _INSUFFICIENT_VISUAL_MARKER in error:
-            # The selection travels in the combined setting (SETTING_COMBINED);
-            # reading the old SETTING_GENERATE key here always came back empty.
-            state_json = unpack_refmod_setting(inputs.get("custom_settings"))[0]
-            state_json = state_json or _ARMED["json"]
+            state_json = read_refmod_payload(inputs.get("custom_settings"))[0]
             if state_json:
                 refmod_visual_count = _count_refmod_visual_refs(state_json)
                 if refmod_visual_count > 0:
@@ -1585,62 +659,49 @@ def install_patches() -> Optional[str]:
         _generate_params.update(_inspect.signature(_orig_generate).parameters)
     except Exception:
         pass
-    _log(f"Wan2GP reference slots: "
-         f"{3 if 'input_frames3' in _generate_params else 2} video / "
-         f"{3 if 'audio_guide3' in _generate_params else 2} audio")
     _orig_as_video = getattr(h3_pipeline, "_as_video", None)
 
     @functools.wraps(_orig_add_image_reference)
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
-        if isinstance(image, _RefModVideoSentinel):
-            # Image (single-frame) output folds the reference video into the
-            # reference images (pipeline.py: "if image_outputs and
-            # video_references"). A moving reference means nothing for one
-            # frame, so the mod's first frame is used as a picture.
-            image = _video_sentinel_as_still(image)
         if isinstance(image, _RefModImageSentinel):
-            latent = image.latent
-            if _gen_state(self)["phase"] == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS \
-                    and getattr(self, "_h3_two_phase", False):
-                fit_w, fit_h = _would_shrink(image, "image", self, target_width, target_height,
-                                             image_refs_relative_size)
-                if fit_w is not None:
-                    # relative=100 on purpose: _would_shrink already applied
-                    # image_refs_relative_size when resolving fit_w/fit_h, and
-                    # _prepare_image_reference would otherwise apply it a
-                    # second time and shrink the mod twice.
-                    rebuilt = _rescaled_refmod_latent(self, image, "image", target_width=fit_w,
-                                                      target_height=fit_h, relative=100.0,
-                                                      force=True)
-                    if rebuilt is not None:
-                        latent = rebuilt
-            if _gen_state(self)["phase"] == 2:
-                # NB: explicit "is not None" -- `rebuilt or latent` calls bool()
-                # on a tensor, which raises "Boolean value of Tensor with more
-                # than one value is ambiguous".
-                rebuilt = _rescaled_refmod_latent(self, image, "image", target_width=target_width,
-                                                  target_height=target_height,
-                                                  relative=image_refs_relative_size)
-                if rebuilt is not None:
-                    latent = rebuilt
+            latent = (_fit_latent_to_canvas(image.latent, target_width, target_height,
+                                            image_refs_relative_size, "image RefMod")
+                      if _should_fit(self, target_width, target_height) else image.latent)
             if _phase2_mods_off(self):
-                # "Mods in phase 2: Off" -- the label stays in the prompt so
-                # the numbering is unchanged, but no reference rows go in.
-                _present_refmod(self, presentation, "image", image)
+                # Fork, "Mods in phase 2: Off": the label stays in the prompt
+                # so the numbering is unchanged, but no reference rows go in.
+                _present_refmod(presentation, image)
                 return
-            fitted = _shrink_mod(self, image, "image", latent, target_width, target_height,
-                                 _gen_state(self)["phase"])
-            if fitted is not None:
-                latent = fitted
+            latent = _apply_size_limits(self, image, "image", latent, target_width, target_height)
+            _present_refmod(presentation, image)
             visual_latents.append(latent)
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
-            _present_refmod(self, presentation, "image", image)
-            # An image mod's soundtrack is handled in _inject_refmods via the
-            # overflow-audio path: the packer's image branch has no audio rows
-            # (unlike its video branch), and _add_image_reference isn't even
-            # given audio_latents to append to.
+            return
+        if isinstance(image, _RefModVideoSentinel):
+            # A video-kind RefMod arriving on the *image* reference path. This
+            # plugin never puts one there -- something else moved it, e.g. the
+            # MiniMax H3 Image Mode plugin, which folds reference videos into
+            # reference images for single-frame (text-to-image) output, where a
+            # moving reference has no meaning. Passing it through to the
+            # original would crash in _to_pil ("int() argument must be ... not
+            # '_RefModVideoSentinel'"), so use the clip's first frame as a
+            # still image reference instead -- a valid single-frame latent, and
+            # the closest thing to what was asked for.
+            latent = (_fit_latent_to_canvas(image.latent[:, :, :1], target_width, target_height,
+                                            image_refs_relative_size, "video RefMod (as still)")
+                      if _should_fit(self, target_width, target_height) else image.latent[:, :, :1])
+            image.enc = _enc_as_still(image.enc)  # one still latent -> "<Picture N>", not "<Video N>"
+            latent = _apply_size_limits(self, image, "image", latent, target_width, target_height)  # fork
+            _present_refmod(presentation, image)
+            visual_latents.append(latent)
+            _place_refmod_ref(self, image, refs,
+                              {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+            if not getattr(patched_add_image_reference, "_warned_video_as_image", False):
+                patched_add_image_reference._warned_video_as_image = True
+                _log("a video-kind RefMod was handed to the image-reference path (image/"
+                     "single-frame output mode); using its first frame as a still reference.")
             return
         _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
@@ -1649,60 +710,26 @@ def install_patches() -> Optional[str]:
     @functools.wraps(_orig_add_video_reference)
     def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
         if isinstance(video, _RefModImageSentinel):
-            # Not routed this way by this plugin, but another one could: a
-            # picture on the video path is the one-frame clip it already is.
-            video = _image_sentinel_as_clip(video)
-        if isinstance(video, _RefModVideoSentinel):
+            # Symmetric guard: a still RefMod on the video path is simply a
+            # one-frame clip, which is a valid video latent.
             latent = video.latent
-            if _gen_state(self)["phase"] == 1 and FIT_REFMODS_TO_PHASE_1_CANVAS \
-                    and getattr(self, "_h3_two_phase", False) \
-                    and getattr(video, "rescale_to", None):
-                height, width = video.rescale_to
-                fit_w, fit_h = _would_shrink(video, "video", self, width, height, None)
-                if fit_w is not None:
-                    rebuilt = _rescaled_refmod_latent(self, video, "video", target_width=fit_w,
-                                                      target_height=fit_h, force=True)
-                    if rebuilt is not None:
-                        latent = rebuilt
-            if _gen_state(self)["phase"] == 2 and getattr(video, "rescale_to", None):
-                height, width = video.rescale_to
-                rebuilt = _rescaled_refmod_latent(self, video, "video", target_width=width,
-                                                  target_height=height)
-                if rebuilt is not None:
-                    latent = rebuilt
-            if _phase2_mods_off(self):
-                _present_refmod(self, presentation, "video", video, fps)
-                return
-            fit_h, fit_w = getattr(video, "rescale_to", None) or (None, None)
-            fitted = _shrink_mod(self, video, "video", latent, fit_w, fit_h, _gen_state(self)["phase"])
-            if fitted is not None:
-                latent = fitted
-            # A mod can carry its own soundtrack. H3 handles this natively:
-            # a reference video with audio is tagged "video_audio" with
-            # ref_audio_t set, and the packer gives it audio rows as well as
-            # video rows. Order matters -- upstream appends the audio latent
-            # and its presentation entry BEFORE the video ones, and the packer
-            # lays each reference's audio rows out ahead of its video rows.
-            attached_audio = getattr(video, "audio_latent", None)
-            merged = (attached_audio is not None and not ATTACHED_AUDIO_AS_SEPARATE_REF
-                      and isinstance(audio_latents, list))
-            if merged:
-                # H3's own shape for a reference video's soundtrack: the audio
-                # latent and its label go in BEFORE the video's, and the packer
-                # lays each reference's audio rows ahead of its video rows.
-                audio_latents.append(attached_audio)
-                if PROMPT_LABELS_FOR_REFMODS and presentation is not None:
-                    presentation.append({"type": "audio"})
-                _log(f"video RefMod carries its own soundtrack "
-                     f"({attached_audio.shape[-1]} audio latents), merged as a video_audio "
-                     f"reference")
+            _present_refmod(presentation, video)
             visual_latents.append(latent)
             _place_refmod_ref(self, video, refs,
-                              {"kind": "video_audio" if merged else "video",
-                               "latent_t": latent.shape[2],
-                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1],
-                               "ref_audio_t": attached_audio.shape[-1] if merged else 0})
-            _present_refmod(self, presentation, "video", video, fps)
+                              {"kind": "video", "latent_t": latent.shape[2],
+                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
+            return
+        if isinstance(video, _RefModVideoSentinel):
+            if _phase2_mods_off(self):   # fork, "Mods in phase 2: Off" (see the image hook)
+                _present_refmod(presentation, video)
+                return
+            latent = _apply_size_limits(self, video, "video", video.latent,
+                                        *_pass_canvas(self, _gen_state(self)["phase"]))  # fork
+            _present_refmod(presentation, video)
+            visual_latents.append(latent)
+            _place_refmod_ref(self, video, refs,
+                              {"kind": "video", "latent_t": latent.shape[2],
+                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
             return
         _note_refs(self, refs)
         return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs)
@@ -1724,11 +751,10 @@ def install_patches() -> Optional[str]:
         def patched_add_audio_reference(self, waveform, presentation, audio_latents, refs):
             if isinstance(waveform, _RefModAudioSentinel):
                 latent = waveform.latent
+                _present_refmod(presentation, waveform)
                 audio_latents.append(latent)
                 _place_refmod_ref(self, waveform, refs,
                                   {"kind": "audio", "ref_audio_t": latent.shape[-1]})
-                if PROMPT_LABELS_FOR_REFMODS:
-                    presentation.append({"type": "audio"})
                 return
             _note_refs(self, refs)
             return _orig_add_audio_reference(self, waveform, presentation, audio_latents, refs)
@@ -1738,38 +764,11 @@ def install_patches() -> Optional[str]:
              "to patch; audio-kind RefMods will not be available (image and video RefMods are "
              "unaffected). This Wan2GP build may not support direct audio references yet.")
 
-    _orig_encode_prompt = getattr(Pipeline, "_encode_prompt", None)
-    if _orig_encode_prompt is not None:
-        @functools.wraps(_orig_encode_prompt)
-        def patched_encode_prompt(self, prompt, presentation, *args, **kwargs):
-            # FL2VA builds its presentation from keyframes only. Append the
-            # staged RefMod labels so an audio mod arrives as "<Audio 1>: "
-            # rather than as an unannounced block of audio rows.
-            if _FL2VA["active"] and _FL2VA.get("presentation") and isinstance(presentation, list):
-                presentation.extend(_FL2VA["presentation"])
-                _log(f"FL2VA: added {len(_FL2VA['presentation'])} RefMod label(s) to the prompt "
-                     f"(FL2VA_PROMPT_LABELS={FL2VA_PROMPT_LABELS!r})")
-            return _orig_encode_prompt(self, prompt, presentation, *args, **kwargs)
-        Pipeline._encode_prompt = patched_encode_prompt
-
     _orig_prepare_condition_rows = getattr(Pipeline, "_prepare_condition_rows", None)
     if _orig_prepare_condition_rows is not None:
         @functools.wraps(_orig_prepare_condition_rows)
         def patched_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs):
-            if _FL2VA["active"] and not getattr(self, "reference_mode", False) \
-                    and isinstance(visual_latents, list):
-                # Read the phase before _restore_hidden_refs advances it. Audio
-                # only on the first pass: both phase-2 paths pass a throwaway
-                # [] for audio and keep phase 1's audio rows, so appending
-                # there would only consume generator randomness.
-                first_pass = _FL2VA["calls"] == 0
-                _FL2VA["calls"] += 1
-                # The first call builds phase 1 (or the only pass); any later
-                # call is phase 2, which gets its own sized copy of the mods.
-                _FL2VA["pass_no"] = 1 if first_pass else 2
-                visual_latents.extend(_FL2VA["visual"] if first_pass else _FL2VA["visual2"])
-                if first_pass and isinstance(audio_latents, list):
-                    audio_latents.extend(_FL2VA["audio"])
+            _append_fl2va_rows(self, visual_latents, audio_latents)   # fork: FL2VA RefMods
             _restore_hidden_refs(self, visual_latents, audio_latents)
             return _orig_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs)
         Pipeline._prepare_condition_rows = patched_prepare_condition_rows
@@ -1777,26 +776,6 @@ def install_patches() -> Optional[str]:
         _log("no _prepare_condition_rows found on MiniMaxH3Pipeline -- RefMod references will be "
              "added immediately instead of after Wan2GP's own reference-count check, so the "
              "native 9-image / 2-video / 2-audio caps will still apply to RefMods on this build.")
-
-    _orig_prepare_control_rows = getattr(Pipeline, "_prepare_control_rows", None)
-    if _orig_prepare_control_rows is not None and CONTROLNET_REFMODS:
-        @functools.wraps(_orig_prepare_control_rows)
-        def patched_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
-                                         height, width, condition_latents, *args, **kwargs):
-            # ControlNet: the control rows carry one blank row for every
-            # condition row ahead of the video. They are built before the
-            # FL2VA mods are appended (in _prepare_condition_rows), so count
-            # the mods in here as well, or the row counts won't match.
-            if _FL2VA["active"] and _FL2VA["visual"] and isinstance(condition_latents, (list, tuple)):
-                condition_latents = list(condition_latents) + list(_FL2VA["visual"])
-                _log(f"FL2VA ControlNet: control rows padded for {len(_FL2VA['visual'])} "
-                     f"RefMod reference(s)")
-            return _orig_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
-                                              height, width, condition_latents, *args, **kwargs)
-        Pipeline._prepare_control_rows = patched_prepare_control_rows
-    elif CONTROLNET_REFMODS:
-        _log("no _prepare_control_rows found on MiniMaxH3Pipeline -- RefMods on the ControlNet "
-             "model may stop with a control-row mismatch on this Wan2GP build.")
 
     _orig_prepare_audio_references = getattr(Pipeline, "_prepare_audio_references", None)
     if _orig_prepare_audio_references is not None:
@@ -1841,6 +820,7 @@ def install_patches() -> Optional[str]:
                         latent = latent[..., :keep_t]
                     rewrapped = _RefModAudioSentinel(latent)
                     rewrapped.hide_ref = getattr(source, "hide_ref", False)  # keep the cap-check decision
+                    rewrapped.enc = getattr(source, "enc", None)             # keep the <Audio N> prompt entry
                     waveforms.append(rewrapped)
                     continue
                 if torch.is_tensor(source):
@@ -1889,11 +869,19 @@ def install_patches() -> Optional[str]:
             # latent goes into the packed sequence at its own saved
             # resolution, exactly as it did before this step existed.
             if isinstance(video, _RefModVideoSentinel):
-                # Remember the size that was asked for: in phase 2 this is the
-                # target resolution, and _add_video_reference uses it to rebuild
-                # the mod at that scale (see RESCALE_REFMODS_IN_PHASE_2).
-                video.rescale_to = (height, width)
-                return video
+                active = _ACTIVE.get("pipeline")
+                if active is None or not _should_fit(active, width, height):
+                    return video
+                fitted = _fit_latent_to_canvas(video.latent, width, height, 100.0, "video RefMod")
+                if fitted is video.latent:
+                    return video
+                shrunk = _RefModVideoSentinel(fitted)
+                shrunk.hide_ref = video.hide_ref
+                shrunk.enc = video.enc
+                # fork: the stack flag and the row's options travel with it
+                shrunk.is_stack, shrunk.max_short = video.is_stack, video.max_short
+                shrunk.picture_encs = video.picture_encs
+                return shrunk
             return _orig_resize_video(video, height, width)
         h3_pipeline._resize_video = patched_resize_video
     else:
@@ -1901,26 +889,22 @@ def install_patches() -> Optional[str]:
              "builds that don't have it; on newer ones video-kind RefMods would fail with "
              "\"'_RefModVideoSentinel' object has no attribute 'permute'\".")
 
+    _install_fl2va_hooks(Pipeline)   # fork: _encode_prompt, _prepare_control_rows, forward
+
     @functools.wraps(_orig_generate)
     def patched_generate(self, *args, **kwargs):
         custom_settings = kwargs.get("custom_settings")
         custom_settings = custom_settings if isinstance(custom_settings, dict) else {}
 
-        state_from_task, extract_job = unpack_refmod_setting(custom_settings)
-        if not extract_job:
-            extract_job = _take_pending_extract()
-            if extract_job:
-                _log("this task reached generate() without its extraction job (Wan2GP dropped the "
-                     "custom_settings payload); running the extraction that was just submitted. "
-                     "Without this it would render a video instead of extracting a mod.")
-        else:
-            set_pending_extract(None)   # arrived normally; don't leave a duplicate staged
+        # The extraction spec rides inside the generate slot (or the legacy
+        # SETTING_EXTRACT key); read_refmod_payload also accepts the shapes
+        # earlier fork builds wrote.
+        state_json, extract_job = read_refmod_payload(custom_settings)
         if extract_job:
             set_progress_status = kwargs.get("set_progress_status")
             try:
-                _prepare_vae_for_job(self, kwargs)
                 _run_extract_job(self, extract_job, set_progress_status=set_progress_status)
-            except ExtractionBlocked as blocked:
+            except ExtractionBlocked as blocked:   # fork: a refusal the user can fix
                 _log(f"extraction refused: {blocked}")
                 if set_progress_status is not None:
                     try:
@@ -1938,69 +922,30 @@ def install_patches() -> Optional[str]:
 
         # Fresh bookkeeping for this call -- every generate() (and every
         # sliding window, each of which is its own call) starts at phase 1.
-        _reset_gen_state(self)
+        state = _reset_gen_state(self)
+        _ACTIVE["pipeline"] = self
+        # The full output canvas for this call. Phase 1 of a two-phase run is
+        # handed a *smaller* canvas (H3_TWO_PHASE_SCALE); comparing against
+        # this is how _should_fit tells the phases apart, so single-phase and
+        # phase-2 runs are left exactly as they were.
+        try:
+            state["full_canvas"] = (int(kwargs.get("width")), int(kwargs.get("height")))
+        except (TypeError, ValueError):
+            state["full_canvas"] = None
 
-        state_json = state_from_task
-        _REFMODS_ACTIVE.update({"on": False, "logged": False})
-        first_window = int(kwargs.get("window_no") or 1) <= 1
-        setattr(self, "_h3_window_no", int(kwargs.get("window_no") or 1))
-        # pipeline.py: image_outputs = image_mode > 0 and not self.audio_only
-        setattr(self, "_h3_image_output", int(kwargs.get("image_mode") or 0) > 0
-                and not getattr(self, "audio_only", False))
-        setattr(self, "_h3_live_image_refs", len(kwargs.get("input_ref_images") or []))
-        # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None.
-        # A single-phase run is *also* "phase 1", so the phase-1 canvas fit must
-        # check this and not just the phase counter -- otherwise it shrinks mods
-        # on ordinary single-phase generations and costs detail (faces first).
-        setattr(self, "_h3_two_phase",
-                int(kwargs.get("guide_phases") or 1) > 1
-                and kwargs.get("frozen_control_video") is None)
+        # Fork: this run's sizing options and which route the mods take.
         _clear_fl2va()
         fl2va = FL2VA_REFMODS and _is_fl2va_pipeline(self)
-        refmod_capable = _is_ref2va_pipeline(self) or fl2va
-        if refmod_capable:
-            _log(f"generate(): {_fl2va_label(self) if fl2va else 'Ref2VA'}, "
-                 f"window {int(kwargs.get('window_no') or 1)}, "
-                 f"task payload={'yes' if state_json else 'no'}, "
-                 f"armed={'yes' if _ARMED['json'] else 'no'}")
-        if not state_json and _ARMED["json"] and refmod_capable \
-                and not kwargs.get("refinement_mode") and not _foreign_task(kwargs):
-            state_json = _ARMED["json"]
-            if first_window:
-                _log("NOTE: this task reached generate() without its RefMod selection, so the "
-                     "inline panel's current selection is being used instead. If you did not "
-                     "expect mods in this generation, clear the panel (or press 'Clear armed "
-                     "RefMods') -- an unexpected mod takes a reference slot from your own "
-                     "references.")
-        # Mod sizing (panel options): "Fit mods to the output size" (fork.18),
-        # each row's "Max size" and "Mods in phase 2" (fork.19).
-        setattr(self, "_h3_out_size", (kwargs.get("width"), kwargs.get("height")))
-        setattr(self, "_h3_fit_output", _fit_output_requested(state_json))
-        setattr(self, "_h3_shrink_fast", _shrink_method_requested(state_json) == SHRINK_FAST)
-        setattr(self, "_h3_tiled_p2", bool(self._h3_two_phase)
-                and _tiling_flag() in str(kwargs.get("video_prompt_type") or ""))
-        p2_mode = _phase2_mode_requested(state_json) if self._h3_two_phase else PHASE2_MODS_FULL
-        setattr(self, "_h3_p2_mode", p2_mode)
-        p2_off = p2_mode == PHASE2_MODS_OFF
-        if p2_off and not fl2va and _has_live_visual_refs(kwargs):
-            # Ref2VA aligns phase 2's references with phase 1's by position;
-            # leaving mods out would shift the generation's own references.
-            p2_off = False
-            _log("Mods in phase 2: Off was asked for, but this generation has reference images or "
-                 "videos of its own, so the mods stay in phase 2 (Full)")
-        setattr(self, "_h3_p2_off", p2_off)
-        if refmod_capable and state_json:
-            if self._h3_fit_output:
-                _log(f"fit to output: on -- visual mods bigger than "
-                     f"{kwargs.get('width')}x{kwargs.get('height')} are rebuilt at that pixel area")
-            if self._h3_two_phase and p2_mode != PHASE2_MODS_FULL:
-                _log(f"Mods in phase 2: {'Off' if p2_off else 'Fit to tile' if p2_mode == PHASE2_MODS_TILE else 'Full'}"
-                     + ("" if p2_mode != PHASE2_MODS_TILE or self._h3_tiled_p2
-                        else " (phase 2 is not tiled in this run, so mods stay full size there)"))
+        _set_run_options(self, kwargs, state_json, fl2va)
+
+        # state_json was already read (and cleared if it turned out to carry an
+        # extraction job) at the top of this function -- don't re-read it here.
         if state_json and fl2va:
+            # Fork: FL2VA has no reference inputs; the mods are staged and
+            # added by the FL2VA hooks instead (see "FL2VA support").
             if not kwargs.get("refinement_mode"):
                 try:
-                    _stage_fl2va_refmods(self, state_json)
+                    _stage_fl2va_refmods(self, kwargs, state_json)
                 except Exception:
                     _clear_fl2va()
                     _log("could not stage RefMods for FL2VA, continuing without them:\n"
@@ -2010,21 +955,15 @@ def install_patches() -> Optional[str]:
                 kwargs = _inject_refmods(self, kwargs, state_json)
             except Exception:
                 _log("could not inject RefMods, continuing without them:\n" + traceback.format_exc())
-        elif refmod_capable and first_window and not kwargs.get("refinement_mode"):
-            _log("no RefMod selection for this task, and none armed in the inline panel -- if you "
-                 "picked mods there, re-select them once after restarting Wan2GP.")
 
         try:
             return _orig_generate(self, *args, **kwargs)
         finally:
-            _clear_fl2va()   # never let staged mods leak into the next generation
+            _clear_fl2va()   # fork: never let staged FL2VA mods leak into the next generation
 
     Pipeline._add_image_reference = patched_add_image_reference
     Pipeline._add_video_reference = patched_add_video_reference
     Pipeline.generate = patched_generate
-    _install_sol_attn_guard()
-    _install_fl2va_forward_hook()
-
     setattr(Pipeline, _PATCH_MARKER, True)
     _log("patches installed on MiniMaxH3Pipeline (RefMod extraction + injection enabled)")
     return None
@@ -2075,15 +1014,12 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
                 resolved_type = model_type or get_state_model_type_fn(state)
                 if is_minimax_h3_refmod_capable(resolved_type, get_base_model_type_fn):
                     stash = state.get(STASH_KEY)
-                    _sync_armed_with_panel(stash)
                     existing = dict(result.get("custom_settings") or {})
                     if stash:
-                        existing[SETTING_COMBINED] = pack_refmod_setting(state_json=stash)
-                        existing.pop(LEGACY_SETTING_COMBINED, None)   # fork.12-21 key
+                        existing[SETTING_GENERATE] = stash
                         result["custom_settings"] = existing
-                    elif SETTING_COMBINED in existing or LEGACY_SETTING_COMBINED in existing:
-                        existing.pop(SETTING_COMBINED, None)
-                        existing.pop(LEGACY_SETTING_COMBINED, None)
+                    elif SETTING_GENERATE in existing:
+                        existing.pop(SETTING_GENERATE, None)
                         result["custom_settings"] = existing or None
         except Exception:
             _log("prepare_inputs_dict patch: RefMod injection failed, leaving settings "
@@ -2138,16 +1074,13 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
             if (isinstance(settings, dict) and isinstance(state, dict)
                     and is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn)):
                 stash = state.get(STASH_KEY)
-                _sync_armed_with_panel(stash)
                 existing = dict(settings.get("custom_settings") or {})
                 if stash:
-                    existing[SETTING_COMBINED] = pack_refmod_setting(state_json=stash)
-                    existing.pop(LEGACY_SETTING_COMBINED, None)   # fork.12-21 key
+                    existing[SETTING_GENERATE] = stash
                     settings = dict(settings)
                     settings["custom_settings"] = existing
-                elif SETTING_COMBINED in existing or LEGACY_SETTING_COMBINED in existing:
-                    existing.pop(SETTING_COMBINED, None)
-                    existing.pop(LEGACY_SETTING_COMBINED, None)
+                elif SETTING_GENERATE in existing:
+                    existing.pop(SETTING_GENERATE, None)
                     settings = dict(settings)
                     settings["custom_settings"] = existing or None
         except Exception:
@@ -2173,86 +1106,25 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # Generation-time injection
 # ═══════════════════════════════════════════════════════════════════════════
 
-_FL2VA_FORWARD_MARKER = "_h3refmod_fl2va_forward_patched"
+def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, image_output=False,
+                            visual_labels=True):
+    """Load a RefMod selection and turn it into sentinels, one list per kind.
 
-
-def _install_fl2va_forward_hook() -> None:
-    """Fill payload["refs"] for FL2VA on the transformer's way in. generate()
-    builds the payload with refs=None in FL2VA and both phase-2 paths reset
-    it to None, so this re-applies on every pass; the layout cache keys on
-    the refs, so the reference-aware packer is used from the first step."""
-    try:
-        from models.minimax_h3 import transformer as h3_transformer
-    except Exception as e:
-        _log(f"could not import models.minimax_h3.transformer ({e!r}); RefMods won't work in FL2VA")
-        return
-    Model = getattr(h3_transformer, "MiniMaxH3Model", None)
-    if Model is None or getattr(Model, _FL2VA_FORWARD_MARKER, False):
-        return
-    _orig_forward = Model.forward
-
-    @functools.wraps(_orig_forward)
-    def patched_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload, *args, **kwargs):
-        if _FL2VA["active"] and _FL2VA["entries"] and isinstance(payload, dict) \
-                and not payload.get("refs"):
-            payload["refs"] = list(_FL2VA["entries2"] if _FL2VA["pass_no"] == 2 else _FL2VA["entries"])
-            if not _FL2VA["announced"]:
-                _FL2VA["announced"] = True
-                _log(f"FL2VA: {len(_FL2VA['entries'])} RefMod reference(s) attached to the "
-                     f"transformer payload -- the reference-aware packer is now in use")
-        return _orig_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
-                             *args, **kwargs)
-
-    Model.forward = patched_forward
-    setattr(Model, _FL2VA_FORWARD_MARKER, True)
-
-
-_SOL_PATCH_MARKER = "_h3refmod_sol_patched"
-
-
-def _install_sol_attn_guard() -> None:
-    """Route RefMod generations around Sol-Attn's INT8 Triton kernels.
-    See DISABLE_SOL_WITH_REFMODS. No effect when the attention mode isn't
-    "sol", and none on generations without RefMods."""
-    try:
-        from models.minimax_h3 import sol_attention as h3_sol
-    except Exception as e:
-        _log(f"could not import models.minimax_h3.sol_attention ({e!r}); "
-             f"the Sol-Attn guard is not installed")
-        return
-    SolCls = getattr(h3_sol, "MiniMaxH3SolAttention", None)
-    if SolCls is None or getattr(SolCls, _SOL_PATCH_MARKER, False):
-        return
-    _orig_use_for_layer = SolCls.use_for_layer
-
-    @functools.wraps(_orig_use_for_layer)
-    def patched_use_for_layer(self, tokens):
-        if DISABLE_SOL_WITH_REFMODS and _REFMODS_ACTIVE["on"] and getattr(self, "enabled", False):
-            if not _REFMODS_ACTIVE["logged"]:
-                _REFMODS_ACTIVE["logged"] = True
-                _log("Sol-Attn bypassed for this generation because RefMods are injected "
-                     "(its INT8 Triton path can hit an illegal memory access as the condition "
-                     "rows grow). Set DISABLE_SOL_WITH_REFMODS = False in patches.py to re-enable.")
-            return False
-        return _orig_use_for_layer(self, tokens)
-
-    SolCls.use_for_layer = patched_use_for_layer
-    setattr(SolCls, _SOL_PATCH_MARKER, True)
-
-
-def _build_refmod_sentinels(state_json: str):
-    """Load and weight a RefMod selection into per-kind sentinels.
-
-    Shared by the Ref2VA path (_inject_refmods, which feeds sentinels
-    through generate()'s reference inputs) and the FL2VA path
+    Shared by the Ref2VA route (_inject_refmods, which hands the sentinels to
+    generate()'s own reference inputs) and, in this fork, the FL2VA route
     (_stage_fl2va_refmods, which can't use those inputs at all). Returns
     (image_sentinels, video_sentinels, audio_sentinels, total_tokens,
-    retention), or None when there is nothing to inject."""
+    retention, window_mode), or None when there is nothing to inject.
+    ``visual_labels`` False (FL2VA, which labels audio mods only) skips
+    decoding prompt-view frames for mods saved without them."""
+    later_window = isinstance(window_no, int) and window_no > 1
     try:
         state = json.loads(state_json)
     except Exception as e:
         _log(f"could not parse RefMod state ({e!r}); ignoring")
         return None
+    if EXTRACT_WRAPPER_KEY in state:
+        return None  # an extraction spec, not a mod selection (already handled upstream)
     rows = state.get("rows") or []
     if not rows:
         return None
@@ -2261,29 +1133,10 @@ def _build_refmod_sentinels(state_json: str):
     if isinstance(curve, list):
         curve = tuple(curve)
     seed = int(state.get("scramble_seed", -1))
-    # "Send as one video": a multi-picture mod goes in as ONE <Video N>
-    # instead of one <Picture N> per picture. Chosen per mod (each row's
-    # "as_video"); the old panel-wide "stack_as_video" flag is still honoured
-    # as the default for selections saved before fork.12.
-    stack_as_video = bool(state.get("stack_as_video", False))
-    stack_mode = state.get("stack_pictures") or encframes.STACK_ALL
-    if stack_mode not in encframes.STACK_CHOICES:
-        stack_mode = encframes.STACK_ALL
-    try:
-        stack_n = max(1, int(state.get("stack_pictures_n") or encframes.STACK_DEFAULT_N))
-    except (TypeError, ValueError):
-        stack_n = encframes.STACK_DEFAULT_N
-    # How many frames of a video mod the encoder is shown. Defaults to the
-    # previous fixed behaviour (up to 8) for selections saved before this.
-    clip_mode = state.get("video_frames") or encframes.STACK_UP_TO_N
-    if clip_mode not in encframes.STACK_CHOICES:
-        clip_mode = encframes.STACK_UP_TO_N
-    try:
-        clip_n = max(1, int(state.get("video_frames_n") or encframes.MAX_CLIP_FRAMES_SHOWN))
-    except (TypeError, ValueError):
-        clip_n = encframes.MAX_CLIP_FRAMES_SHOWN
+    window_mode = _window_mode_from_state(state)
+    shown = _shown_frames_from_state(state)   # fork: "Text encoder options"
 
-    loaded_rows = []  # (mod, strength, copies, as_video, use_audio, max_short), one per selected row
+    loaded_rows = []  # (mod, strength, copies, row), one entry per selected row, in order
     for row in rows:
         name = row.get("mod")
         strength = float(row.get("strength", 1.0))
@@ -2295,12 +1148,7 @@ def _build_refmod_sentinels(state_json: str):
         except Exception as e:
             _log(f"could not load mod {name!r}, skipping ({e!r})")
             continue
-        loaded_rows.append((mod, strength, copies, bool(row.get("as_video", stack_as_video)),
-                            # "Include audio": a visual mod's attached soundtrack can be
-                            # left out per row (on unless the row says otherwise).
-                            bool(row.get("use_audio", True)),
-                            # "Max size" (fork.19): short edge in pixels, or none.
-                            _row_max_short(row)))
+        loaded_rows.append((mod, strength, copies, row))
 
     if not loaded_rows:
         return None
@@ -2314,30 +1162,28 @@ def _build_refmod_sentinels(state_json: str):
 
     image_sentinels, video_sentinels, audio_sentinels = [], [], []
     total_tokens = 0
-    for mod, strength, copies, as_video, use_audio, max_short in loaded_rows:
-        n_img_before, n_vid_before = len(image_sentinels), len(video_sentinels)
-        soundtrack = mod.audio_latent if use_audio else None
-        if mod.audio_latent is not None and not use_audio:
-            _log(f"'{mod.name}': soundtrack left out (Include audio unticked)")
+    for mod, strength, copies, row in loaded_rows:
         eff = max(0.0, min(2.0, strength * retention))
         latent = _weighted_latent_cached(mod, eff, curve)
         if latent is None:
             continue
         total_tokens += mod.token_count
-        # Pictures, single or stacked -- including a ComfyUI picture stack,
-        # which ComfyUI saves as kind "video" (see core.is_still_stack).
+        if visual_labels:
+            _ensure_enc_frames(pipeline_self, mod)   # fork: mods saved without encoder frames
+        first_image, first_video = len(image_sentinels), len(video_sentinels)
+        # A picture stack ComfyUI saved as kind "video" is still pictures (fork).
         pictures = mod.kind == "image" or mod.still_stack()
-        if pictures and as_video and latent.shape[2] > 1:
-            # One video reference holding every picture. "Copies" repeats the
-            # pictures inside that one slot (one label), as for a video mod.
+        if pictures and row.get("as_video") and latent.shape[2] > 1:
+            # Fork, "Send as one video": every picture of the mod in ONE video
+            # reference -- one <Video N> label instead of one <Picture N> per
+            # picture. "Copies" repeats the pictures inside that one slot.
             if copies > 1:
                 latent = latent.repeat(1, 1, copies, 1, 1)
-            video_sentinels.append(_RefModVideoSentinel(
-                latent, mod.latent, _preview_key(mod, "stack", 0), audio_latent=soundtrack,
-                mod=mod, enc_strength=eff, is_stack=True, stack_mode=stack_mode, stack_n=stack_n))
-            _log(f"'{mod.name}': {latent.shape[2]} pictures sent as one video reference "
-                 f"(encoder shown {len(encframes.stack_picks(mod.latent.shape[2], stack_mode, stack_n))} "
-                 f"of {mod.latent.shape[2]})")
+            sentinel = _RefModVideoSentinel(latent)
+            sentinel.is_stack = True
+            sentinel.enc = _enc_stack(mod, eff, shown)
+            sentinel.picture_encs = [_enc_item(mod, "image", j, eff) for j in range(latent.shape[2])]
+            video_sentinels.append(sentinel)
         elif pictures:
             # An "image" mod can still have more than one latent frame if
             # several still images were stacked together at extraction time
@@ -2349,12 +1195,11 @@ def _build_refmod_sentinels(state_json: str):
             t = latent.shape[2]
             for _ in range(copies):
                 for j in range(t):
-                    # Attached audio rides on the FIRST still only: it is one
-                    # soundtrack for the mod, not one per stacked image.
-                    image_sentinels.append(_RefModImageSentinel(
-                        latent[:, :, j:j + 1], mod.latent[:, :, j:j + 1], _preview_key(mod, "image", j),
-                        audio_latent=soundtrack if j == 0 else None,
-                        mod=mod, still_index=j, enc_strength=eff))
+                    sentinel = _RefModImageSentinel(latent[:, :, j:j + 1])
+                    # One prompt entry per image, so a two-image mod really
+                    # does become <Picture N> and <Picture N+1>.
+                    sentinel.enc = _enc_item(mod, "image", j, eff)
+                    image_sentinels.append(sentinel)
         elif mod.kind == "video":
             # Video-kind mods go through Wan2GP's own native reference-video
             # slots directly -- the exact same mechanism "Use Two Reference
@@ -2363,13 +1208,22 @@ def _build_refmod_sentinels(state_json: str):
             # mod's own frames within its one slot (extending its own
             # duration) instead of spawning extra slot-consuming instances,
             # since MiniMax H3 only exposes 2 such slots in total.
-            if copies > 1:
-                latent = latent.repeat(1, 1, copies, 1, 1)
-            sentinel = _RefModVideoSentinel(latent, mod.latent, _preview_key(mod, "video", 0),
-                                            audio_latent=soundtrack,
-                                            mod=mod, enc_strength=eff)
-            sentinel.clip_mode, sentinel.clip_n = clip_mode, clip_n
-            video_sentinels.append(sentinel)
+            if later_window and window_mode == WINDOW_MODE_FIRST:
+                pass  # this mod sits out every window after the first
+            elif later_window and window_mode == WINDOW_MODE_STILL:
+                # Keep the identity, drop the motion: one still reference,
+                # the mod's own first latent frame. A whole clip handed to a
+                # later window can surface a few of its frames at the window
+                # boundary; a single still cannot.
+                still = _RefModImageSentinel(latent[:, :, :1])
+                still.enc = _enc_as_still(_enc_item(mod, "video", 0, eff))
+                image_sentinels.append(still)
+            else:
+                if copies > 1:
+                    latent = latent.repeat(1, 1, copies, 1, 1)
+                sentinel = _RefModVideoSentinel(latent)
+                sentinel.enc = _enc_clip_shown(_enc_item(mod, "video", 0, eff), shown)
+                video_sentinels.append(sentinel)
         else:  # "audio"
             # Same pattern as video-kind mods, one slot per mod (2 native
             # audio-reference slots total); "copies" repeats this mod's own
@@ -2377,341 +1231,69 @@ def _build_refmod_sentinels(state_json: str):
             # second one.
             if copies > 1:
                 latent = latent.repeat(1, 1, 1, copies)
-            audio_sentinels.append(_RefModAudioSentinel(latent))
+            sentinel = _RefModAudioSentinel(latent)
+            # Audio prompt entries carry no pixels at all -- the label is the
+            # whole thing -- so an audio mod always gets one.
+            sentinel.enc = {"type": "audio"} if PROMPT_LABELS_FOR_REFMODS else None
+            audio_sentinels.append(sentinel)
 
-        for sentinel in image_sentinels[n_img_before:] + video_sentinels[n_vid_before:]:
-            sentinel.max_short = max_short
-        # A visual mod may also carry a soundtrack. Treat it exactly as a
-        # standalone audio mod: it takes a native audio slot, so it gets its
-        # <Audio N> label, its place in the reference order and the cap
-        # handling -- none of which the direct-injection path provides, and
-        # that label is what a prompt refers to for voice reuse.
-        if (mod.kind in ("image", "video") and soundtrack is not None
-                and ATTACHED_AUDIO_AS_SEPARATE_REF):
-            audio_sentinels.append(_RefModAudioSentinel(mod.audio_latent))
-            _log(f"{mod.kind} RefMod '{mod.name}' carries a soundtrack "
-                 f"({mod.audio_latent.shape[-1]} audio latents, "
-                 f"~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s) -- injected as "
-                 f"its own <Audio N> reference; refer to it as <Audio N>, not <Video N>.")
+        # Fork: the row's "Max size", applied wherever the mod is sized.
+        for sentinel in image_sentinels[first_image:] + video_sentinels[first_video:]:
+            sentinel.max_short = _row_max_short(row)
+        # Fork: a visual mod's own soundtrack is injected exactly like an
+        # audio mod -- its own native audio slot and <Audio N> label -- unless
+        # the row's "Include audio" is unticked.
+        if mod.kind != "audio" and mod.audio_latent is not None:
+            if row.get("use_audio", True):
+                soundtrack = _RefModAudioSentinel(mod.audio_latent)
+                soundtrack.enc = {"type": "audio"} if PROMPT_LABELS_FOR_REFMODS else None
+                audio_sentinels.append(soundtrack)
+                _log(f"'{mod.name}' carries a soundtrack (~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s) "
+                     f"-- injected as its own <Audio N> reference")
+            else:
+                _log(f"'{mod.name}': soundtrack left out (Include audio unticked)")
 
     if not image_sentinels and not video_sentinels and not audio_sentinels:
         return None
-    return image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention
 
+    # Image / single-frame output: a reference *video* has no place to go.
+    # WanGP handles its own live case by folding only the first reference
+    # video into the image references and switching reference videos off
+    # entirely ("if image_outputs and video_references: input_ref_images =
+    # [..., guide_to_float(input_frames)]; video_references = False" in
+    # pipeline.generate). If we put video RefMods in the native video slots
+    # here, that same code would keep the first one and silently drop any
+    # others. Convert them ourselves instead -- one still reference per mod,
+    # from its first latent frame, exactly what the image path can use.
+    if image_output:
+        if video_sentinels:
+            for sentinel in video_sentinels:
+                if sentinel.is_stack:
+                    # Fork: a picture stack sent as one video goes back to
+                    # being its pictures -- all of them, not just the first.
+                    image_sentinels.extend(_stack_as_pictures(sentinel))
+                    continue
+                still = _RefModImageSentinel(sentinel.latent[:, :, :1])
+                still.enc = _enc_as_still(sentinel.enc)
+                still.max_short = sentinel.max_short
+                image_sentinels.append(still)
+            _log(f"image output mode: {len(video_sentinels)} video-kind RefMod(s) converted to "
+                 f"still image references (first frame each) -- a reference video has no meaning "
+                 f"for a single-frame output, and WanGP would otherwise keep only the first one.")
+            video_sentinels = []
 
-# ── FL2VA support ───────────────────────────────────────────────────────
-#
-# The Ref2VA route above can't work on FL2VA: the pipeline is built with
-# reference_mode=False, which skips every reference-building step, and any
-# value in input_ref_images / input_frames raises "Image, video, and audio
-# references require the Ref2VA checkpoint".
-#
-# But the transformer itself is model-agnostic. MiniMaxH3Model._layout picks
-# build_ref2va_packed_sequence purely on payload["refs"] being non-empty, and
-# that packer already takes first/last-frame keyframe anchors alongside
-# references. The ComfyUI original relies on exactly this: its Apply node
-# appends ref blocks to whatever conditioning it's given, FL2VA included.
-#
-# So in FL2VA the mods bypass generate()'s reference inputs entirely:
-#   * their latents are appended to the condition latents in
-#     _prepare_condition_rows (phase 1, plain phase 2, and tiled phase 2,
-#     which appends reference rows whole to every tile), and
-#   * payload["refs"] is filled in at the top of the transformer's forward
-#     whenever generate() left it empty -- phase 1 builds it as None and
-#     both phase-2 paths reset it to None.
-# Like the ComfyUI Apply node, nothing is presented to the text encoder:
-# FL2VA prompts carry no reference labels.
-# How a mod's attached soundtrack is injected.
-#   True  - as its own <Audio N> reference, exactly like a standalone audio
-#           mod. Voice reuse from an audio reference is a trained Ref2VA
-#           capability, so this is the one to use for vocal timbre.
-#   False - merged into the visual reference as H3's "video_audio" kind, which
-#           is the shape used for a reference video's OWN soundtrack: it tells
-#           the model the audio belongs to that footage rather than offering it
-#           as a voice to reuse.
-# Image mods always use the separate form -- the packer's image branch has no
-# audio rows at all.
-ATTACHED_AUDIO_AS_SEPARATE_REF = True
-
-FL2VA_REFMODS = True
-
-# RefMods on the FL2VA ControlNet-Union model (fork.18). It is the FL2VA
-# transformer plus a control branch, so mods go in through the FL2VA route.
-# The one extra step: the control branch's rows are built with blank padding
-# for every condition row ahead of the video (start/end frames), BEFORE the
-# mods are appended, so _prepare_control_rows is patched to pad for the mods
-# too -- otherwise the transformer stops with "control rows must match the
-# packed video rows". The control branch itself only acts on text and the
-# target video, never on reference rows.
-CONTROLNET_REFMODS = True
-
-# Which RefMods get a prompt label in FL2VA.
-#   "audio" - label audio mods only (default)
-#   "all"   - label every mod, as Ref2VA does
-#   "none"  - no labels, exactly like the ComfyUI original's Apply node
-#
-# FL2VA presents its own start/end frames to the text encoder as <Picture N>,
-# so it understands labels; it simply isn't given any for references. A visual
-# reference can still bias the picture unlabelled, but a voice reference has
-# much less to grab onto -- "use this voice" has to come from somewhere. Audio
-# mods are labelled by default for that reason. Labels are appended after the
-# keyframes, so a start frame stays <Picture 1>.
-FL2VA_PROMPT_LABELS = "audio"
-
-_FL2VA = {"active": False, "visual": [], "audio": [], "entries": [], "announced": False,
-          "presentation": [], "visual2": [], "entries2": [], "calls": 0, "pass_no": 1}
-
-
-def _clear_fl2va() -> None:
-    _FL2VA.update(active=False, visual=[], audio=[], entries=[], announced=False, presentation=[],
-                  visual2=[], entries2=[], calls=0, pass_no=1)
-
-
-def _transformer_has_control(transformer) -> bool:
-    """Control checkpoints attach a ControlBlock to their DiT blocks; FL2VA
-    (and FL2VA finetunes such as VDN) don't. Control models feed their own
-    rows through the payload, so they're left alone."""
-    try:
-        return any(getattr(block, "control", None) is not None
-                   for block in getattr(transformer, "blocks", None) or ())
-    except Exception:
-        return False
-
-
-def _is_fl2va_pipeline(pipeline_self) -> bool:
-    return (not getattr(pipeline_self, "reference_mode", False)
-            and getattr(pipeline_self, "fixed_prompt", None) is None
-            and not getattr(pipeline_self, "audio_only", False)
-            and (CONTROLNET_REFMODS
-                 or not _transformer_has_control(getattr(pipeline_self, "transformer", None))))
-
-
-def _tiling_flag() -> str:
-    try:
-        from models.minimax_h3 import pipeline as h3_pipeline
-        return str(getattr(h3_pipeline, "H3_PHASE_2_TILING_FLAG", "~"))
-    except Exception:
-        return "~"
-
-
-def _has_live_visual_refs(kwargs) -> bool:
-    """Does the generation have reference images or videos of its own (not
-    RefMods)? Checked before the mods are injected."""
-    video_prompt_type = str(kwargs.get("video_prompt_type") or "")
-    if [r for r in (kwargs.get("input_ref_images") or []) if not isinstance(r, _RefModImageSentinel)]:
-        return True
-    for key, letter in (("input_frames", "V"), ("input_frames2", "+"), ("input_frames3", "*")):
-        value = kwargs.get(key)
-        if value is not None and not isinstance(value, _RefModVideoSentinel) and letter in video_prompt_type:
-            return True
-    return False
-
-
-def _phase2_mods_off(pipeline_self) -> bool:
-    """True during phase 2 of a two-phase run when "Mods in phase 2" is Off
-    and it is safe to leave them out (see patched generate)."""
-    return (bool(getattr(pipeline_self, "_h3_p2_off", False))
-            and _gen_state(pipeline_self)["phase"] == 2)
-
-
-def _pass_canvas(pipeline_self, pass_no):
-    """(width, height) a pass renders at: the half-size canvas for phase 1 of
-    a two-phase run, otherwise the output size."""
-    out_w, out_h = getattr(pipeline_self, "_h3_out_size", (None, None))
-    if not out_w or not out_h:
-        return None, None
-    if pass_no == 1 and getattr(pipeline_self, "_h3_two_phase", False):
-        return _phase_1_canvas(out_w, out_h)
-    return int(out_w), int(out_h)
-
-
-# Keys other plugins put in custom_settings when they run their own task
-# (e.g. 2 Phases Plus' H3 Upscaler tab). Such a task comes with its own RefMod
-# selection or none, so the Media Generator panel's armed selection must not
-# be used for it.
-FOREIGN_TASK_KEYS = ("two_phases_plus_upscale_source",)
-
-
-def _foreign_task(kwargs) -> bool:
-    custom = kwargs.get("custom_settings")
-    return isinstance(custom, dict) and any(custom.get(key) for key in FOREIGN_TASK_KEYS)
-
-
-def _prepare_vae_for_job(pipeline_self, kwargs) -> None:
-    """Plugin jobs (extract, decompile, store encoder frames) run in place of
-    the generation, before generate() has set up the VAE -- and on the first
-    task after a model load its tiling is still off, so one large source can
-    run the graphics card out of memory in a single encode or decode
-    (fork.23). Switch it on the same way a generation would, first."""
-    configure = getattr(pipeline_self, "_configure_tiling", None)
-    if not callable(configure):
-        return
-    try:
-        configure(kwargs.get("VAE_tile_size"))
-    except Exception:
-        _log("could not switch on VAE tiling before the job; continuing without it:\n"
-             + traceback.format_exc())
-
-
-def _fl2va_label(pipeline_self) -> str:
-    return ("FL2VA ControlNet" if _transformer_has_control(getattr(pipeline_self, "transformer", None))
-            else "FL2VA")
-
-
-def _row_max_short(row):
-    """A row's "Max size" as a short edge in pixels, or None for full size."""
-    try:
-        value = int(row.get("max_size") or 0)
-    except (TypeError, ValueError):
-        return None
-    return value if value >= 32 else None
-
-
-def _phase2_mode_requested(state_json) -> str:
-    if not state_json:
-        return PHASE2_MODS_FULL
-    try:
-        mode = str(json.loads(state_json).get("phase2_mods") or PHASE2_MODS_FULL).lower()
-    except Exception:
-        return PHASE2_MODS_FULL
-    return mode if mode in PHASE2_MODS_CHOICES else PHASE2_MODS_FULL
-
-
-SHRINK_REENCODE, SHRINK_FAST = "reencode", "fast"
-
-
-def _shrink_method_requested(state_json) -> str:
-    if not state_json:
-        return SHRINK_REENCODE
-    try:
-        method = str(json.loads(state_json).get("shrink_method") or SHRINK_REENCODE).lower()
-    except Exception:
-        return SHRINK_REENCODE
-    return method if method in (SHRINK_REENCODE, SHRINK_FAST) else SHRINK_REENCODE
-
-
-def _fit_output_requested(state_json) -> bool:
-    if not state_json:
-        return False
-    try:
-        return bool(json.loads(state_json).get("fit_to_output", False))
-    except Exception:
-        return False
-
-
-def _stage_fl2va_refmods(pipeline_self, state_json: str) -> bool:
-    """Load the selection and stage it for the FL2VA hooks. Order matters:
-    the packer assigns condition rows to references in list order, so the
-    entries are built in exactly the order their latents get appended."""
-    built = _build_refmod_sentinels(state_json)
-    if built is None:
-        return False
-    image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention = built
-    image_sentinels, video_sentinels = _reshape_video_mods(
-        image_sentinels, video_sentinels,
-        window_no=int(getattr(pipeline_self, "_h3_window_no", 1) or 1),
-        image_output=bool(getattr(pipeline_self, "_h3_image_output", False)),
-        window_mode=_window_mode_requested(state_json))
-    two_phase = bool(getattr(pipeline_self, "_h3_two_phase", False))
-    p2_off = bool(getattr(pipeline_self, "_h3_p2_off", False))
-
-    def sized(sentinel, kind, pass_no):
-        # FL2VA can't resize mods inside generate() the way Ref2VA's hooks do,
-        # so each pass gets its own copy, sized for that pass up front.
-        fitted = _shrink_mod(pipeline_self, sentinel, kind, sentinel.latent,
-                             *_pass_canvas(pipeline_self, pass_no), pass_no=pass_no)
-        return sentinel.latent if fitted is None else fitted
-
-    def build_pass(pass_no):
-        """(visual latents, entries) for one pass. Audio rows are the same in
-        both passes (phase 2 reuses phase 1's), so a pass that leaves the
-        visual mods out keeps every audio entry, in the same order."""
-        visual, entries = [], []
-        leave_out = pass_no == 2 and p2_off
-        for sentinel in image_sentinels:
-            if not leave_out:
-                latent = sized(sentinel, "image", pass_no)
-                visual.append(latent)
-                entries.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
-            attached = getattr(sentinel, "audio_latent", None)
-            if attached is not None:   # image refs have no audio rows: pair one alongside
-                entries.append({"kind": "audio", "ref_audio_t": attached.shape[-1]})
-        for sentinel in video_sentinels:
-            attached = getattr(sentinel, "audio_latent", None)
-            merged = attached is not None and not ATTACHED_AUDIO_AS_SEPARATE_REF
-            if leave_out:
-                if merged:
-                    entries.append({"kind": "audio", "ref_audio_t": attached.shape[-1]})
-                continue
-            latent = sized(sentinel, "video", pass_no)
-            visual.append(latent)
-            entries.append({"kind": "video_audio" if merged else "video",
-                            "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
-                            "latent_w": latent.shape[-1],
-                            "ref_audio_t": attached.shape[-1] if merged else 0})
-        for sentinel in audio_sentinels:
-            entries.append({"kind": "audio", "ref_audio_t": sentinel.latent.shape[-1]})
-        return visual, entries
-
-    audio = []
-    for sentinel in image_sentinels:
-        if getattr(sentinel, "audio_latent", None) is not None:
-            audio.append(sentinel.audio_latent)
-    for sentinel in video_sentinels:
-        if getattr(sentinel, "audio_latent", None) is not None and not ATTACHED_AUDIO_AS_SEPARATE_REF:
-            audio.append(sentinel.audio_latent)
-    for sentinel in audio_sentinels:
-        audio.append(sentinel.latent)
-    visual, entries = build_pass(1)
-    visual2, entries2 = build_pass(2) if two_phase else (visual, entries)
-    labelled = []
-    mode = str(FL2VA_PROMPT_LABELS or "none").lower()
-    if mode in ("all", "audio"):
-        for entry in entries:
-            if entry["kind"] == "audio":
-                labelled.append({"type": "audio"})
-            elif mode == "all":
-                # No frames to show (nothing is decoded on this path), so a
-                # visual entry can only be a label -- which the encoder has no
-                # way to render. Skip it rather than emit a broken block.
-                continue
-    _FL2VA.update(active=True, visual=visual, audio=audio, entries=entries, announced=False,
-                  presentation=labelled, visual2=visual2, entries2=entries2, calls=0, pass_no=1)
-    audio_rows = sum(e["ref_audio_t"] * 2 for e in entries if e["kind"] == "audio")
-    _log(f"FL2VA: staging {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
-         f"{len(audio_sentinels)} audio-kind RefMod reference(s), retention={retention:.2f} "
-         f"(~{total_tokens} tokens"
-         + (f", {audio_rows} audio rows" if audio_rows else "") + ")")
-    return True
+    return image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode
 
 
 def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     window_no = kwargs.get("window_no")
-    if not INJECT_ON_EVERY_WINDOW and isinstance(window_no, int) and window_no > 1:
-        # Wan2GP's own sliding-window loop (also used by "Continue Video")
-        # only feeds its *native* references (image_refs, prefix_video, a
-        # reference video's own frames, etc.) into window_no==1 -- every
-        # later window continues from the *previous* window's own tail
-        # frames instead, not the original reference again (see wgp.py's
-        # own "if window_no == 1 and image_refs is not None..." gates).
-        # custom_settings (carrying our RefMod selection) is passed to
-        # every window's generate() call unconditionally, though -- and
-        # since RefMod injection happens down here, inside generate()
-        # itself, it has no visibility into which window this is unless we
-        # check window_no explicitly. Without this check, a video-kind (or
-        # image-kind) RefMod would get re-injected as a "reference" on
-        # every single window, so a few frames of it visibly appear at
-        # every window boundary in the output -- this is exactly that bug.
-        return kwargs
-    built = _build_refmod_sentinels(state_json)
+    later_window = isinstance(window_no, int) and window_no > 1
+    built = _build_refmod_sentinels(
+        pipeline_self, state_json, window_no,
+        image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False))
     if built is None:
         return kwargs
-    image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention = built
-    image_sentinels, video_sentinels = _reshape_video_mods(
-        image_sentinels, video_sentinels,
-        window_no=int(window_no or 1) if isinstance(window_no, int) else 1,
-        image_output=bool(getattr(pipeline_self, "_h3_image_output", False)),
-        window_mode=_window_mode_requested(state_json))
+    image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode = built
 
     state = _gen_state(pipeline_self)
 
@@ -2730,8 +1312,10 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
 
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
-        setattr(pipeline_self, "_h3_live_image_refs", len(existing))
         kwargs["input_ref_images"] = list(existing) + image_sentinels
+        if STABLE_REFMOD_LABELS and later_window and not existing:
+            for sentinel in image_sentinels:   # fork: see STABLE_REFMOD_LABELS
+                sentinel.label_first = True
 
     native_videos = []
     if video_sentinels:
@@ -2763,18 +1347,19 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         # Wan2GP's generate() only reads two video kwargs; the rest are added
         # straight into refs/visual_latents after the cap check instead.
         for sentinel in remaining:
+            # Fork: these never pass through the hooks, so size them here, for
+            # the first pass (fitted to phase 1's canvas, then the size limits).
+            canvas = _pass_canvas(pipeline_self, 1)
             latent = sentinel.latent
-            fitted = _shrink_mod(pipeline_self, sentinel, "video", latent,
-                                 *_pass_canvas(pipeline_self, 1), pass_no=1)
-            if fitted is not None:
-                latent = fitted
+            if getattr(pipeline_self, "_h3_two_phase", False) and canvas[0]:
+                latent = _fit_latent_to_canvas(latent, canvas[0], canvas[1], 100.0, "video RefMod")
+            latent = _apply_size_limits(pipeline_self, sentinel, "video", latent, *canvas)
             state["overflow_visual"].append((latent, {
                 "kind": "video", "latent_t": latent.shape[2],
                 "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0}))
         if remaining:
-            _log(f"{len(remaining)} video-kind RefMod(s) beyond Wan2GP's "
-                 f"{_NATIVE_CAP_VIDEO} native reference-video slots will be added directly "
-                 f"(no <Video N> prompt label, and past what the model is built for)")
+            _log(f"{len(remaining)} video-kind RefMod(s) beyond Wan2GP's two native "
+                 f"reference-video slots will be added directly")
         kwargs["video_prompt_type"] = video_prompt_type
 
     native_audios = []
@@ -2808,8 +1393,8 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 latent = sentinel.latent
                 state["overflow_audio"].append((latent, {"kind": "audio", "ref_audio_t": latent.shape[-1]}))
             if remaining_audio:
-                _log(f"{len(remaining_audio)} audio-kind RefMod(s) beyond Wan2GP's "
-                     f"{_NATIVE_CAP_AUDIO} native audio-reference slots will be added directly")
+                _log(f"{len(remaining_audio)} audio-kind RefMod(s) beyond Wan2GP's two native "
+                     f"audio-reference slots will be added directly")
             kwargs["audio_prompt_type"] = audio_prompt_type
 
     # Decide which RefMods stay visible to Wan2GP's inline cap check and
@@ -2836,30 +1421,844 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 else:
                     visible_visual += 1
 
-    _REFMODS_ACTIVE["on"] = True
-
+    where = f" [sliding window {window_no}, video mods: {window_mode}]" if later_window else ""
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
-         f"retention={retention:.2f} (~{total_tokens} tokens)")
-    # Exactly what the pipeline is being handed, so a reference that "went in"
-    # but had no effect can be told apart from one that never reached a slot.
-    filled = [name for name in ("input_frames", "input_frames2", "input_frames3",
-                                "audio_guide", "audio_guide2", "audio_guide3")
-              if kwargs.get(name) is not None]
-    _log(f"  slots filled: {', '.join(filled) or 'none'} | "
-         f"video_prompt_type={kwargs.get('video_prompt_type')!r} "
-         f"audio_prompt_type={kwargs.get('audio_prompt_type')!r} | "
-         f"hidden from the cap check: "
-         f"{sum(1 for s in image_sentinels + native_videos + native_audios if s.hide_ref)} "
-         f"of {len(image_sentinels) + len(native_videos) + len(native_audios)} | "
-         f"direct-injected: {len(state['overflow_visual'])} visual, "
-         f"{len(state['overflow_audio'])} audio")
+         f"retention={retention:.2f} (~{total_tokens} tokens){where}")
     return kwargs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fork additions: panel options, mod sizing, FL2VA
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Everything in this section is new in the jedsdead fork and only reached from
+# a few marked lines in the code above. It reads the extra fields the fork's
+# panel puts in a selection ("as_video", "use_audio", "max_size" per row;
+# "fit_to_output", "phase2_mods", "shrink_method", "stack_pictures",
+# "video_frames" for the whole panel) and does nothing when they are absent,
+# so a plain {"rows": [{"mod", "strength"}]} selection behaves exactly as it
+# does without the fork.
+
+# In windows 2+ the frame carried over from the previous window is added to the
+# prompt as a picture BEFORE any reference, so it takes <Picture 1> and pushes
+# every reference's label up by one -- a prompt written for window 1 then points
+# at the wrong picture. With this on, picture RefMods are presented ahead of
+# that frame instead, so their labels are the same in every window. Only when
+# the generation has no reference images of its own.
+STABLE_REFMOD_LABELS = True
+
+# Prompt labels in FL2VA: every mod is labelled as in Ref2VA -- picture and
+# video mods get <Picture N> / <Video N> (their stored frames shown to the
+# text encoder), audio mods <Audio N>. FL2VA presents its own start/end frames
+# as <Picture N> first, so a picture mod's number follows them. Set this to
+# "none" to label nothing at all, like the ComfyUI original.
+FL2VA_PROMPT_LABELS = "on"
+
+# Earlier fork builds called the window modes whole / picture / first.
+_LEGACY_WINDOW_MODES = {"whole": "full", "picture": "still", "first": "first"}
+
+
+def _window_mode_from_state(state) -> str:
+    mode = state.get("window_mode")
+    if not mode and state.get("window_video"):
+        mode = _LEGACY_WINDOW_MODES.get(str(state.get("window_video")).lower())
+    mode = str(mode or WINDOW_MODE_DEFAULT)
+    return mode if mode in (WINDOW_MODE_STILL, WINDOW_MODE_FULL, WINDOW_MODE_FIRST) else WINDOW_MODE_DEFAULT
+
+
+def _shown_frames_from_state(state) -> dict:
+    """The panel's "Text encoder options": how many pictures of a stack sent
+    as one video, and how many frames of a video mod, the encoder is shown."""
+    def count(key, default):
+        try:
+            return max(1, int(state.get(key) or default))
+        except (TypeError, ValueError):
+            return default
+    stack_mode = state.get("stack_pictures") or encframes.STACK_ALL
+    clip_mode = state.get("video_frames") or encframes.STACK_UP_TO_N
+    return {"stack_mode": stack_mode if stack_mode in encframes.STACK_CHOICES else encframes.STACK_ALL,
+            "stack_n": count("stack_pictures_n", encframes.STACK_DEFAULT_N),
+            "clip_mode": clip_mode if clip_mode in encframes.STACK_CHOICES else encframes.STACK_UP_TO_N,
+            "clip_n": count("video_frames_n", encframes.MAX_CLIP_FRAMES_SHOWN)}
+
+
+def _insert_ahead_of_carryover(presentation, entry) -> None:
+    """Put a picture RefMod's prompt entry ahead of the first picture that
+    isn't one of ours (the frame carried over from the previous window), after
+    any RefMod pictures already placed there, so their order is kept."""
+    ours = getattr(_insert_ahead_of_carryover, "_ours", None)
+    if ours is None or ours[0] is not presentation:
+        ours = (presentation, set())
+        _insert_ahead_of_carryover._ours = ours
+    at = next((i for i, item in enumerate(presentation)
+               if isinstance(item, dict) and item.get("type") == "image" and id(item) not in ours[1]),
+              None)
+    if at is None:
+        presentation.append(entry)
+    else:
+        presentation.insert(at, entry)
+    ours[1].add(id(entry))
+
+
+# ── Caches ────────────────────────────────────────────────────────────────
+#
+# Every sliding window is its own generate() call, so without these each
+# window re-read every mod off disk and re-ran the blur in weighted_latent().
+# Keyed by file mtime, so re-extracting a mod under the same name is picked up.
+_MOD_CACHE = collections.OrderedDict()
+_MOD_CACHE_MAX = 8
+_WEIGHTED_CACHE = collections.OrderedDict()
+_WEIGHTED_CACHE_MAX = 16
+_SHRINK_CACHE = collections.OrderedDict()
+_SHRINK_CACHE_MAX = 16
+
+
+def _cache_put(cache, key, value, limit):
+    cache[key] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
+    return value
+
+
+def _load_refmod_cached(name):
+    try:
+        stamp = os.path.getmtime(storage.mod_path(name) + ".safetensors")
+    except Exception:
+        stamp = None
+    key = (name, stamp)
+    mod = _MOD_CACHE.get(key) if stamp is not None else None
+    if mod is None:
+        mod = storage.load_refmod(name)
+        if stamp is not None:
+            _cache_put(_MOD_CACHE, key, mod, _MOD_CACHE_MAX)
+    else:
+        _MOD_CACHE.move_to_end(key)
+    mod._h3_cache_key = key if stamp is not None else None
+    return mod
+
+
+def _weighted_latent_cached(mod, strength, curve):
+    base = getattr(mod, "_h3_cache_key", None)
+    key = (base, round(float(strength), 6), tuple(curve) if isinstance(curve, (list, tuple)) else curve)
+    if base is not None and key in _WEIGHTED_CACHE:
+        _WEIGHTED_CACHE.move_to_end(key)
+        latent = _WEIGHTED_CACHE[key]
+    else:
+        latent = mod.weighted_latent(strength, curve=curve)
+        if base is not None and latent is not None:
+            _cache_put(_WEIGHTED_CACHE, key, latent, _WEIGHTED_CACHE_MAX)
+    # A clone on the way out: at strength 1.0 this is the cached mod's own
+    # tensor, and one in-place write downstream would corrupt it for every
+    # later generation.
+    return None if latent is None else latent.clone()
+
+
+# ── Prompt entries ────────────────────────────────────────────────────────
+
+def _decode_cthw(pipeline_self, latent) -> torch.Tensor:
+    """VAE-decode a visual latent to [C, T, H, W] float in [-1, 1] on the CPU."""
+    decoded = pipeline_self.vae.decode(latent.to(device=pipeline_self.device, dtype=torch.float32))
+    return decoded.float().clamp(-1.0, 1.0)[0].cpu()
+
+
+def decode_encoder_frames(pipeline_self, mod):
+    """A visual mod's encoder frames rebuilt from its latent:
+    ([N, H, W, 3] float 0..1, timestamps, layout, fps). Pictures (single or
+    stacked) are decoded one latent frame at a time -- they were encoded
+    separately, so decoding them as one clip would smear them together. A
+    video mod is decoded as a clip and sampled at two frames a second."""
+    layout = core.expected_enc_layout(mod.kind, mod.latent_t, mod.still_stack())
+    if layout == core.ENC_LAYOUT_STILLS:
+        pictures = [encframes.cap_long_edge(_qwen_frames_from_cthw(
+                        _decode_cthw(pipeline_self, mod.latent[:, :, j:j + 1])[:, :1]), core.ENC_MAX_EDGE)
+                    for j in range(mod.latent.shape[2])]
+        size = pictures[0].shape[1:3]
+        pictures = [p if p.shape[1:3] == size else
+                    F.interpolate(p.permute(0, 3, 1, 2), size=tuple(size), mode="bilinear",
+                                  align_corners=False).permute(0, 2, 3, 1) for p in pictures]
+        frames = torch.cat(pictures)
+        return frames, [float(j) for j in range(frames.shape[0])], layout, 0.0
+    video = _decode_cthw(pipeline_self, mod.latent)
+    indices, times = encframes.clip_picks(video.shape[1], encframes.ENC_FPS)
+    keep = encframes.thin_evenly(len(indices), core.ENC_MAX_CLIP_FRAMES)
+    indices, times = [indices[i] for i in keep], [times[i] for i in keep]
+    frames = encframes.cap_long_edge(_qwen_frames_from_cthw(video[:, indices]), core.ENC_MAX_EDGE_CLIP)
+    return frames, times, layout, encframes.ENC_FPS
+
+
+def _ensure_enc_frames(pipeline_self, mod) -> None:
+    """Give a mod saved without encoder frames (older mods, or ones from other
+    tools) a set decoded from its latent, once per session -- the mod is
+    cached, so later windows and runs reuse them. Without frames a mod still
+    conditions the DiT but gets no <Picture N> / <Video N> label."""
+    if not PROMPT_LABELS_FOR_REFMODS or mod.kind == "audio":
+        return
+    wanted = core.expected_enc_layout(mod.kind, mod.latent_t, mod.still_stack())
+    if mod.has_encoder_frames() and mod.enc_layout == wanted:
+        return
+    if getattr(pipeline_self, "vae", None) is None:
+        return
+    try:
+        frames, times, layout, fps = decode_encoder_frames(pipeline_self, mod)
+        mod.enc_frames, mod.enc_times, mod.enc_layout, mod.enc_fps = frames, times, layout, fps
+        _log(f"'{mod.name}': no stored encoder frames -- decoded {frames.shape[0]} for its prompt "
+             f"label (once per session; Library > Encoder frames can store them in the mod)")
+    except Exception:
+        _log(f"could not decode encoder frames for '{mod.name}'; it is injected without a prompt "
+             f"label:\n" + traceback.format_exc())
+
+
+def _dimmed(frames, strength):
+    """The same dimming _enc_item applies: a weaker mod shows the encoder a
+    weaker picture."""
+    return frames * strength + 0.5 * (1.0 - strength) if strength < 1.0 else frames
+
+
+def _enc_stack(mod, strength, shown):
+    """The prompt entry for a picture stack sent as one video: its pictures
+    (all, or up to N) as one video item."""
+    frames = getattr(mod, "enc_frames", None)
+    if not PROMPT_LABELS_FOR_REFMODS or frames is None or not frames.shape[0]:
+        return None
+    picks = encframes.stack_picks(frames.shape[0], shown["stack_mode"], shown["stack_n"])
+    chosen, stamps = encframes.stack_presentation(frames, picks)
+    _log(f"'{mod.name}': {mod.latent_t} pictures sent as one video reference "
+         f"(text encoder shown {len(picks)} of {frames.shape[0]})")
+    return {"type": "video", "frames": _dimmed(chosen, strength).clone(), "timestamps": stamps}
+
+
+def _enc_clip_shown(enc, shown):
+    """A video mod's prompt entry thinned to the panel's "frames shown"."""
+    if not isinstance(enc, dict) or enc.get("type") != "video" or shown["clip_mode"] == encframes.STACK_ALL:
+        return enc
+    frames = enc.get("frames")
+    keep = encframes.thin_evenly(frames.shape[0], shown["clip_n"])
+    if len(keep) == frames.shape[0]:
+        return enc
+    out = dict(enc, frames=frames[keep].clone())
+    if enc.get("timestamps"):
+        out["timestamps"] = [enc["timestamps"][i] for i in keep]
+    return out
+
+
+def _enc_trimmed(enc, seconds):
+    """A clip's prompt entry cut to the part a budget trim left."""
+    if not isinstance(enc, dict) or enc.get("type") != "video" or not enc.get("timestamps"):
+        return enc
+    keep = [i for i, t in enumerate(enc["timestamps"]) if t < seconds + 1e-6] or [0]
+    if len(keep) == len(enc["timestamps"]):
+        return enc
+    return dict(enc, frames=enc["frames"][keep].clone(), timestamps=[enc["timestamps"][i] for i in keep])
+
+
+def _stack_as_pictures(stack):
+    """A picture stack sent as one video, split back into its pictures."""
+    pictures = []
+    encs = stack.picture_encs or []
+    for j in range(stack.latent.shape[2]):
+        still = _RefModImageSentinel(stack.latent[:, :, j:j + 1])
+        still.enc = encs[j] if j < len(encs) else None
+        still.hide_ref = stack.hide_ref
+        still.max_short = stack.max_short
+        pictures.append(still)
+    return pictures
+
+
+# ── Mod sizing: "Max size", "Fit mods to the output size", phase 2 ────────
+
+PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF = "full", "tile", "off"
+SHRINK_REENCODE, SHRINK_FAST = "reencode", "fast"
+
+
+def _row_max_short(row):
+    """A row's "Max size" as a short edge in pixels, or None for full size."""
+    try:
+        value = int(row.get("max_size") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 32 else None
+
+
+def _state_option(state_json, key, default, allowed=None):
+    try:
+        value = json.loads(state_json).get(key, default) if state_json else default
+    except Exception:
+        return default
+    if allowed is not None:
+        value = str(value or default).lower()
+        return value if value in allowed else default
+    return value
+
+
+def _dims_for_short_edge(latent, short_px):
+    """(width, height) in pixels that bring a mod's short edge down to
+    ``short_px``, keeping its shape -- or (None, None) if it already is."""
+    try:
+        lat_h, lat_w, short_px = int(latent.shape[-2]), int(latent.shape[-1]), int(short_px)
+    except Exception:
+        return None, None
+    stored_short = min(lat_h, lat_w) * _VAE_SPATIAL_FACTOR
+    if short_px <= 0 or stored_short <= short_px:
+        return None, None
+    scale = short_px / float(stored_short)
+    new_w = max(32, int(lat_w * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
+    new_h = max(32, int(lat_h * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
+    if (new_w // _VAE_SPATIAL_FACTOR) * (new_h // _VAE_SPATIAL_FACTOR) >= lat_h * lat_w:
+        return None, None
+    return new_w, new_h
+
+
+def _fit_output_dims(latent, target_width, target_height):
+    """(width, height) in pixels that bring a mod down to a canvas's pixel
+    area, keeping its own aspect ratio -- or (None, None) if it fits already."""
+    try:
+        lat_h, lat_w = int(latent.shape[-2]), int(latent.shape[-1])
+        out_w, out_h = int(target_width), int(target_height)
+    except Exception:
+        return None, None
+    stored = lat_h * lat_w
+    canvas = (out_w / _VAE_SPATIAL_FACTOR) * (out_h / _VAE_SPATIAL_FACTOR)
+    if out_w <= 0 or out_h <= 0 or stored <= canvas:
+        return None, None
+    scale = math.sqrt(canvas / stored)
+    new_w = max(32, int(lat_w * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
+    new_h = max(32, int(lat_h * _VAE_SPATIAL_FACTOR * scale) // 32 * 32)
+    if (new_w // _VAE_SPATIAL_FACTOR) * (new_h // _VAE_SPATIAL_FACTOR) >= stored:
+        return None, None
+    return new_w, new_h
+
+
+def _phase_1_canvas(width, height):
+    """The half-size canvas phase 1 of a two-phase run renders at
+    (pipeline.py: round(target / H3_TWO_PHASE_SCALE / 32) * 32)."""
+    try:
+        from models.minimax_h3 import pipeline as h3_pipeline
+        scale = float(getattr(h3_pipeline, "H3_TWO_PHASE_SCALE", 2.0))
+    except Exception:
+        scale = 2.0
+    return (max(32, round(int(width) / scale / 32) * 32), max(32, round(int(height) / scale / 32) * 32))
+
+
+def _phase_2_tile(width, height):
+    """(width, height) of one tile of a tiled phase 2, or None."""
+    try:
+        from models.minimax_h3 import pipeline as h3_pipeline
+        return (int(h3_pipeline._spatial_tiles(int(width))[0][1]),
+                int(h3_pipeline._spatial_tiles(int(height))[0][1]))
+    except Exception:
+        return None
+
+
+def _pass_canvas(pipeline_self, pass_no):
+    """(width, height) a pass renders at: the half-size canvas for phase 1 of
+    a two-phase run, otherwise the output size."""
+    out_w, out_h = getattr(pipeline_self, "_h3_out_size", (None, None)) or (None, None)
+    if not out_w or not out_h:
+        return None, None
+    if pass_no == 1 and getattr(pipeline_self, "_h3_two_phase", False):
+        return _phase_1_canvas(out_w, out_h)
+    return int(out_w), int(out_h)
+
+
+def _shrink_target(pipeline_self, sentinel, latent, canvas_w, canvas_h, pass_no):
+    """The smallest of the sizes that apply to this mod on this pass, as
+    (width, height, reason), or None to leave it as it is:
+      * its row's "Max size" (short edge in pixels),
+      * "Fit mods to the output size" -- the canvas of this pass,
+      * "Mods in phase 2: Fit to tile" -- one tile of a tiled phase 2.
+    Phase 1 of a two-phase run is already fitted to its canvas by
+    _fit_latent_to_canvas. Only ever shrinks."""
+    candidates = []
+    cap = getattr(sentinel, "max_short", None)
+    if cap:
+        w, h = _dims_for_short_edge(latent, cap)
+        if w is not None:
+            candidates.append((w, h, f"max size {int(cap)}px"))
+    if canvas_w and canvas_h:
+        if getattr(pipeline_self, "_h3_fit_output", False):
+            w, h = _fit_output_dims(latent, canvas_w, canvas_h)
+            if w is not None:
+                candidates.append((w, h, "fit to output"))
+        if (pass_no == 2 and getattr(pipeline_self, "_h3_tiled_p2", False)
+                and getattr(pipeline_self, "_h3_p2_mode", PHASE2_MODS_FULL) == PHASE2_MODS_TILE):
+            tile = _phase_2_tile(canvas_w, canvas_h)
+            if tile:
+                w, h = _fit_output_dims(latent, tile[0], tile[1])
+                if w is not None:
+                    candidates.append((w, h, "phase-2 tile"))
+    return min(candidates, key=lambda c: c[0] * c[1]) if candidates else None
+
+
+def _apply_size_limits(pipeline_self, sentinel, kind, latent, canvas_w=None, canvas_h=None, pass_no=None):
+    """``latent`` made smaller when a size limit applies (see _shrink_target),
+    else ``latent`` unchanged. "Shrink method": Re-encode decodes the mod,
+    resizes the pixels and re-encodes them with the generation's own VAE
+    (best quality, cached so it happens once per mod and size); Fast
+    resamples the stored latent directly, the way _fit_latent_to_canvas does
+    (instant, no VAE, rougher)."""
+    if latent is None or latent.dim() != 5:
+        return latent
+    if pass_no is None:
+        pass_no = _gen_state(pipeline_self)["phase"]
+    target = _shrink_target(pipeline_self, sentinel, latent, canvas_w, canvas_h, pass_no)
+    if target is None:
+        return latent
+    new_w, new_h, reason = target
+    if getattr(pipeline_self, "_h3_shrink_fast", False):
+        smaller = _fit_latent_to_canvas(latent, new_w, new_h, 100.0, f"{kind} RefMod ({reason})")
+    else:
+        smaller = _reencode_smaller(pipeline_self, latent, kind, getattr(sentinel, "is_stack", False),
+                                    new_w, new_h)
+    if smaller is None or smaller.shape[-2] * smaller.shape[-1] >= latent.shape[-2] * latent.shape[-1]:
+        return latent
+    _log(f"{kind} RefMod shrunk ({reason}, pass {pass_no}): "
+         f"{latent.shape[-1] * _VAE_SPATIAL_FACTOR}x{latent.shape[-2] * _VAE_SPATIAL_FACTOR} -> "
+         f"{smaller.shape[-1] * _VAE_SPATIAL_FACTOR}x{smaller.shape[-2] * _VAE_SPATIAL_FACTOR}px "
+         f"(~{100.0 * smaller.shape[-2] * smaller.shape[-1] / (latent.shape[-2] * latent.shape[-1]):.0f}% "
+         f"of its tokens)")
+    return smaller
+
+
+def _reencode_smaller(pipeline_self, latent, kind, is_stack, width, height):
+    """Decode, resize the pixels to (width, height), re-encode. Pictures
+    (single or a stack) are rebuilt one at a time, never as frames of a clip.
+    Returns None to keep the stored latent."""
+    try:
+        key = (tuple(latent.shape), round(float(latent.float().sum()), 3), kind, bool(is_stack),
+               int(width), int(height))
+        if key in _SHRINK_CACHE:
+            _SHRINK_CACHE.move_to_end(key)
+            return _SHRINK_CACHE[key]
+        from models.minimax_h3 import pipeline as h3_pipeline
+        if kind == "image" or is_stack:
+            parts = []
+            for j in range(latent.shape[2]):
+                picture = _decode_cthw(pipeline_self, latent[:, :, j:j + 1])[:, :1]
+                parts.append(pipeline_self._encode_video(
+                    h3_pipeline._resize_video(picture, int(height), int(width))))
+            smaller = torch.cat(parts, dim=2)
+        else:
+            video = _decode_cthw(pipeline_self, latent)
+            smaller = pipeline_self._encode_video(h3_pipeline._resize_video(video, int(height), int(width)))
+        smaller = smaller.to(latent.dtype)
+        return _cache_put(_SHRINK_CACHE, key, smaller, _SHRINK_CACHE_MAX)
+    except Exception:
+        _log("could not rebuild a RefMod smaller; using it at its stored size:\n" + traceback.format_exc())
+        return None
+
+
+def _has_live_visual_refs(kwargs) -> bool:
+    """Does the generation have reference images or videos of its own (not
+    RefMods)? Checked before the mods are injected."""
+    video_prompt_type = str(kwargs.get("video_prompt_type") or "")
+    if [r for r in (kwargs.get("input_ref_images") or []) if not isinstance(r, _RefModImageSentinel)]:
+        return True
+    for key, letter in (("input_frames", "V"), ("input_frames2", "+"), ("input_frames3", "*")):
+        value = kwargs.get(key)
+        if value is not None and not isinstance(value, _RefModVideoSentinel) and letter in video_prompt_type:
+            return True
+    return False
+
+
+def _phase2_mods_off(pipeline_self) -> bool:
+    """True during phase 2 of a two-phase run when "Mods in phase 2" is Off
+    and it is safe to leave them out (see _set_run_options)."""
+    return bool(getattr(pipeline_self, "_h3_p2_off", False)) and _gen_state(pipeline_self)["phase"] == 2
+
+
+def _tiling_flag() -> str:
+    try:
+        from models.minimax_h3 import pipeline as h3_pipeline
+        return str(getattr(h3_pipeline, "H3_PHASE_2_TILING_FLAG", "~"))
+    except Exception:
+        return "~"
+
+
+def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
+    """Read this run's panel options onto the pipeline for the hooks."""
+    # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None
+    two_phase = (int(kwargs.get("guide_phases") or 1) > 1
+                 and kwargs.get("frozen_control_video") is None)
+    pipeline_self._h3_two_phase = two_phase
+    pipeline_self._h3_out_size = (kwargs.get("width"), kwargs.get("height"))
+    pipeline_self._h3_fit_output = bool(_state_option(state_json, "fit_to_output", False))
+    pipeline_self._h3_shrink_fast = _state_option(state_json, "shrink_method", SHRINK_REENCODE,
+                                                  (SHRINK_REENCODE, SHRINK_FAST)) == SHRINK_FAST
+    pipeline_self._h3_tiled_p2 = two_phase and _tiling_flag() in str(kwargs.get("video_prompt_type") or "")
+    p2_mode = (_state_option(state_json, "phase2_mods", PHASE2_MODS_FULL,
+                             (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF))
+               if two_phase else PHASE2_MODS_FULL)
+    pipeline_self._h3_p2_mode = p2_mode
+    p2_off = p2_mode == PHASE2_MODS_OFF
+    if p2_off and not fl2va and _has_live_visual_refs(kwargs):
+        # Ref2VA lines phase 2's references up with phase 1's by position;
+        # leaving the mods out would shift the generation's own references.
+        p2_off = False
+        _log("Mods in phase 2: Off was asked for, but this generation has reference images or "
+             "videos of its own, so the mods stay in phase 2 (Full)")
+    pipeline_self._h3_p2_off = p2_off
+    if state_json:
+        if pipeline_self._h3_fit_output:
+            _log(f"fit to output: on -- visual mods bigger than {kwargs.get('width')}x"
+                 f"{kwargs.get('height')} are made smaller to that pixel area")
+        if two_phase and p2_mode != PHASE2_MODS_FULL:
+            _log("Mods in phase 2: " + ("Off" if p2_off else "Fit to tile" if p2_mode == PHASE2_MODS_TILE
+                                        else "Full")
+                 + ("" if p2_mode != PHASE2_MODS_TILE or pipeline_self._h3_tiled_p2
+                    else " (phase 2 is not tiled in this run, so mods stay full size there)"))
+
+
+# ── FL2VA support ─────────────────────────────────────────────────────────
+#
+# The Ref2VA route can't work on FL2VA: the pipeline is built with
+# reference_mode=False, which skips every reference-building step, and any
+# value in input_ref_images / input_frames raises "Image, video, and audio
+# references require the Ref2VA checkpoint".
+#
+# But the transformer itself is model-agnostic. MiniMaxH3Model._layout picks
+# build_ref2va_packed_sequence purely on payload["refs"] being non-empty, and
+# that packer already takes first/last-frame keyframe anchors alongside
+# references. The ComfyUI original relies on exactly this: its Apply node
+# appends ref blocks to whatever conditioning it's given, FL2VA included.
+#
+# So in FL2VA the mods bypass generate()'s reference inputs entirely:
+#   * their latents are appended to the condition latents in
+#     _prepare_condition_rows (phase 1, plain phase 2, and tiled phase 2,
+#     which appends reference rows whole to every tile), and
+#   * payload["refs"] is filled in at the top of the transformer's forward
+#     whenever generate() left it empty -- phase 1 builds it as None and
+#     both phase-2 paths reset it to None.
+# The ControlNet model's control rows carry one blank row per condition row
+# ahead of the video, built BEFORE the mods are appended, so
+# _prepare_control_rows is patched to count them too.
+
+_FL2VA = {"active": False, "visual": [], "audio": [], "entries": [], "announced": False,
+          "presentation": [], "visual2": [], "entries2": [], "calls": 0, "pass_no": 1,
+          "labels_logged": False}
+
+
+def _clear_fl2va() -> None:
+    _FL2VA.update(active=False, visual=[], audio=[], entries=[], announced=False, presentation=[],
+                  visual2=[], entries2=[], calls=0, pass_no=1, labels_logged=False)
+
+
+def _transformer_has_control(transformer) -> bool:
+    """Control checkpoints attach a ControlBlock to their DiT blocks; FL2VA
+    (and FL2VA finetunes such as VDN) don't."""
+    try:
+        return any(getattr(block, "control", None) is not None
+                   for block in getattr(transformer, "blocks", None) or ())
+    except Exception:
+        return False
+
+
+def _is_fl2va_pipeline(pipeline_self) -> bool:
+    return (not getattr(pipeline_self, "reference_mode", False)
+            and getattr(pipeline_self, "fixed_prompt", None) is None
+            and not getattr(pipeline_self, "audio_only", False)
+            and (CONTROLNET_REFMODS
+                 or not _transformer_has_control(getattr(pipeline_self, "transformer", None))))
+
+
+def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
+    """Load the selection and stage it for the FL2VA hooks. Order matters:
+    the packer assigns condition rows to references in list order, so the
+    entries are built in exactly the order their latents get appended."""
+    window_no = kwargs.get("window_no")
+    labels_on = PROMPT_LABELS_FOR_REFMODS and str(FL2VA_PROMPT_LABELS or "none").lower() != "none"
+    visual_labels = labels_on
+    built = _build_refmod_sentinels(
+        pipeline_self, state_json, window_no,
+        image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False),
+        visual_labels=visual_labels)
+    if built is None:
+        return False
+    image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode = built
+    two_phase = bool(getattr(pipeline_self, "_h3_two_phase", False))
+    p2_off = bool(getattr(pipeline_self, "_h3_p2_off", False))
+
+    def sized(sentinel, kind, pass_no):
+        # FL2VA can't size mods inside generate() the way the Ref2VA hooks
+        # do, so each pass gets its own copy, sized for that pass up front:
+        # phase 1 of a two-phase run fitted to its canvas, then the limits.
+        canvas = _pass_canvas(pipeline_self, pass_no)
+        latent = sentinel.latent
+        if two_phase and pass_no == 1 and canvas[0]:
+            latent = _fit_latent_to_canvas(latent, canvas[0], canvas[1], 100.0, f"{kind} RefMod")
+        return _apply_size_limits(pipeline_self, sentinel, kind, latent, *canvas, pass_no=pass_no)
+
+    def build_pass(pass_no):
+        visual, entries = [], []
+        if not (pass_no == 2 and p2_off):
+            for sentinel in image_sentinels:
+                latent = sized(sentinel, "image", pass_no)
+                visual.append(latent)
+                entries.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+            for sentinel in video_sentinels:
+                latent = sized(sentinel, "video", pass_no)
+                visual.append(latent)
+                entries.append({"kind": "video", "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
+                                "latent_w": latent.shape[-1], "ref_audio_t": 0})
+        # Phase 2 reuses phase 1's audio rows, so every audio entry stays.
+        for sentinel in audio_sentinels:
+            entries.append({"kind": "audio", "ref_audio_t": sentinel.latent.shape[-1]})
+        return visual, entries
+
+    visual, entries = build_pass(1)
+    visual2, entries2 = build_pass(2) if two_phase else (visual, entries)
+    labels = []
+    if visual_labels:
+        # In the order the references are packed: pictures, videos, audio.
+        labels = [s.enc for s in image_sentinels + video_sentinels if isinstance(s.enc, dict)]
+    if labels_on:
+        labels += [{"type": "audio"} for _ in audio_sentinels]
+    _FL2VA.update(active=True, visual=visual, audio=[s.latent for s in audio_sentinels], entries=entries,
+                  announced=False, presentation=labels, visual2=visual2, entries2=entries2, calls=0,
+                  pass_no=1)
+    _log(f"FL2VA: staging {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
+         f"{len(audio_sentinels)} audio-kind RefMod reference(s), retention={retention:.2f} "
+         f"(~{total_tokens} tokens); prompt labels: "
+         + (", ".join(f"<{ {'image': 'Picture', 'video': 'Video', 'audio': 'Audio'}[e['type']]}>" for e in labels)
+            or "none"))
+    return True
+
+
+def _append_fl2va_rows(pipeline_self, visual_latents, audio_latents) -> None:
+    """From _prepare_condition_rows: add the staged mods to this pass's
+    condition latents. Audio only on the first pass -- both phase-2 paths
+    pass a throwaway [] for audio and keep phase 1's audio rows."""
+    if not _FL2VA["active"] or getattr(pipeline_self, "reference_mode", False) \
+            or not isinstance(visual_latents, list):
+        return
+    first_pass = _FL2VA["calls"] == 0
+    _FL2VA["calls"] += 1
+    _FL2VA["pass_no"] = 1 if first_pass else 2
+    visual_latents.extend(_FL2VA["visual"] if first_pass else _FL2VA["visual2"])
+    if first_pass and isinstance(audio_latents, list):
+        audio_latents.extend(_FL2VA["audio"])
+
+
+_FL2VA_HOOKS_MARKER = "_h3refmod_fl2va_hooks"
+
+
+def _install_fl2va_hooks(Pipeline) -> None:
+    if not FL2VA_REFMODS or getattr(Pipeline, _FL2VA_HOOKS_MARKER, False):
+        return
+    setattr(Pipeline, _FL2VA_HOOKS_MARKER, True)
+
+    _orig_encode_prompt = getattr(Pipeline, "_encode_prompt", None)
+    if _orig_encode_prompt is not None:
+        @functools.wraps(_orig_encode_prompt)
+        def patched_encode_prompt(self, prompt, presentation, *args, **kwargs):
+            # FL2VA builds its presentation from keyframes only; the staged
+            # labels go after them, so a start frame stays <Picture 1>.
+            if _FL2VA["active"] and _FL2VA.get("presentation") and isinstance(presentation, list):
+                presentation.extend(_FL2VA["presentation"])
+                if not _FL2VA.get("labels_logged"):
+                    _FL2VA["labels_logged"] = True
+                    counts = {"image": 0, "video": 0, "audio": 0}
+                    named = []
+                    for item in presentation:
+                        kind = item.get("type")
+                        if kind in counts:
+                            counts[kind] += 1
+                            if any(item is ours for ours in _FL2VA["presentation"]):
+                                named.append(f"<{ {'image': 'Picture', 'video': 'Video', 'audio': 'Audio'}[kind]} {counts[kind]}>")
+                    _log("FL2VA: RefMods in the prompt as " + ", ".join(named))
+            return _orig_encode_prompt(self, prompt, presentation, *args, **kwargs)
+        Pipeline._encode_prompt = patched_encode_prompt
+
+    _orig_prepare_control_rows = getattr(Pipeline, "_prepare_control_rows", None)
+    if _orig_prepare_control_rows is not None and CONTROLNET_REFMODS:
+        @functools.wraps(_orig_prepare_control_rows)
+        def patched_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
+                                         height, width, condition_latents, *args, **kwargs):
+            if _FL2VA["active"] and _FL2VA["visual"] and isinstance(condition_latents, (list, tuple)):
+                condition_latents = list(condition_latents) + list(_FL2VA["visual"])
+                _log(f"FL2VA ControlNet: control rows padded for {len(_FL2VA['visual'])} RefMod "
+                     f"reference(s)")
+            return _orig_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
+                                              height, width, condition_latents, *args, **kwargs)
+        Pipeline._prepare_control_rows = patched_prepare_control_rows
+
+    try:
+        from models.minimax_h3 import transformer as h3_transformer
+        Model = h3_transformer.MiniMaxH3Model
+    except Exception as e:
+        _log(f"could not reach MiniMaxH3Model ({e!r}); RefMods won't work in FL2VA")
+        return
+    _orig_forward = Model.forward
+
+    @functools.wraps(_orig_forward)
+    def patched_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload, *args, **kwargs):
+        if _FL2VA["active"] and _FL2VA["entries"] and isinstance(payload, dict) and not payload.get("refs"):
+            payload["refs"] = list(_FL2VA["entries2"] if _FL2VA["pass_no"] == 2 else _FL2VA["entries"])
+            if not _FL2VA["announced"]:
+                _FL2VA["announced"] = True
+                _log(f"FL2VA: {len(_FL2VA['entries'])} RefMod reference(s) attached to the "
+                     f"transformer payload -- the reference-aware packer is now in use")
+        return _orig_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
+                             *args, **kwargs)
+
+    Model.forward = patched_forward
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Extraction
 # ═══════════════════════════════════════════════════════════════════════════
+
+PROMPT_LABELS_FOR_REFMODS = True   # give each RefMod its own <Picture N> /
+                                   # <Video N> / <Audio N> entry in the prompt
+
+# What a video-kind mod does on sliding windows after the first one. Image and
+# audio mods always reach every window, which is what WanGP itself does with
+# live references: src_ref_images and audio_guide are both assigned once,
+# before the window loop in wgp.py, and handed to every generate() call, and a
+# reference video ("-") is re-extracted from frame 0 on every window
+# (guide_frames_extract_start = 0 if reference_videos). Video mods are the one
+# case worth a choice, because a whole clip given to a later window can let a
+# few of its own frames surface at the window boundary.
+WINDOW_MODE_STILL = "still"   # first latent frame only, as an image reference
+WINDOW_MODE_FULL = "full"     # the whole clip, exactly like a live reference video
+WINDOW_MODE_FIRST = "first"   # nothing at all after window 1
+WINDOW_MODE_DEFAULT = WINDOW_MODE_STILL
+
+
+_VAE_SPATIAL_FACTOR = 16   # pixels per latent cell, both axes
+
+
+def _should_fit(pipeline_self, target_width, target_height) -> bool:
+    """True only while rendering a reduced canvas -- i.e. phase 1 of a
+    two-phase run. Single-phase runs and phase 2 are handed the full canvas
+    and are deliberately left untouched."""
+    full = _gen_state(pipeline_self).get("full_canvas")
+    if not full or None in full:
+        return False
+    try:
+        return int(target_width) < int(full[0]) or int(target_height) < int(full[1])
+    except (TypeError, ValueError):
+        return False
+
+
+def _fit_latent_to_canvas(latent, target_width, target_height, relative_size=100.0, label=""):
+    """Shrink a RefMod latent so it fits the canvas this phase is rendering at.
+
+    Two-phase generation renders phase 1 at half resolution
+    (``H3_TWO_PHASE_SCALE``), and every *live* reference is fitted to that
+    smaller canvas before being encoded -- `_prepare_image_reference` resizes
+    to a pixel budget of ``target_w * target_h * relative_size / 100``, and
+    reference videos go through `_resize_video`. A RefMod arrives already
+    encoded, so nothing used to fit it: phase 1 got a reference several times
+    larger than the frame it was conditioning, costing tokens and sitting at
+    a different scale from everything else.
+
+    The latent is resampled on its spatial axes only (time, and the 24
+    channels, are untouched), keeping aspect ratio, and **only ever made
+    smaller** -- a mod extracted below the canvas is left exactly as it is
+    rather than being blown up into detail it never had. Phase 2 and
+    single-phase runs pass the full canvas, so a normally-sized mod is
+    untouched there.
+    """
+    if latent is None or latent.dim() != 5:
+        return latent
+    h, w = latent.shape[-2], latent.shape[-1]
+    try:
+        budget = float(target_width) * float(target_height) * float(relative_size) / 100.0
+    except (TypeError, ValueError):
+        return latent
+    if budget <= 0:
+        return latent
+    current = (h * _VAE_SPATIAL_FACTOR) * (w * _VAE_SPATIAL_FACTOR)
+    if current <= budget:
+        return latent
+    scale = (budget / current) ** 0.5
+    # keep both axes even: the DiT patchifies the latent in 2x2 cells
+    new_h = max(2, int(round(h * scale / 2)) * 2)
+    new_w = max(2, int(round(w * scale / 2)) * 2)
+    if new_h >= h and new_w >= w:
+        return latent
+    new_h, new_w = min(new_h, h), min(new_w, w)
+    t = latent.shape[2]
+    flat = latent.reshape(latent.shape[0] * latent.shape[1], t, h, w)
+    resized = torch.nn.functional.interpolate(flat, size=(new_h, new_w), mode="area")
+    out = resized.reshape(latent.shape[0], latent.shape[1], t, new_h, new_w).to(latent.dtype)
+    _log(f"fitted {label or 'RefMod'} to this phase's canvas: {w}x{h} -> {new_w}x{new_h} latent cells "
+         f"({w * _VAE_SPATIAL_FACTOR}x{h * _VAE_SPATIAL_FACTOR}px -> "
+         f"{new_w * _VAE_SPATIAL_FACTOR}x{new_h * _VAE_SPATIAL_FACTOR}px)")
+    return out
+
+
+def _enc_item(mod, kind, frame_index, strength):
+    """The presentation entry for one RefMod reference, or None when the mod
+    carries no encoder frames (extracted before they were stored -- it still
+    conditions the DiT, it just gets no prompt label).
+
+    Frames are dimmed toward mid-grey in step with ``strength`` so the text
+    encoder is never shown a stronger reference than the DiT receives."""
+    if not PROMPT_LABELS_FOR_REFMODS:
+        return None
+    frames = getattr(mod, "enc_frames", None)
+    if frames is None or not frames.shape[0]:
+        return None
+    try:
+        if kind == "image":
+            index = min(frame_index, frames.shape[0] - 1)
+            chosen, stamps = frames[index:index + 1], None
+        else:
+            chosen = frames
+            times = list(getattr(mod, "enc_times", []) or [])
+            stamps = times[:chosen.shape[0]] if len(times) >= chosen.shape[0] else None
+        if strength < 1.0:
+            chosen = chosen * strength + 0.5 * (1.0 - strength)
+        item = {"type": kind, "frames": chosen.clone()}
+        if kind == "video" and stamps:
+            item["timestamps"] = stamps
+        return item
+    except Exception:
+        _log("could not build a RefMod's prompt entry:\n" + traceback.format_exc())
+        return None
+
+
+def _enc_as_still(enc):
+    """Re-label a video mod's prompt entry as a still picture, keeping only
+    its first frame. Used when a video-kind RefMod ends up on the image
+    reference path (image / single-frame output): the DiT then receives one
+    still latent, so the text encoder must be shown one still too -- labelled
+    "<Picture N>", not "<Video N>", or the prompt would address something
+    that is not there."""
+    if not isinstance(enc, dict) or enc.get("type") != "video":
+        return enc
+    frames = enc.get("frames")
+    if frames is None or not getattr(frames, "shape", (0,))[0]:
+        return None
+    return {"type": "image", "frames": frames[:1].clone()}
+
+
+def _present_refmod(presentation, sentinel) -> None:
+    """Append this mod's prompt entry, so the text encoder sees it and the
+    prompt can address it as "<Picture N>" / "<Video N>" / "<Audio N>" --
+    exactly what a live reference gets. Without it the mod's latent still
+    conditions the DiT, but nothing in the text stream points at it, so H3's
+    own prompt structure ("<Subject 1> is the violinist from <Picture 1>")
+    has nothing to bind to."""
+    if not PROMPT_LABELS_FOR_REFMODS or presentation is None or sentinel.enc is None:
+        return
+    try:
+        if getattr(sentinel, "label_first", False) and sentinel.enc.get("type") == "image":
+            _insert_ahead_of_carryover(presentation, sentinel.enc)   # fork
+            return
+        presentation.append(sentinel.enc)
+    except Exception:
+        _log("could not add a RefMod's prompt entry:\n" + traceback.format_exc())
+
+
+def _qwen_frames_from_cthw(video: torch.Tensor) -> torch.Tensor:
+    """[C, T, H, W] in [-1, 1] -> [T, H, W, 3] in [0, 1]; the same conversion
+    pipeline.py's own _qwen_frames() applies before handing a live reference
+    to the Qwen3-VL text/vision encoder."""
+    return video.permute(1, 2, 3, 0).add(1.0).mul(0.5).clamp(0.0, 1.0).float().cpu()
+
 
 def _encode_ref_image(pipeline_self, video_cthw: torch.Tensor) -> torch.Tensor:
     """[C, 1, H, W] pixel tensor -> [1, 24, 1, H, W] VAE latent (cpu)."""
@@ -2884,14 +2283,11 @@ def _encode_ref_audio(pipeline_self, waveform: torch.Tensor) -> torch.Tensor:
 
 
 def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
-    """Audio-ONLY mod extraction (no image/video sources given).
-
-    Audio given ALONGSIDE images or video doesn't come here: it is encoded by
-    the visual path and stored as that mod's soundtrack. The two latents are
-    never stacked -- an audio latent [1, 32, 2, T] and a visual one
-    [1, 24, T, H, W] have incompatible shapes -- they are stored side by side
-    and injected as separate references. Audio is always full-fidelity
-    ("encode"-only -- there's no spatial grid to pool, so "training" mode's
+    """Audio-mod extraction -- entirely separate from the image/video path
+    above, since an audio VAE latent [1, 32, 2, T] (channels x stereo x
+    time) is structurally incompatible to stack alongside a visual latent
+    [1, 24, T, H, W]. Audio mods are always full-fidelity ("encode"-only --
+    there's no spatial grid to pool for audio, so "training" mode's
     compression concept doesn't apply)."""
     name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")
     concept_type = spec.get("concept_type", "generic")
@@ -2916,9 +2312,10 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
     # in plugin.py) only comes into play once the *real* audio latent gets
     # produced below, for the token-budget and duration-reporting math.
     target_px = (latent_frames - 1) * 4 + 1 if latent_frames > 1 else 1
-    # Since fork.16 an audio mod's length is its own "Soundtrack length"
-    # setting; specs without one keep the old video-slider length.
-    target_seconds = _audio_seconds(spec, target_px / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
+    target_seconds = target_px / FPS_ASSUMED_FOR_DURATION_ESTIMATE
+    # Fork: the extractor's own "Soundtrack length" sets an audio mod's
+    # length when it is given; specs without it keep the duration above.
+    target_seconds = _audio_seconds(spec, target_seconds)
 
     status(f"H3 RefMod: loading audio reference (up to ~{target_seconds:.1f}s, mode=encode -- "
           f"audio mods are always full-fidelity)")
@@ -2927,7 +2324,7 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
         full_seconds = sf.info(audio_path).frames / sf.info(audio_path).samplerate
         if full_seconds > target_seconds + 0.15:
             status(f"H3 RefMod: this file is ~{full_seconds:.1f}s long, but only the first "
-                  f"~{target_seconds:.1f}s (set by 'Soundtrack length') will be "
+                  f"~{target_seconds:.1f}s (set by the extractor's audio length) will be "
                   f"used -- raise that slider before extracting if you want more of it kept.")
     except Exception:
         pass
@@ -2970,32 +2367,108 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
         status(f"H3 RefMod '{name}' extracted ({mod.token_count} tokens) but not saved (save=false)")
 
 
-def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
-    """Add, replace or remove the soundtrack on mods that already exist, so a
-    visual mod doesn't have to be rebuilt from its sources to gain one.
-    Encoding needs the audio VAE, hence a task rather than a plain UI action."""
-    names = [n for n in (spec.get("names") or []) if n]
+# ── Fork: soundtracks, and the Library / Decompile jobs ───────────────────
+
+def _require_audio_length(waveform, what: str) -> float:
+    """Refuse audio shorter than MIN_AUDIO_SECONDS; returns its length."""
+    seconds = waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
+    if seconds < MIN_AUDIO_SECONDS - 0.05:
+        raise ExtractionBlocked(
+            f"{what} is only ~{seconds:.1f}s long. H3 needs at least {MIN_AUDIO_SECONDS:g}s of "
+            f"audio to use it as a reference -- use a longer clip, or a longer part of it.")
+    return seconds
+
+
+def _audio_seconds(spec: dict, fallback: float) -> float:
+    """The extractor's audio length ("Soundtrack length"), never under the
+    minimum. Specs without one keep ``fallback``."""
+    try:
+        value = float(spec["audio_seconds"]) if spec.get("audio_seconds") is not None else float(fallback)
+    except (TypeError, ValueError):
+        value = float(fallback)
+    return max(MIN_AUDIO_SECONDS, value)
+
+
+def _read_soundtrack(spec, image_paths, video_paths, status):
+    """The soundtrack for a visual mod as a [1, 2, samples] waveform, or None.
+
+    An audio file given with the images/videos, or -- with "Use the clip's own
+    audio" -- the first video source that has a soundtrack (a chosen audio
+    file wins). Its length is "Soundtrack length"; a trimmed clip's audio
+    starts at the trim start. Audio shorter than H3's 2-second minimum is
+    refused, except a clip's own audio, which is kept with a warning so the
+    clip can still make a visual mod."""
     audio_path = spec.get("audio_path") or None
-    remove = bool(spec.get("remove"))
-    seconds = float(spec.get("seconds") or 0.0)
+    from_clip = False
+    if not audio_path and spec.get("use_clip_audio") and video_paths:
+        for candidate in video_paths:
+            if storage.video_has_audio(candidate):
+                audio_path, from_clip = candidate, True
+                status(f"H3 RefMod: using the clip's own audio from {os.path.basename(str(candidate))}")
+                break
+        else:
+            status("H3 RefMod: 'Use the clip's own audio' was set, but no video source has an audio "
+                   "track -- extracting without a soundtrack")
+    if not audio_path:
+        return None
+    seconds = _audio_seconds(spec, DEFAULT_AUDIO_SECONDS)
+    trim = (spec.get("video_trims") or {}).get(os.path.basename(str(audio_path)))
+    waveform = storage.extract_audio_from_video(audio_path, max_seconds=seconds,
+                                                start_seconds=float(trim[0]) if trim else 0.0)
+    if waveform is None:
+        raise ExtractionBlocked(f"No audio could be read from {os.path.basename(str(audio_path))}.")
+    where = (f"The audio from {os.path.basename(str(audio_path))}"
+             + (f" (from {float(trim[0]):g}s, the trim start)" if trim else ""))
+    got = waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
+    if from_clip and got < MIN_AUDIO_SECONDS - 0.05:
+        status(f"H3 RefMod: ⚠️ {where} is only ~{got:.1f}s long -- kept anyway, but H3 documents "
+               f"{MIN_AUDIO_SECONDS:g}s as the shortest usable audio reference, so this voice may "
+               f"not be picked up.")
+    elif not from_clip:
+        got = _require_audio_length(waveform, where)
+    status(f"H3 RefMod: soundtrack ~{got:.1f}s (Soundtrack length {seconds:g}s)")
+    return waveform
+
+
+def _cat_enc_frames(frames_list):
+    """Join per-source encoder frames into one [N, H, W, 3] tensor, resizing
+    any that differ to the largest size (training mode keeps each source's
+    own aspect, so they can)."""
+    if len({tuple(f.shape[1:3]) for f in frames_list}) > 1:
+        h = max(f.shape[1] for f in frames_list)
+        w = max(f.shape[2] for f in frames_list)
+        frames_list = [f if tuple(f.shape[1:3]) == (h, w) else
+                       F.interpolate(f.permute(0, 3, 1, 2), size=(h, w), mode="bilinear",
+                                     align_corners=False).permute(0, 2, 3, 1) for f in frames_list]
+    return torch.cat(frames_list)
+
+
+def _enable_vae_tiling(pipeline_self) -> None:
+    """These jobs run before generate() has set up the VAE (see the same step
+    in _run_extract_job)."""
+    try:
+        pipeline_self._configure_tiling(None)
+    except Exception as e:
+        _log(f"could not enable VAE tiling before the job ({e!r}); continuing untiled")
+
+
+def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
+    """Library: add, replace or remove the soundtrack on existing image/video
+    mods, so a mod doesn't have to be rebuilt from its sources to gain one."""
+    names = [n for n in (spec.get("names") or []) if n]
+    audio_path, remove = spec.get("audio_path") or None, bool(spec.get("remove"))
     if not names:
         status("Attach audio: nothing selected.")
         return
-    if not audio_path and not remove:
-        status("Attach audio: pick an audio file, or tick Remove.")
-        return
-
     latent = None
     if not remove:
-        # Accepts a video file as well as an audio one: its soundtrack is
-        # pulled out first, so an existing mod can be given the voice from the
-        # very clip it was built from -- provided you still have that file,
-        # since a mod records no source paths.
+        if not audio_path:
+            status("Attach audio: pick an audio file, or tick Remove.")
+            return
         waveform = storage.extract_audio_from_video(
-            audio_path, max_seconds=max(MIN_AUDIO_SECONDS, seconds or DEFAULT_AUDIO_SECONDS))
+            audio_path, max_seconds=max(MIN_AUDIO_SECONDS, float(spec.get("seconds") or DEFAULT_AUDIO_SECONDS)))
         if waveform is None:
-            status(f"Attach audio: no audio track could be read from "
-                   f"{os.path.basename(str(audio_path))}.")
+            status(f"Attach audio: no audio track could be read from {os.path.basename(str(audio_path))}.")
             return
         try:
             _require_audio_length(waveform, f"The audio in {os.path.basename(str(audio_path))}")
@@ -3003,86 +2476,73 @@ def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
             status(f"Attach audio refused: {blocked}")
             return
         latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
-        if latent.dim() != 4 or latent.shape[1] != 32 or latent.shape[2] != 2:
-            raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(latent.shape)}.")
-        status(f"Attach audio: encoded {latent.shape[-1]} audio latents "
-               f"(~{latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s, "
-               f"+{latent.shape[-1] * 2} tokens per mod)")
-
     done = skipped = failed = 0
     for index, name in enumerate(names, 1):
         try:
             mod = storage.load_refmod(name)
-            if mod.kind == "audio":
+            if mod.kind == "audio" or (remove and mod.audio_latent is None):
                 skipped += 1
-                status(f"[{index}/{len(names)}] '{name}' is an audio mod -- nothing to attach to")
-                continue
-            if remove and mod.audio_latent is None:
-                skipped += 1
-                status(f"[{index}/{len(names)}] '{name}' has no soundtrack")
+                status(f"[{index}/{len(names)}] '{name}': nothing to do")
                 continue
             mod.audio_latent = None if remove else latent.clone()
             mod.audio_t = 0 if remove else int(latent.shape[-1])
             mod.save(storage.mod_path(name))
             done += 1
             status(f"[{index}/{len(names)}] '{name}': "
-                   + ("soundtrack removed" if remove else
-                      f"soundtrack attached, mod is now {mod.token_count} tokens"))
+                   + ("soundtrack removed" if remove else f"soundtrack attached, now {mod.token_count} tokens"))
         except Exception:
             failed += 1
             _log(f"could not update {name!r}:\n" + traceback.format_exc())
-            status(f"[{index}/{len(names)}] '{name}': failed -- see the console")
     status(f"Attach audio finished: {done} updated, {skipped} skipped, {failed} failed.")
 
 
-def _attach_encoder_frames(pipeline_self, mod, status) -> bool:
-    """Decode a visual mod once and store the result in it as its encoder
-    frames, so generations never have to decode it. A failure only costs the
-    speed-up: the mod is still saved, and decodes at generation time instead."""
-    if mod.kind == "audio":
-        return False
-    try:
-        frames, times, fps, layout = decode_encoder_frames(pipeline_self, mod)
-        mod.set_encoder_frames(frames, times, fps, layout)
-        status(f"H3 RefMod: stored {len(times)} encoder frame(s) ({layout}, "
-               f"{frames.shape[2]}x{frames.shape[1]}px)")
-        return True
-    except Exception:
-        mod.clear_encoder_frames()
-        _log("could not store encoder frames; the mod is saved without them and will be "
-             "decoded at generation time instead:\n" + traceback.format_exc())
-        status("H3 RefMod: could not store encoder frames (see the console) -- saving without them")
-        return False
-
-
-def _decode_audio_latent(pipeline_self, latent) -> torch.Tensor:
-    """An H3 audio latent [1, 32, 2, T] -> waveform [2, samples] at 32 kHz,
-    with the pipeline's own audio VAE (the one that decodes generated sound)."""
-    audio_vae = getattr(pipeline_self, "audio_vae", None)
-    if audio_vae is None:
-        raise RuntimeError("this pipeline has no audio VAE to decode with")
-    waveform = audio_vae.decode(latent.to(device=pipeline_self.device, dtype=torch.float32))[0]
-    return waveform.float().clamp(-1.0, 1.0).cpu()
+def _run_store_frames_job(pipeline_self, spec: dict, status) -> None:
+    """Library: store encoder frames in mods saved without them (decoded from
+    the latent), so their prompt labels never need a decode at generation."""
+    names = storage.list_refmods_missing_frames() if spec.get("all_missing") else \
+        [n for n in (spec.get("names") or []) if n]
+    if not names:
+        status("Encoder frames: nothing to do -- every mod already has them.")
+        return
+    done = skipped = failed = 0
+    for index, name in enumerate(names, 1):
+        try:
+            mod = storage.load_refmod(name)
+            wanted = core.expected_enc_layout(mod.kind, mod.latent_t, mod.still_stack())
+            if mod.kind == "audio" or (mod.has_encoder_frames() and mod.enc_layout == wanted):
+                skipped += 1
+                status(f"[{index}/{len(names)}] '{name}': nothing to do")
+                continue
+            mod.enc_frames, mod.enc_times, mod.enc_layout, mod.enc_fps = \
+                decode_encoder_frames(pipeline_self, mod)
+            mod.save(storage.mod_path(name))
+            done += 1
+            status(f"[{index}/{len(names)}] '{name}': stored {len(mod.enc_times)} encoder frame(s)")
+        except Exception:
+            failed += 1
+            _log(f"could not store encoder frames for {name!r}:\n" + traceback.format_exc())
+    status(f"Encoder frames finished: {done} updated, {skipped} skipped, {failed} failed.")
 
 
 def _run_decompile_job(pipeline_self, spec: dict, status) -> None:
-    """Reconstruct what a mod holds as ordinary files: one PNG per picture, an
-    MP4 for a video, a WAV for its audio. These are VAE reconstructions of the
-    stored latents, not the original sources -- whatever extraction discarded
-    (resolution, the parts outside a trim, pooled detail in training mode,
-    the individual pictures behind a merge) can't come back."""
+    """Decompile tab: what a mod holds, rebuilt as ordinary files -- one PNG
+    per picture, an MP4 for a video, a WAV for its audio. These are VAE
+    reconstructions of the stored latents, not the original sources."""
     name = spec.get("name")
     if not name:
         status("Decompile: no mod chosen.")
         return
     mod = storage.load_refmod(name)
     out = storage.clear_decompile_dir(name)
-    written = []
-    soundtrack_path = None
+    written, soundtrack_path = [], None
     audio_latent = mod.latent if mod.kind == "audio" else mod.audio_latent
     if audio_latent is not None:
         try:
-            waveform = _decode_audio_latent(pipeline_self, audio_latent)
+            audio_vae = getattr(pipeline_self, "audio_vae", None)
+            if audio_vae is None:
+                raise RuntimeError("this pipeline has no audio VAE to decode with")
+            waveform = audio_vae.decode(audio_latent.to(device=pipeline_self.device,
+                                                        dtype=torch.float32))[0].float().clamp(-1, 1).cpu()
             soundtrack_path = storage.save_wav(
                 waveform, os.path.join(out, "audio.wav" if mod.kind == "audio" else "soundtrack.wav"))
             written.append(f"{os.path.basename(soundtrack_path)} "
@@ -3092,62 +2552,26 @@ def _run_decompile_job(pipeline_self, spec: dict, status) -> None:
             _log(f"decompile: could not decode the audio of {name!r}:\n" + traceback.format_exc())
             status(f"Decompile: the audio of '{name}' could not be decoded -- see the console")
     if mod.kind != "audio":
-        if mod.still_stack() or mod.kind == "image" or mod.latent.shape[2] <= 1:
-            # Pictures were encoded one by one, so they're decoded one by one.
-            count = mod.latent.shape[2]
-            for j in range(count):
-                picture = _cthw_to_thwc01(_decode_cthw(pipeline_self, mod.latent[:, :, j:j + 1]))[0]
+        if mod.kind == "image" or mod.still_stack() or mod.latent.shape[2] <= 1:
+            size = ""
+            for j in range(mod.latent.shape[2]):   # pictures were encoded one by one
+                picture = _qwen_frames_from_cthw(_decode_cthw(pipeline_self, mod.latent[:, :, j:j + 1])[:, :1])[0]
                 storage.save_png(picture, os.path.join(out, f"picture_{j + 1:02d}.png"))
-                if j == 0:
-                    size = f"{picture.shape[1]}x{picture.shape[0]}"
-            written.append(f"{count} picture(s), {size}px")
+                size = size or f"{picture.shape[1]}x{picture.shape[0]}"
+            written.append(f"{mod.latent.shape[2]} picture(s), {size}px")
         else:
-            frames = _cthw_to_thwc01(_decode_cthw(pipeline_self, mod.latent))
-            storage.save_mp4(frames, os.path.join(out, "video.mp4"),
-                                    FPS_ASSUMED_FOR_DURATION_ESTIMATE, soundtrack_path)
-            written.append(f"video.mp4 ({frames.shape[0]} frames, ~"
-                           f"{frames.shape[0] / FPS_ASSUMED_FOR_DURATION_ESTIMATE:.1f}s, "
+            frames = _qwen_frames_from_cthw(_decode_cthw(pipeline_self, mod.latent))
+            storage.save_mp4(frames, os.path.join(out, "video.mp4"), FPS_ASSUMED_FOR_DURATION_ESTIMATE,
+                             soundtrack_path)
+            written.append(f"video.mp4 ({frames.shape[0]} frames, "
+                           f"~{frames.shape[0] / FPS_ASSUMED_FOR_DURATION_ESTIMATE:.1f}s, "
                            f"{frames.shape[2]}x{frames.shape[1]}px"
                            + (", with its soundtrack" if soundtrack_path else "") + ")")
-            frames = None
     status(f"Decompile finished: '{name}' -> " + ", ".join(written) + f" in {out}")
 
 
-def _run_store_frames_job(pipeline_self, spec: dict, status) -> None:
-    """Add encoder frames to mods that were saved without them (or whose
-    stored frames no longer match how the mod is used). Decoding needs the
-    video VAE, hence a task rather than a plain UI action. Only the frames
-    are added; the latent, soundtrack and metadata are rewritten unchanged."""
-    names = [n for n in (spec.get("names") or []) if n]
-    if spec.get("all_missing"):
-        names = storage.list_refmods_missing_frames()
-    if not names:
-        status("Encoder frames: nothing to do -- every mod already has them.")
-        return
-    done = skipped = failed = 0
-    for index, name in enumerate(names, 1):
-        try:
-            mod = storage.load_refmod(name)
-            if mod.kind == "audio":
-                skipped += 1
-                status(f"[{index}/{len(names)}] '{name}' is an audio mod -- nothing to show the encoder")
-                continue
-            if mod.encoder_frames_usable(encframes.ENC_FPS):
-                skipped += 1
-                status(f"[{index}/{len(names)}] '{name}' already has encoder frames")
-                continue
-            if _attach_encoder_frames(pipeline_self, mod, lambda msg: None):
-                mod.save(storage.mod_path(name))
-                done += 1
-                status(f"[{index}/{len(names)}] '{name}': stored {len(mod.enc_times)} encoder frame(s)")
-            else:
-                failed += 1
-                status(f"[{index}/{len(names)}] '{name}': failed -- see the console")
-        except Exception:
-            failed += 1
-            _log(f"could not store encoder frames for {name!r}:\n" + traceback.format_exc())
-            status(f"[{index}/{len(names)}] '{name}': failed -- see the console")
-    status(f"Encoder frames finished: {done} updated, {skipped} skipped, {failed} failed.")
+_EXTRA_JOBS = {"attach_audio": _run_attach_audio_job, "store_frames": _run_store_frames_job,
+               "decompile": _run_decompile_job}
 
 
 def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> None:
@@ -3162,14 +2586,10 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             except Exception:
                 pass
 
-    if spec.get("op") == "attach_audio":
-        _run_attach_audio_job(pipeline_self, spec, status)
-        return
-    if spec.get("op") == "store_frames":
-        _run_store_frames_job(pipeline_self, spec, status)
-        return
-    if spec.get("op") == "decompile":
-        _run_decompile_job(pipeline_self, spec, status)
+    # Fork: other jobs that need the loaded VAEs ride the same channel.
+    if spec.get("op") in _EXTRA_JOBS:
+        _enable_vae_tiling(pipeline_self)
+        _EXTRA_JOBS[spec["op"]](pipeline_self, spec, status)
         return
 
     name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")
@@ -3184,6 +2604,9 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         video_paths = [p for p in (spec.get("video_path"), spec.get("video_path2")) if p]
     audio_path = spec.get("audio_path") or None
     ref_resolution = int(spec.get("ref_resolution", 1024))
+    # Long edge of the frames shown to Qwen3-VL (the <Picture N> channel).
+    # 0 / missing = the module default, which is live-reference parity.
+    enc_resolution = int(spec.get("enc_resolution", 0)) or core.ENC_MAX_EDGE
     pool_h = int(spec.get("pool_h", 16))
     pool_w = int(spec.get("pool_w", 16))
     latent_frames = int(spec.get("latent_frames", 16))
@@ -3201,49 +2624,11 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     if not image_paths and not video_paths:
         raise ValueError("RefMod extraction: no reference image(s) or video provided.")
 
-    # The soundtrack is chosen and read FIRST: a clip too short to use is
-    # refused before any slow visual encoding, not after it.
-    # "Use the clip's own audio": the first video source with a soundtrack;
-    # a separately chosen audio file always wins if both are given.
-    from_clip = False
-    if not audio_path and spec.get("use_clip_audio") and video_paths:
-        for candidate in video_paths:
-            if storage.video_has_audio(candidate):
-                audio_path = candidate
-                from_clip = True
-                status(f"H3 RefMod: using the clip's own audio from "
-                       f"{os.path.basename(candidate)}")
-                break
-        else:
-            status("H3 RefMod: 'use the clip's own audio' was set, but no video source has "
-                   "an audio track -- extracting without a soundtrack")
-    soundtrack_waveform = None
-    if audio_path and spec.get("audio_seconds") is not None:
-        # "Soundtrack length" (fork.16+): one setting for every soundtrack,
-        # independent of the visual duration.
-        target_seconds = _audio_seconds(spec, DEFAULT_AUDIO_SECONDS)
-        clip_trim = (spec.get("video_trims") or {}).get(os.path.basename(str(audio_path)))
-        soundtrack_waveform = storage.extract_audio_from_video(
-            audio_path, max_seconds=target_seconds,
-            start_seconds=float(clip_trim[0]) if clip_trim else 0.0)
-        if soundtrack_waveform is None:
-            raise ExtractionBlocked(f"No audio could be read from "
-                                    f"{os.path.basename(str(audio_path))}.")
-        where = (f"The audio from {os.path.basename(str(audio_path))}"
-                 + (f" (from {float(clip_trim[0]):g}s, the trim start)" if clip_trim else ""))
-        if from_clip:
-            # A clip's own audio is the one exception to the 2s minimum: the
-            # clip can still make a perfectly good visual mod, so a short
-            # soundtrack is kept, with a warning, rather than refusing it all.
-            got = soundtrack_waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE
-            if got < MIN_AUDIO_SECONDS - 0.05:
-                status(f"H3 RefMod: ⚠️ {where} is only ~{got:.1f}s long -- kept anyway, but H3 "
-                       f"documents {MIN_AUDIO_SECONDS:g}s as the shortest usable audio reference, "
-                       f"so this voice may not be picked up. A longer clip (or an earlier trim "
-                       f"start) gives the model more to work with.")
-        else:
-            got = _require_audio_length(soundtrack_waveform, where)
-        status(f"H3 RefMod: soundtrack ~{got:.1f}s (Soundtrack length {target_seconds:g}s)")
+    # Fork: audio given WITH images or video becomes this mod's soundtrack --
+    # stored beside the visual latent (the shapes can't be stacked) and
+    # injected as its own <Audio N> reference. Read first, so a clip too
+    # short to use is refused before any slow visual encoding.
+    soundtrack_waveform = _read_soundtrack(spec, image_paths, video_paths, status)
 
     pool_warning = core.identity_training_pool_warning(concept_type, mode, pool_h, pool_w)
     if pool_warning:
@@ -3262,12 +2647,6 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             remove_background_images_ref = 0
 
     sources = []  # list of (cthw_tensor, is_video)
-    # "Turn reference videos into a picture stack": each video becomes still
-    # pictures (the sharpest frame from every 1/N-second slot) instead of a
-    # clip, so a mod keeps a clip's identity at a fraction of its tokens.
-    video_as_pictures = bool(spec.get("video_as_pictures", False))
-    pictures_per_second = max(0.05, float(spec.get("pictures_per_second", 1.0) or 1.0))
-    stills_spans = {}   # video file name -> seconds its pictures cover (sizes its soundtrack)
     for i, p in enumerate(image_paths):
         from PIL import Image
         with Image.open(p) as img:
@@ -3276,27 +2655,29 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             status(f"H3 RefMod: removing background from image {i + 1}/{len(image_paths)}")
             img = storage.remove_background_from_image(img, session=rembg_session)
         sources.append((storage.pil_to_cthw(img), False))
+    # Fork: "Turn reference videos into a picture stack" -- each video becomes
+    # still pictures (the sharpest frame from every 1/N-second slot) instead
+    # of a clip, keeping a clip's identity at a fraction of its tokens.
+    video_as_pictures = bool(spec.get("video_as_pictures", False))
+    pictures_per_second = max(0.05, float(spec.get("pictures_per_second", 1.0) or 1.0))
+    from_stills = 0
     for vp in video_paths:
-        # Per-video trim chosen in the extractor's preview, keyed by file name.
+        # Fork: per-video trim chosen in the extractor's preview, by file name.
         trim = (spec.get("video_trims") or {}).get(os.path.basename(str(vp)))
         start_s = float(trim[0]) if trim else 0.0
         dur_s = max(0.1, float(trim[1]) - float(trim[0])) if trim else None
         if trim:
-            status(f"H3 RefMod: using {start_s:g}-{float(trim[1]):g}s of "
-                   f"{os.path.basename(str(vp))}")
+            status(f"H3 RefMod: using {start_s:g}-{float(trim[1]):g}s of {os.path.basename(str(vp))}")
         if video_as_pictures:
-            # Same span a clip would use: the trim, capped by "Reference
-            # duration to use".
             limit_s = (((latent_frames - 1) * 4 + 1) if latent_frames > 1 else 1) \
                 / float(FPS_ASSUMED_FOR_DURATION_ESTIMATE)
-            span_s = min(dur_s, limit_s) if dur_s else limit_s
-            stills, covered = storage.load_video_stills(vp, pictures_per_second, start_s, span_s,
+            stills, covered = storage.load_video_stills(vp, pictures_per_second, start_s,
+                                                        min(dur_s, limit_s) if dur_s else limit_s,
                                                         max_short_edge=ref_resolution)
-            stills_spans[os.path.basename(str(vp))] = covered
             status(f"H3 RefMod: {os.path.basename(str(vp))} -> {len(stills)} picture(s) "
-                   f"({pictures_per_second:g} per second over {covered:.1f}s, sharpest frame "
-                   f"of each slot)")
+                   f"({pictures_per_second:g} per second over {covered:.1f}s, sharpest frame of each slot)")
             sources.extend((still, False) for still in stills)
+            from_stills += 1
             continue
         video = storage.load_video_cthw(vp, max_frames=max(64, latent_frames * 8),
                                         start_seconds=start_s, duration_seconds=dur_s)
@@ -3326,14 +2707,25 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             status(f"pooled grid {pool_h}x{pool_w} -> {pool_grid[0]}x{pool_grid[1]} to match source aspect")
     gh, gw = pool_grid if pool_grid is not None else (pool_h, pool_w)
 
+    # Extraction runs *before* the original generate(), so the pipeline's own
+    # _configure_tiling() has not run in this call -- on the very first task
+    # after a model load the VAE is still untiled, and a large source (a wide
+    # panorama, a 2048-short-edge photo) can exhaust VRAM in one encode.
+    # Enabling it here is exactly what generate() does a moment later, and is
+    # harmless when it is already on.
+    try:
+        pipeline_self._configure_tiling(None)
+    except Exception as e:
+        _log(f"could not enable VAE tiling before encoding ({e!r}); continuing untiled -- "
+             f"a very large reference image may run out of VRAM")
+
     frames = []
     n_img = n_vid = 0
     source_shapes = []
-    # "Merge into one picture" (training mode, several sources): instead of
-    # stacking each source's own pooled grid, keep each pooled grid and full
-    # encode, then build ONE shared grid from all of them after the loop
-    # (core.merge_latents) -- the consensus of the collection, at one
-    # reference's token cost.
+    enc_frames, enc_times, enc_layout = [], [], core.ENC_LAYOUT_STILLS
+    # Fork: "Merge into one picture" (training mode, several sources) -- each
+    # source's pooled grid and full encode are kept, and ONE shared grid is
+    # built from all of them after the loop (core.merge_latents).
     merge = bool(spec.get("merge", False))
     if merge and mode != "training":
         status("H3 RefMod: 'Merge into one picture' only applies in training mode -- stacking instead")
@@ -3354,19 +2746,37 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             raise ValueError(f"Expected a MiniMax H3 video-VAE latent [1,24,T,H,W], got {tuple(z.shape)}.")
         source_shapes.append(f"{z.shape[2]}x{z.shape[3]}x{z.shape[4]}")
 
+        # Keep a few pixels for the text encoder, so this mod can earn a
+        # "<Picture N>" / "<Video N>" label in the prompt later (see
+        # core.encode_enc_frames). Taken from the same resized source the VAE
+        # just saw, and converted to Qwen's [T, H, W, 3] 0..1 convention --
+        # the exact thing pipeline.py's own _qwen_frames() produces for a
+        # live reference.
+        if is_video and src.shape[1] > 1:
+            enc_layout = core.ENC_LAYOUT_CLIP
+            # two frames a second, the rate Wan2GP samples a live reference
+            # video at for the encoder
+            picks, cursor = [], 0.0
+            while round(cursor) < src.shape[1]:
+                if not picks or round(cursor) > picks[-1]:
+                    picks.append(round(cursor))
+                cursor += FPS_ASSUMED_FOR_DURATION_ESTIMATE / 2
+            picks = picks[:core.ENC_MAX_CLIP_FRAMES]
+            enc_frames.append(_qwen_frames_from_cthw(src[:, picks]))
+            enc_times.extend(p / FPS_ASSUMED_FOR_DURATION_ESTIMATE for p in picks)
+        else:
+            enc_frames.append(_qwen_frames_from_cthw(src[:, :1]))
+            enc_times.append(float(len(enc_times)))
+
         if mode == "encode":
             pooled = z.to(torch.float16)
         else:
             pool_t = min(latent_frames, z.shape[2]) if is_video else 1
             pooled = core.pool_latent(z, pool_t, gh, gw).to(torch.float16)
-            if merge_refs is not None:
-                # Refined jointly after the loop, against every full encode.
+            if merge_refs is not None:   # fork: refined jointly after the loop
                 merge_refs.append((pooled.float().cpu(), z.float().cpu()))
                 z = None
-                if is_video:
-                    n_vid += 1
-                else:
-                    n_img += 1
+                n_vid, n_img = n_vid + bool(is_video), n_img + (not is_video)
                 continue
             if identity > 0:
                 status(f"H3 RefMod: refining identity for {label} ({identity} steps)")
@@ -3377,17 +2787,15 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         else:
             n_img += 1
 
+    merged_n = 0
     if merge_refs is not None:
         status(f"H3 RefMod: merging {len(merge_refs)} references into one {gh}x{gw} grid"
                + (f" ({identity} joint refinement steps)" if identity > 0
                   else " (plain average -- identity refinement steps is 0)"))
-        latent = core.merge_latents([p for p, _ in merge_refs], [f for _, f in merge_refs],
-                                    gh, gw, steps=identity, progress_every=100).to(torch.float16)
-        merged_n = len(merge_refs)
-        merge_refs = None
-    else:
-        latent = torch.cat(frames, dim=2)
-        merged_n = 0
+        frames = [core.merge_latents([p for p, _ in merge_refs], [f for _, f in merge_refs],
+                                     gh, gw, steps=identity, progress_every=100).to(torch.float16)]
+        merged_n, merge_refs = len(merge_refs), None
+    latent = torch.cat(frames, dim=2)
     if multiplier > 1:
         latent = latent.repeat(1, 1, multiplier, 1, 1)
     requested_t = latent.shape[2]
@@ -3404,82 +2812,57 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
               f"~{req_sec:.1f}s worth of frames ({requested_t}), saved ~{got_sec:.1f}s "
               f"({total_t}). Raise 'Max tokens' (Advanced) or lower the ref resolution/pool "
               f"grid to keep more of the requested duration.")
-    # Optional soundtrack for a visual mod. The two latents are structurally
-    # different ([1,32,2,T] vs [1,24,T,H,W]) so they can't be stacked, but they
-    # can be stored side by side and injected as one reference: H3 tags a
-    # reference video carrying audio "video_audio" and gives it audio rows.
-    audio_latent = None
-    if audio_path and soundtrack_waveform is None:
-        # Specs from before fork.16 (no "Soundtrack length"): the old sizing.
-        if n_vid > 0 and not merged_n:
-            # A clip: the soundtrack matches the visual duration it kept.
-            target_seconds = (((total_t - 1) * 4 + 1 if total_t > 1 else 1)
-                              / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
-        else:
-            # Pictures (single, stacked or merged) have no duration of their
-            # own -- sizing the voice from their latent frames gave a single
-            # picture half a second of audio. Use "Reference duration to use",
-            # which is what that slider promises for audio.
-            target_seconds = (((latent_frames - 1) * 4 + 1 if latent_frames > 1 else 1)
-                              / FPS_ASSUMED_FOR_DURATION_ESTIMATE)
-        if os.path.basename(str(audio_path)) in stills_spans:
-            # Pictures taken from a video: the soundtrack covers the span of
-            # the video they were taken from.
-            target_seconds = stills_spans[os.path.basename(str(audio_path))]
-        # H3 documents 2 seconds as the shortest usable audio reference; a
-        # shorter voice sample gives it too little to go on.
-        target_seconds = max(MIN_SOUNDTRACK_SECONDS, target_seconds)
-        clip_trim = (spec.get("video_trims") or {}).get(os.path.basename(str(audio_path)))
-        soundtrack_waveform = storage.extract_audio_from_video(
-            audio_path, max_seconds=target_seconds,
-            start_seconds=float(clip_trim[0]) if clip_trim else 0.0)
-        if soundtrack_waveform is None:
-            raise ValueError(f"No audio could be read from {os.path.basename(audio_path)}.")
-    if audio_path and soundtrack_waveform is not None:
-        status(f"H3 RefMod: encoding the attached soundtrack "
-               f"(~{soundtrack_waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE:.1f}s)")
-        audio_latent = _encode_ref_audio(pipeline_self, soundtrack_waveform).to(torch.float16)
-        if audio_latent.dim() != 4 or audio_latent.shape[1] != 32 or audio_latent.shape[2] != 2:
-            raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(audio_latent.shape)}.")
-        status(f"H3 RefMod: soundtrack attached ({audio_latent.shape[-1]} audio latents, "
-               f"~{audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s, "
-               f"+{audio_latent.shape[-1] * 2} tokens)")
-
     kind = "video" if n_vid > 0 else "image"  # NOT total_t > 1: several still images
                                               # stacked together (n_vid==0) still form
                                               # multiple independent *image* references,
                                               # not a multi-frame video, even though the
                                               # underlying latent has more than one frame.
     px_w, px_h = latent.shape[4] * 16, latent.shape[3] * 16
+    audio_latent = None
+    if soundtrack_waveform is not None:   # fork: the mod's soundtrack
+        status(f"H3 RefMod: encoding the soundtrack "
+               f"(~{soundtrack_waveform.shape[-1] / storage.AUDIO_SAMPLE_RATE:.1f}s)")
+        audio_latent = _encode_ref_audio(pipeline_self, soundtrack_waveform).to(torch.float16)
+        if audio_latent.dim() != 4 or audio_latent.shape[1] != 32 or audio_latent.shape[2] != 2:
+            raise ValueError(f"Expected an audio-VAE latent [1,32,2,T], got {tuple(audio_latent.shape)}.")
     mod = core.H3RefMod(
         name=storage._split_folder(name)[1], kind=kind, latent=latent, latent_h=latent.shape[3], latent_w=latent.shape[4],
         latent_t=total_t, mode=mode,
-        source=("merge" if merged_n else
-                "stack" if len(frames) > 1 else ("video" if n_vid else "image")),
+        enc_frames=(_cat_enc_frames(enc_frames) if enc_frames else None),
+        enc_times=enc_times, enc_layout=enc_layout,
+        enc_fps=(FPS_ASSUMED_FOR_DURATION_ESTIMATE if enc_layout == core.ENC_LAYOUT_CLIP else 0.0),
+        # A clip stores up to ENC_MAX_CLIP_FRAMES views, so it keeps the
+        # smaller per-frame cap; a still spends its whole budget on one frame.
+        enc_max_edge=(min(enc_resolution, core.ENC_MAX_EDGE_CLIP)
+                      if enc_layout == core.ENC_LAYOUT_CLIP else enc_resolution),
+        source="merge" if merged_n else ("stack" if len(frames) > 1 else ("video" if n_vid else "image")),
         source_shape=" +".join(source_shapes),
         pool=(f"full-res {px_w}x{px_h}px (short-edge cap {ref_resolution}px)" if mode == "encode"
               else f"{total_t}x{gh}x{gw}"),
         optimize_steps=identity if mode == "training" else 0,
-        tags=[f"{n_img} img, {n_vid} vid"] + ([f"merged {merged_n} refs"] if merged_n else [])
-             + ([f"x{multiplier} repeat"] if multiplier > 1 else [])
-             + ([f"{pictures_per_second:g}/s from video"] if stills_spans else [])
+        tags=[f"{n_img} img, {n_vid} vid"] + ([f"x{multiplier} repeat"] if multiplier > 1 else [])
              + (["background removed"] if remove_background_images_ref else [])
-             + (["with soundtrack"] if audio_path else []),
+             + ([f"merged {merged_n} refs"] if merged_n else [])
+             + ([f"{pictures_per_second:g}/s from video"] if from_stills else [])
+             + (["with soundtrack"] if audio_latent is not None else []),
         description=description, concept_type=concept_type,
-        audio_latent=audio_latent,
-        audio_t=0 if audio_latent is None else int(audio_latent.shape[-1]),
+        audio_latent=audio_latent, audio_t=0 if audio_latent is None else int(audio_latent.shape[-1]),
     )
+    if merged_n:
+        # Fork: a merged mod is one picture that none of the sources is, so
+        # the encoder is shown the merge itself, decoded from its latent.
+        try:
+            mod.enc_frames, mod.enc_times, mod.enc_layout, mod.enc_fps = \
+                decode_encoder_frames(pipeline_self, mod)
+            mod.enc_max_edge = enc_resolution
+        except Exception:
+            mod.enc_frames, mod.enc_times = None, []
+            _log("could not decode the merged picture for its prompt label; saving without one:\n"
+                 + traceback.format_exc())
 
     if save:
-        if spec.get("store_encoder_frames", True):
-            _attach_encoder_frames(pipeline_self, mod, status)
-        else:
-            status("H3 RefMod: not storing encoder frames (option off) -- this mod will be "
-                   "decoded once per session instead; the Library can add them later")
         path = mod.save(storage.mod_path(name))
         status(f"H3 RefMod '{name}' saved: {mod.token_count} tokens, {kind}/{mode}"
-               + (" + soundtrack" if audio_latent is not None else "")
-               + (f" + {len(mod.enc_times)} encoder frame(s)" if mod.has_encoder_frames() else "")
-               + f" -> {path}")
+               + (" + soundtrack" if audio_latent is not None else "") + f" -> {path}")
     else:
         status(f"H3 RefMod '{name}' extracted ({mod.token_count} tokens) but not saved (save=false)")
