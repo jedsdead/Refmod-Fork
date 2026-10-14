@@ -301,14 +301,16 @@ def _trim_summary(trims, names, durations=None):
 # "Include audio", prompt label, soundtrack's prompt label.
 ROW_WIDTH = 6
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
-# fit to output, mods in phase 2, shrink method, video mods on sliding windows.
-STACK_CONTROLS = 8
+# fit to output, mods in phase 2, shrink method, video mods on sliding windows,
+# mods in phase 1 (fork.30, last so older saved orders still line up).
+STACK_CONTROLS = 9
 
 # Label dropdowns (fork.27): how far each one counts.
 LABEL_MAX = {"image": 20, "video": 9, "audio": 9}
 LABEL_WORDS = {"image": "Picture", "video": "Video", "audio": "Audio"}
 AUTO_LABEL = "auto"
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
+PHASE1_MODS_UI = [("Fit to phase 1", "fit"), ("Full size", "full")]   # fork.30
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
@@ -431,7 +433,7 @@ def _is_picture_mod(meta):
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
                    fit_to_output=False, phase2_mods="full", shrink_method="reencode",
-                   window_mode=WINDOW_MODE_DEFAULT):
+                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="fit"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown, plus the
@@ -452,6 +454,8 @@ def _stack_payload(stack_mode, stack_n,
             "fit_to_output": bool(fit_to_output),
             # "Mods in phase 2": full / tile / off.
             "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
+            # "Mods in phase 1": fit / full (fork.30).
+            "phase1_mods": phase1_mods if phase1_mods in ("fit", "full") else "fit",
             # "Shrink method": reencode / fast.
             "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode",
             # "Video mods on sliding windows 2, 3, ...": still / full / first.
@@ -753,7 +757,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.27"
+        self.version = "0.38.1-fork.30"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -857,13 +861,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # handler below still correctly hides it the moment any model switch happens.
         with gr.Accordion("MiniMax H3 RefMods (inline)", open=False) as accordion:
             gr.Markdown(
-                "Applies when a **MiniMax H3 Ref2VA, FL2VA or FL2VA ControlNet** model is selected "
-                "above -- every other "
-                "field on this page (resolution, frame count, steps, attention mode, memory "
-                "profile, output filename, etc.) is untouched and works exactly as normal. "
-                "Extract new RefMods from the **MiniMax H3 RefMods** tab. Selecting a mod here "
-                "applies immediately to generations started from *this page's* own Generate "
-                "button -- no separate submission needed.")
+                "Works with **MiniMax H3 Ref2VA, FL2VA and FL2VA ControlNet**. Make mods in the **MiniMax H3 RefMods** tab.")
             # Fork: the full panel (per-row options, sizing, text encoder).
             mod_rows, panel_controls = self._build_mod_picker_rows_full()
             with gr.Row():
@@ -952,9 +950,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Row():
             folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
                                     label="Folder", scale=3,
-                                    info="Narrow the mod lists below to one subfolder of "
-                                         "loras/refmods_plugin/minimax_h3/. Pick "
-                                         f"'{ALL_FOLDERS_CHOICE}' to go back to seeing everything.")
+                                    info="Show one subfolder only.")
             refresh_btn = gr.Button("🔄 Refresh mod list", size="sm", scale=1)
         counter = gr.Markdown(_format_ref_counter([]))
         mod_rows = []
@@ -1003,11 +999,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         window_mode = gr.Dropdown(
             label="Video mods on sliding windows 2, 3, ...",
             choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
-            info="Only matters when Number of frames needs more than one window. Image and "
-                 "audio mods always reach every window, exactly like a live reference does. "
-                 "Video mods have a known quirk: given whole to a later window, a few of their "
-                 "own frames can surface at the window boundary. 'First frame as a still' keeps "
-                 "the identity without the motion that causes that.")
+            info="Runs longer than one window only. Image and audio mods reach every window.")
 
         # Appended as a one-element pseudo-row so both callers (inline panel
         # and the plugin's own Generate tab) pick it up through the same flat
@@ -1036,24 +1028,19 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Row():
             folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
                                     label="Folder", scale=3,
-                                    info="Narrow the mod lists below to one subfolder of "
-                                         "loras/refmods_plugin/minimax_h3/. Pick "
-                                         f"'{ALL_FOLDERS_CHOICE}' to go back to seeing everything.")
+                                    info="Show one subfolder only.")
             refresh_btn = gr.Button("🔄 Refresh mod list", size="sm", scale=1)
         # Above the pickers, where they can't be missed: the readout of what
         # is selected (with each mod's prompt label), then the text encoder
         # options.
         counter = gr.Markdown(_format_ref_counter([]))
         with gr.Accordion("Text encoder options", open=True):
-            gr.Markdown("How many pictures of each mod the text encoder is shown, to bind its "
-                        "prompt label. The model always receives every mod in full.")
+            gr.Markdown("Pictures the text encoder sees per mod, to bind its label. The model always gets the whole mod.")
             with gr.Row():
                 stack_mode = gr.Dropdown(
                     choices=list(encframes.STACK_CHOICES), value=encframes.STACK_ALL, scale=3,
                     label="Mods sent as one video: pictures shown",
-                    info="For multi-picture mods with 'Send as one video' ticked. 'all' is best "
-                         "for identity; 'up to N' caps text-encoder memory and time on big "
-                         "stacks.")
+                    info="'up to N' saves memory on big stacks.")
                 stack_n = gr.Number(value=encframes.STACK_DEFAULT_N, precision=0, minimum=1,
                                     maximum=256, label="N", visible=False, scale=1)
             with gr.Row():
@@ -1061,41 +1048,28 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     choices=[encframes.STACK_UP_TO_N, encframes.STACK_ALL],
                     value=encframes.STACK_UP_TO_N, scale=3,
                     label="Video mods: frames shown",
-                    info="A video mod keeps two frames per second of its clip. 'up to N' shows N "
-                         "of them, spread from first to last; 'all' shows every one. Fewer = a "
-                         "lighter text encode and slightly faster steps.")
+                    info="Two frames a second are stored; 'up to N' spreads N across the clip.")
                 video_n = gr.Number(value=encframes.MAX_CLIP_FRAMES_SHOWN, precision=0, minimum=1,
                                     maximum=256, label="N", scale=1)
         with gr.Row():
             fit_to_output = gr.Checkbox(
                 False, label="Fit mods to the output size (faster)", scale=2,
-                info="Off: every picture and video mod goes in at the size it was extracted "
-                     "at. On: a mod bigger than the video you're making is shrunk to its size "
-                     "first, keeping its shape. Fewer tokens, so generation is faster -- but a "
-                     "shrunk mod carries less fine detail, faces first. Mods already that size or "
-                     "smaller are left alone. Works in Ref2VA, FL2VA and FL2VA ControlNet.")
-            phase2_mods = gr.Dropdown(
-                choices=PHASE2_MODS_UI, value="full", label="Mods in phase 2", scale=1,
-                info="Two-phase runs only. Full: mods as set above. Fit to tile: with phase 2 "
-                     "tiling on, each mod is shrunk to one tile, so the 4 tiles pay a quarter "
-                     "each. Off (experimental): phase 2 runs without the visual mods -- fastest, "
-                     "but faces may drift. Ref2VA keeps them if you also use references of your "
-                     "own.")
+                info="Shrink mods larger than the output. Less detail.")
             shrink_method = gr.Dropdown(
                 choices=SHRINK_METHOD_UI, value="reencode", label="Shrink method", scale=1,
-                info="How a mod is made smaller (Fit mods to the output size, Fit to tile). Re-encode: "
-                     "decoded, resized and re-encoded with the loaded VAE -- best quality, takes a "
-                     "few seconds per mod once. Fast: the stored mod is resized directly -- "
-                     "instant, no VAE, but rougher.")
+                info="Re-encode: best. Fast: instant, rougher.")
+        with gr.Row():
+            # fork.30: two-phase runs only.
+            phase1_mods = gr.Dropdown(
+                choices=PHASE1_MODS_UI, value="fit", label="Mods in phase 1 (two-phase)", scale=1,
+                info="Full size: sharper faces, slower phase 1.")
+            phase2_mods = gr.Dropdown(
+                choices=PHASE2_MODS_UI, value="full", label="Mods in phase 2 (two-phase)", scale=1,
+                info="Off: no visual mods (fastest).")
         window_mode = gr.Dropdown(
             label="Video mods on sliding windows 2, 3, ...",
             choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
-            info="Only matters when Number of frames needs more than one window. Image and "
-                 "audio mods always reach every window, exactly like a live reference does. "
-                 "Video mods have a known quirk: given whole to a later window, a few of their "
-                 "own frames can surface at the window boundary. 'First frame as a still' keeps "
-                 "the identity without the motion that causes that. Picture stacks sent as one "
-                 "video always go in whole.")
+            info="Runs longer than one window only. Image and audio mods reach every window.")
 
         # One slot per kind to start with; "Add" reveals the next one and
         # "Remove" clears and hides the last. Every slot is still built up
@@ -1108,13 +1082,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         for kind, label, count in (("image", "Image RefMods", counts[0]),
                                    ("video", "Video RefMods", counts[1]),
                                    ("audio", "Audio RefMods", counts[2])):
-            note = (" -- a mod made from several pictures also gets a **Send as one video** "
-                    "box: ticked, it is one `<Video N>` in the prompt instead of one "
-                    "`<Picture N>` per picture." if kind == "image" else "")
-            gr.Markdown(f"**{label}**{note}"
-                        + (" Each mod's **Label** sets its `<Picture N>` / `<Video N>` / `<Audio N>`; "
-                           "a start image or references of your own take the first numbers, so pick "
-                           "after them." if kind == "image" else ""))
+            gr.Markdown(f"**{label}**" + (" -- a start image or your own references take the "
+                                           "first label numbers." if kind == "image" else ""))
             kind_rows, kind_ui = [], []
             for i in range(count):
                 with gr.Row(visible=i == 0) as row_ui:
@@ -1194,26 +1163,16 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
         return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods,
-                          shrink_method, window_mode)
+                          shrink_method, window_mode, phase1_mods)
 
 
     def _build_extract_section(self, api_session, model_dd):
-        gr.Markdown("### Extract a RefMod\n"
-                    "Turn one or more reference images (and/or one reference video) into a small "
-                    "saved file. This briefly runs a real generation task on the model selected "
-                    "above so it can reuse its already-loaded VAE -- you'll see the usual progress "
-                    "bar for a few seconds, then **no video is produced on purpose**: the mod file "
-                    "is what was created. Check the status line below for confirmation.")
+        gr.Markdown("### Extract a RefMod\nRuns a short task on the model above to use its VAE. No video is made; the mod file is the result.")
         with gr.Row():
             name = gr.Textbox(label="Mod name", value="my_concept",
-                              info="A plain name saves to the main folder. Include a path "
-                                   "(characters/tanya) to save into a subfolder instead -- it's "
-                                   "created automatically if it doesn't exist.")
+                              info="Use a path (characters/tanya) for a subfolder.")
             mode = gr.Radio(label="Mode", choices=["training", "encode"], value="training",
-                            info="encode = full fidelity (identical to a live reference), best for a "
-                                 "precise face/identity. training = approximate (pooling discards "
-                                 "fine detail), best for a general concept/style/pose where "
-                                 "approximation is fine.")
+                            info="encode: exact, best for faces. training: pooled and smaller, for general concepts.")
         with gr.Row():
             ref_images = gr.Files(label="Reference image(s)", file_types=["image"], file_count="multiple")
             with gr.Column():
@@ -1221,24 +1180,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 # Fork: videos as still pictures instead of clips.
                 video_as_pictures = gr.Checkbox(
                     False, label="Turn reference videos into a picture stack",
-                    info="Instead of a clip, take still pictures from each video: the sharpest "
-                         "frame from every slot of time, so motion blur and blinks are skipped. "
-                         "Same span as a clip (the trim, or the whole video up to 15s). "
-                         "Keeps identity at a fraction of a clip's tokens, but not motion.")
+                    info="Sharpest frame per time slot: identity at fewer tokens, no motion.")
                 pictures_per_second = gr.Slider(
                     0.25, 12, value=1.0, step=0.25, label="Pictures per second of video",
                     visible=False,
-                    info="1 = one picture per second (5 from a 5s span). Each picture costs about "
-                         "as much as 3-4 frames of a clip, so high values approach a clip's cost.")
+                    info="Each picture costs about 3-4 clip frames.")
         stills_estimate = gr.Markdown("")
-        gr.Markdown("*Add as many reference images and videos as you like -- every one is encoded "
-                   "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
-                   "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
+        gr.Markdown("*Every image and video added goes into this one mod.*")
         with gr.Accordion("Preview / trim reference videos", open=True):   # fork
-            gr.Markdown("Pick an uploaded video to watch it, and trim the span this mod is built "
-                        "from. Trims are per video and remembered while the page stays open; an "
-                        "untrimmed video is used whole, up to H3's 15-second limit for a reference "
-                        "video. A trim also sets where *Use the clip's own audio* starts.")
+            gr.Markdown("Untrimmed videos are used whole, up to 15 s.")
             with gr.Row():
                 video_pick = gr.Dropdown(label="Video", choices=[], value=None, scale=2)
                 video_duration = gr.Markdown("")
@@ -1255,73 +1205,46 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Row():
             ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath", scale=2)
             use_clip_audio = gr.Checkbox(False, label="Use the clip's own audio", scale=1,
-                                         info="Take the soundtrack from the first reference video "
-                                              "that has one, so a single clip of someone talking "
-                                              "gives this mod both the look and the voice. Ignored "
-                                              "if you choose an audio file.")
+                                         info="Ignored if an audio file is set.")
         soundtrack_seconds = gr.Slider(
             MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS, step=0.5,
             label="Audio length (seconds)",
-            info=f"How much audio this mod keeps, independent of the video length. At least "
-                 f"{MIN_AUDIO_SECONDS:g}s, H3's shortest audio reference: an audio file shorter "
-                 f"than that is refused; a clip's own audio is kept with a warning. ~80 tokens "
-                 f"per second.")
-        gr.Markdown("*Audio on its own makes an audio-only mod. Audio **together with** images or "
-                   "video gives that mod a soundtrack as well as a look: the two latents are stored "
-                   "side by side (their shapes can't be stacked) and the audio is injected as its own "
-                   "`<Audio N>` reference, so refer to it that way in prompts. Always extracted at "
-                   "full fidelity; 'Mode' above doesn't apply to audio. A soundtrack can also be "
-                   "added later from the Library.*")
+            info=f"At least {MIN_AUDIO_SECONDS:g}s. ~80 tokens a second.")
+        gr.Markdown("*Audio alone makes an audio-only mod; with images or video it becomes the mod's soundtrack (its own `<Audio N>`).*")
         audio_duration_warning = gr.Markdown("")
         remove_background_images_ref = gr.Dropdown(
             choices=[("Keep Backgrounds behind all Reference Images", 0),
                     ("Remove Background behind People / Objects", 1)],
             value=0,
             label="Automatic Removal of Background behind People or Objects in Reference Images",
-            info="Same background removal Wan2GP's own Media Generator uses for reference images "
-                 "-- only applies to the image(s) above, not to reference videos.")
+            info="Images only.")
         with gr.Accordion("Advanced", open=True):
             with gr.Row():
                 ref_resolution = gr.Slider(256, 2048, value=1024, step=64, label="Ref resolution (short edge, px)",
-                                           info="Cap, never an upscale: a source whose short edge is "
-                                                "already below this is encoded untouched. Feeds the DiT.")
+                                           info="A cap; never upscales.")
                 enc_resolution = gr.Slider(256, 2048, value=core.ENC_MAX_EDGE, step=64,
                                            label="Prompt-view resolution (long edge, px)",
-                                           info="Feeds Qwen3-VL, the channel that binds this mod to its "
-                                                "<Picture N> label in the prompt. Default matches what a "
-                                                "live reference gets. Lower = fewer vision tokens, weaker "
-                                                "recognition. Video mods are capped lower (they store "
-                                                "several frames).")
+                                           info="What the text encoder sees, to bind the label. Lower = fewer tokens.")
                 pool_h = gr.Slider(2, 64, value=16, step=2, label="Pool grid height (training mode)",
                                    info="Training mode. Bigger grid = more detail, more tokens.")
                 pool_w = gr.Slider(2, 64, value=16, step=2, label="Pool grid width (training mode)",
                                    info="Training mode. Same as height, other axis.")
             pool_warning = gr.Markdown("")
             encode_mode_note = gr.Markdown(
-                "ℹ️ **Mode is set to `encode`, so Pool grid and Identity refinement steps do "
-                "nothing** -- the latent is kept at full VAE resolution, there is no pooled grid "
-                "to size and nothing to refine *towards* (the full encode is already the target). "
-                "Changing them produces a byte-for-byte identical mod. Switch Mode to `training` "
-                "to use them.", visible=False)
+                "ℹ️ Pool grid and Identity refinement only apply in `training` mode.", visible=False)
             with gr.Row():
                 # fork.27: no duration slider -- a video is used whole, or as
                 # trimmed in "Preview / trim reference videos", up to H3's 15 s.
                 latent_frames = gr.State(latent_frames_to_seconds(MAX_LATENT_FRAMES))
                 identity = gr.Slider(0, 2000, value=500, step=50, label="Identity refinement steps (training mode)",
-                                     info="Training mode. Higher = truer to original, but it converges "
-                                          "around 200 steps and is flat after that -- 500 and 2000 give "
-                                          "the same file. 0 skips it.")
+                                     info="Flat after ~200 steps. 0 skips it.")
                 multiplier = gr.Slider(1, 10, value=1, step=1, label="Repeat multiplier",
                                        info="Repeats the mod. Higher = stronger effect, bigger file.")
                 max_tokens = gr.Slider(0, 65536, value=65536, step=512, label="Max tokens (0 = no cap)",
                                        info="Max tokens allowed. 0 = unlimited.")
             merge = gr.Checkbox(   # fork
                 False, label="Merge into one picture (training mode, several sources)",
-                info="Instead of keeping every picture, combine them into ONE small picture of "
-                     "what they have in common -- one reference's tokens however many go in. "
-                     "What agrees across the pictures at the same place in the frame survives; "
-                     "backgrounds and unique details are averaged away. Works best on similarly "
-                     "framed shots. Identity refinement steps refine the merge.")
+                info="Combine the pictures into one that keeps what they share. Best on similarly framed shots.")
             description = gr.Textbox(
                 label="keyword - description", lines=2,
                 info="Text note only. Model never reads it.")
@@ -1565,18 +1488,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     # ── Library ─────────────────────────────────────────────────────────
 
     def _build_library_section(self, api_session=None, model_dd=None):
-        gr.Markdown("### Saved RefMods\n"
-                    "Mods live in `loras/refmods_plugin/minimax_h3/`. "
-                    "Mods produced by the ComfyUI-MiniMaxH3Mod pack use the same file format and "
-                    "can be dropped into that folder directly. **Subfolders are supported** -- "
-                    "make any folder structure you like inside that directory to sort your mods, "
-                    "and use the Folder picker below (here and in the mod pickers) to browse it. "
-                    "Mods in subfolders are named by their relative path (`characters/tanya`).")
+        gr.Markdown("### Saved RefMods\nIn `loras/refmods_plugin/minimax_h3/` (subfolders work). ComfyUI-MiniMaxH3Mod mods can be dropped in.")
         with gr.Row():
             library_folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
                                             label="Folder", scale=3,
-                                            info=f"Pick '{ALL_FOLDERS_CHOICE}' to go back to "
-                                                 f"seeing every mod again.")
+                                            info="Show one subfolder only.")
             refresh_btn = gr.Button("Refresh", scale=1)
         table = gr.Dataframe(
             headers=["name", "kind", "mode", "DiT tokens", "prompt view", "size (MB)",
@@ -1588,24 +1504,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             delete_btn = gr.Button("Delete", variant="stop")
         delete_status = gr.Textbox(label="", interactive=False, show_label=False)
         gr.Markdown(
-            "Mods extracted purely from several still images (no video source) used to be "
-            "wrongly saved as `video` kind if more than one image was stacked together -- the "
-            "button below rescans every saved mod's own extraction record and corrects it in "
-            "place (the latent data itself is untouched, only the `kind` label). Safe to run "
-            "anytime, including on mods that are already correct. Covers every subfolder too.")
+            "Re-check every mod's image/video kind (fixes old multi-image mods).")
         with gr.Row():
             fix_btn = gr.Button("Fix classification (image vs video)")
             fix_status = gr.Markdown("")
 
         gr.Markdown(
-            "**Rename, move, or edit a mod's description.** Pick a mod, click Load, edit either "
-            "field, then Save -- the latent data itself is never touched, only the "
-            "name/description. Typing a plain name keeps the mod in its current folder; typing a "
-            "path (`characters/tanya`) moves it there, creating the folder if needed, and a "
-            "leading `/` moves it back to the main folder. "
-            "Both fields are plain editable text boxes, so you can also just click into either one, "
-            "select the text (e.g. double/triple-click, or Ctrl+A), and copy it (Ctrl+C) to reuse "
-            "elsewhere -- no separate copy button needed.")
+            "**Rename, move or edit a description.** A path (`characters/tanya`) moves the mod; a leading `/` moves it to the main folder.")
         with gr.Row():
             edit_name_dd = gr.Dropdown(label="Mod to edit", choices=_library_mod_names(), scale=2)
             edit_load_btn = gr.Button("Load")
@@ -1686,13 +1591,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                             outputs=[table, library_folder_dd, edit_name_dd, edit_status], queue=False)
 
         gr.Markdown(
-            "**Build prompt hint.** The `keyword - description` field you set at extraction is "
-            "never read by the model automatically -- there's no image-embedding channel on H3's "
-            "Ref2VA path to hang an automatic clue off of, so a mod file's description only reaches "
-            "the model if you type it into your prompt yourself. This builds that string for you "
-            "from one or more saved mods (`concept_type: description; concept_type: description...`) "
-            "so you can copy it into your prompt instead of retyping it by hand -- mirrors the "
-            "ComfyUI pack's own \"prompt hint\" loader output.")
+            "**Prompt hint.** Builds a prompt string from mods' descriptions, which the model never reads on its own.")
         with gr.Row():
             hint_names = gr.Textbox(label="Mod name(s), comma-separated, in the order you want them combined",
                                     scale=2)
@@ -1716,9 +1615,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         # ── Fork: folders, soundtracks and encoder frames ──
         with gr.Accordion("Folders and moving", open=False):
-            gr.Markdown("Folders are subfolders of the mods directory. A move rewrites the mod "
-                        "in place, keeping everything in it, and never overwrites a mod of the "
-                        "same name.")
+            gr.Markdown("Moves keep everything in the mod and never overwrite.")
             with gr.Row():
                 new_folder_name = gr.Textbox(label="New folder", scale=2,
                                              placeholder="characters, or characters/female to nest")
@@ -1736,9 +1633,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 delete_folder_btn = gr.Button("Delete folder", variant="stop")
             folder_status = gr.Textbox(label="", interactive=False, show_label=False)
         with gr.Accordion("Soundtrack: add, replace or remove", open=False):
-            gr.Markdown("Give an image or video mod its own voice without rebuilding it: the "
-                        "audio is injected as its own `<Audio N>` reference. Audio-only mods are "
-                        "skipped. Runs a short task on the model selected at the top of this tab.")
+            gr.Markdown("Adds a soundtrack as its own `<Audio N>`. Runs a short task on the model above.")
             with gr.Row():
                 audio_target_dd = gr.Dropdown(label="Mods to update", choices=_library_mod_names(),
                                               value=[], multiselect=True, scale=2)
@@ -1752,11 +1647,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")
             audio_status = gr.Textbox(label="", interactive=False, show_label=False)
         with gr.Accordion("Encoder frames", open=False):
-            gr.Markdown("Mods saved without prompt-view frames (older mods, or ones from other "
-                        "tools) are decoded once per session to get their `<Picture N>` / "
-                        "`<Video N>` label. This stores those frames in the mod instead -- the "
-                        "*prompt view* column shows which have them. Nothing else in the mod "
-                        "changes. Runs a short task on the model selected at the top of this tab.")
+            gr.Markdown("Stores prompt-view frames in mods that lack them, so they aren't decoded every session.")
             with gr.Row():
                 frames_target_dd = gr.Dropdown(label="Mods to update", choices=_library_mod_names(),
                                                value=[], multiselect=True, scale=2)
@@ -1881,13 +1772,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     # ── Generate ────────────────────────────────────────────────────────
 
     def _build_decompile_section(self, api_session, model_dd):   # fork
-        gr.Markdown("### Decompile a RefMod\n"
-                    "See what a mod holds: its pictures, video and audio, rebuilt as ordinary "
-                    "files you can view, play and save. These are **reconstructions of what the "
-                    "mod stores, not the original sources** -- anything extraction discarded "
-                    "(the original resolution, the parts outside a trim, the fine detail pooled "
-                    "away in training mode, the individual pictures behind a merge) can't come "
-                    "back. Encode-mode mods come closest to their sources.")
+        gr.Markdown("### Decompile a RefMod\nRebuilds a mod's pictures, video and audio as files: reconstructions, not the originals.")
         with gr.Row():
             mod_dd = gr.Dropdown(label="Mod", choices=_library_mod_names(), value=None, scale=4)
             refresh_btn = gr.Button("🔄 Refresh", size="sm", scale=0, min_width=110)
@@ -1978,20 +1863,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     def _build_generate_section(self, api_session, model_dd):
         gr.Markdown(
-            "# ⚠️ Prefer the **Media Generator** tab for actual generation\n"
-            "**It has far more options (resolution categories, attention mode, memory profile, "
-            "output filename, and everything else Wan2GP's main form offers) -- and your RefMods "
-            "are available there too, under LoRAs → MiniMax H3 RefMods (inline).** This panel below "
-            "is kept as a simpler fallback with only a subset of the fields.")
-        gr.Markdown("### Generate with RefMods\n"
-                    "Covers the fields you're most likely to tune here: prompt, resolution, frame "
-                    "count, steps, sampler, reference-image budget, LoRAs, step-skipping "
-                    "accelerators, sliding window, and sol-attn sparsity, plus up to "
-                    f"{IMAGE_ROWS} image + {VIDEO_ROWS} video RefMods (MiniMax H3 Ref2VA's own "
-                    "native caps). Anything else keeps whatever you last set on the main "
-                    "**Media Generator** tab for this model (use *Sync from the main form* below), "
-                    "or that model's own factory defaults otherwise -- so no setting is ever left "
-                    "unset, even ones without a widget here.")
+            "**Tip:** the **Media Generator** tab has every option, and RefMods are there too under *MiniMax H3 RefMods (inline)*.")
+        gr.Markdown("### Generate with RefMods\nA simpler form. Other settings come from the Media Generator (*Sync from the main form*) or the model's defaults.")
         synced = gr.State({})
         with gr.Row():
             sync_btn = gr.Button("⟲ Sync from the main form (copies every current setting)")
@@ -2049,8 +1922,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     info="Leave on Auto unless you know a specific backend is installed.")
                 attention_sparsity = gr.Slider(
                     0.0, 4.0, value=1.3, step=0.05, label="Sol-Attn Start Tau",
-                    info="Only used when Sol-Attn is selected above. Higher = sparser/faster, "
-                         "lower = denser/more faithful. End Tau is fixed at 0.8.")
+                    info="Sol-Attn only. Higher = sparser, faster.")
 
         generate_btn = gr.Button("Generate", variant="primary")
         output_video = gr.Video(label="Output")
@@ -2155,9 +2027,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Column() as root:
             if self._patch_error:
                 gr.Markdown(f"⚠️ **RefMods could not hook into MiniMax H3**: {self._patch_error}")
-            gr.Markdown(f"## {PlugIn_Name}\n"
-                       "No-training reference mods for MiniMax H3 Ref2VA. See the README bundled "
-                       "with this plugin for how the mechanism works and its current limitations.")
+            gr.Markdown(f"## {PlugIn_Name}\nReference mods for MiniMax H3. See the README for details.")
             model_choices = _model_choices(api_session)
             model_dd = gr.Dropdown(
                 label="MiniMax H3 Ref2VA model (used for Extract and Generate below)",

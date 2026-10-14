@@ -666,8 +666,8 @@ def install_patches() -> Optional[str]:
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
         if isinstance(image, _RefModImageSentinel):
-            latent = (_fit_latent_to_canvas(image.latent, target_width, target_height,
-                                            image_refs_relative_size, "image RefMod")
+            latent = (_fit_phase_1(self, image, "image", image.latent, target_width, target_height,
+                                   image_refs_relative_size)
                       if _should_fit(self, target_width, target_height) else image.latent)
             if _phase2_mods_off(self):
                 # Fork, "Mods in phase 2: Off": the label stays in the prompt
@@ -690,8 +690,8 @@ def install_patches() -> Optional[str]:
             # '_RefModVideoSentinel'"), so use the clip's first frame as a
             # still image reference instead -- a valid single-frame latent, and
             # the closest thing to what was asked for.
-            latent = (_fit_latent_to_canvas(image.latent[:, :, :1], target_width, target_height,
-                                            image_refs_relative_size, "video RefMod (as still)")
+            latent = (_fit_phase_1(self, image, "image", image.latent[:, :, :1], target_width, target_height,
+                                   image_refs_relative_size)
                       if _should_fit(self, target_width, target_height) else image.latent[:, :, :1])
             image.enc = _enc_as_still(image.enc)  # one still latent -> "<Picture N>", not "<Video N>"
             latent = _apply_size_limits(self, image, "image", latent, target_width, target_height)  # fork
@@ -873,7 +873,7 @@ def install_patches() -> Optional[str]:
                 active = _ACTIVE.get("pipeline")
                 if active is None or not _should_fit(active, width, height):
                     return video
-                fitted = _fit_latent_to_canvas(video.latent, width, height, 100.0, "video RefMod")
+                fitted = _fit_phase_1(active, video, "video", video.latent, width, height, 100.0)
                 if fitted is video.latent:
                     return video
                 shrunk = _RefModVideoSentinel(fitted)
@@ -961,6 +961,8 @@ def install_patches() -> Optional[str]:
             return _orig_generate(self, *args, **kwargs)
         finally:
             _clear_fl2va()   # fork: never let staged FL2VA mods leak into the next generation
+            _veda_restore(self)
+            _REFMODS_IN_USE["on"] = False
 
     Pipeline._add_image_reference = patched_add_image_reference
     Pipeline._add_video_reference = patched_add_video_reference
@@ -1430,7 +1432,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             canvas = _pass_canvas(pipeline_self, 1)
             latent = sentinel.latent
             if getattr(pipeline_self, "_h3_two_phase", False) and canvas[0]:
-                latent = _fit_latent_to_canvas(latent, canvas[0], canvas[1], 100.0, "video RefMod")
+                latent = _fit_phase_1(pipeline_self, sentinel, "video", latent, canvas[0], canvas[1], 100.0)
             latent = _apply_size_limits(pipeline_self, sentinel, "video", latent, *canvas)
             state["overflow_visual"].append((latent, {
                 "kind": "video", "latent_t": latent.shape[2],
@@ -1499,6 +1501,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 else:
                     visible_visual += 1
 
+    _REFMODS_IN_USE["on"] = True   # fork: see _veda_full_references
     where = f" [sliding window {window_no}, video mods: {window_mode}]" if later_window else ""
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
@@ -1566,6 +1569,48 @@ def _shown_frames_from_state(state) -> dict:
 # later windows can put the mods' pictures back at the same numbers.
 _LABEL_BASE = {"image": None}
 _LABEL_LOG = {"done": False}
+
+# Fork.28: whether this generation carries RefMods (either route), for the
+# Veda Sparse adjustment below.
+_REFMODS_IN_USE = {"on": False}
+
+
+def _veda_full_references(transformer) -> None:
+    """Veda Sparse attention (the "Veda Sparse" model variants) attends to
+    reference rows sparsely, by a learned predictor's choice, at the
+    budget its predictor file sets. The FL2VA variants load the text-to-video
+    predictor, which was never trained with references and keeps only ~10%
+    of them -- so a mod reached the model but was mostly never looked at.
+    While a generation carries RefMods, references are attended in full
+    instead (Veda's own "keeps all" mode for references: they become global
+    rows, like the text); the generated video stays sparse, so most of the
+    speed-up remains. Restored when the generation ends."""
+    policy = getattr(transformer, "veda_attention", None)
+    if policy is None or not _REFMODS_IN_USE["on"] or getattr(policy, "_h3refmod_saved_reference", None):
+        return
+    reference = getattr(policy, "reference", None)
+    if reference is None or getattr(reference, "keeps_all", False):
+        return
+    try:
+        from models.minimax_h3.veda.selection import Budget
+        policy._h3refmod_saved_reference = reference
+        policy.reference = Budget(ratio=1.0)
+        policy.reset()
+        _log(f"Veda Sparse: references attended in full while RefMods are in use "
+             f"(this model's predictor had them at {reference.describe()})")
+    except Exception:
+        policy._h3refmod_saved_reference = None
+        _log("could not switch Veda's references to full attention; mods may be weak on this "
+             "model:\n" + traceback.format_exc())
+
+
+def _veda_restore(pipeline_self) -> None:
+    policy = getattr(getattr(pipeline_self, "transformer", None), "veda_attention", None)
+    saved = getattr(policy, "_h3refmod_saved_reference", None) if policy is not None else None
+    if saved is not None:
+        policy.reference = saved
+        policy._h3refmod_saved_reference = None
+        policy.reset()
 
 
 def _label_offsets(kwargs, later_window, stable, ref2va):
@@ -1802,6 +1847,7 @@ def _stack_as_pictures(stack):
 # ── Mod sizing: "Max size", "Fit mods to the output size", phase 2 ────────
 
 PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF = "full", "tile", "off"
+PHASE1_MODS_FIT, PHASE1_MODS_FULL = "fit", "full"   # fork.30
 SHRINK_REENCODE, SHRINK_FAST = "reencode", "fast"
 
 
@@ -1909,6 +1955,12 @@ def _shrink_target(pipeline_self, sentinel, latent, canvas_w, canvas_h, pass_no)
         w, h = _dims_for_short_edge(latent, cap)
         if w is not None:
             candidates.append((w, h, f"max size {int(cap)}px"))
+    if (pass_no == 1 and getattr(pipeline_self, "_h3_p1_full", False)
+            and getattr(pipeline_self, "_h3_two_phase", False)):
+        # fork.30: "Mods in phase 1: Full size" -- fit to the output, not phase 1's half canvas.
+        out_w, out_h = getattr(pipeline_self, "_h3_out_size", (None, None)) or (None, None)
+        if out_w and out_h:
+            canvas_w, canvas_h = int(out_w), int(out_h)
     if canvas_w and canvas_h:
         if getattr(pipeline_self, "_h3_fit_output", False):
             w, h = _fit_output_dims(latent, canvas_w, canvas_h)
@@ -1922,6 +1974,44 @@ def _shrink_target(pipeline_self, sentinel, latent, canvas_w, canvas_h, pass_no)
                 if w is not None:
                     candidates.append((w, h, "phase-2 tile"))
     return min(candidates, key=lambda c: c[0] * c[1]) if candidates else None
+
+
+def _fit_phase_1(pipeline_self, sentinel, kind, latent, target_width, target_height, relative_size=100.0):
+    if getattr(pipeline_self, "_h3_p1_full", False):   # fork.30: "Mods in phase 1: Full size"
+        return latent
+    """Fit a mod to phase 1's half-size canvas (fork.29).
+
+    Same size as the original port's _fit_latent_to_canvas, but made the way
+    "Shrink method" says. Re-encode (the default) decodes the mod, resizes
+    the picture and encodes it again; Fast is the port's own latent resample.
+    Averaging VAE latent cells is not the same as shrinking the picture --
+    it blurs fine detail, faces first -- and phase 1 is where a two-phase
+    run settles identity (phase 2 only refines it from ~0.9 noise), so the
+    resample left mods with little visible effect on two-phase runs."""
+    if latent is None or latent.dim() != 5:
+        return latent
+    if getattr(pipeline_self, "_h3_shrink_fast", False):
+        return _fit_latent_to_canvas(latent, target_width, target_height, relative_size, f"{kind} RefMod")
+    h, w = latent.shape[-2], latent.shape[-1]
+    try:
+        budget = float(target_width) * float(target_height) * float(relative_size) / 100.0
+    except (TypeError, ValueError):
+        return latent
+    current = (h * _VAE_SPATIAL_FACTOR) * (w * _VAE_SPATIAL_FACTOR)
+    if budget <= 0 or current <= budget:
+        return latent
+    scale = (budget / current) ** 0.5
+    new_h = min(h, max(2, int(round(h * scale / 2)) * 2))
+    new_w = min(w, max(2, int(round(w * scale / 2)) * 2))
+    if new_h >= h and new_w >= w:
+        return latent
+    smaller = _reencode_smaller(pipeline_self, latent, kind, getattr(sentinel, "is_stack", False),
+                                new_w * _VAE_SPATIAL_FACTOR, new_h * _VAE_SPATIAL_FACTOR)
+    if smaller is None:
+        return _fit_latent_to_canvas(latent, target_width, target_height, relative_size, f"{kind} RefMod")
+    _log(f"fitted {kind} RefMod to phase 1's canvas (re-encoded): {w}x{h} -> "
+         f"{smaller.shape[-1]}x{smaller.shape[-2]} latent cells")
+    return smaller
 
 
 def _apply_size_limits(pipeline_self, sentinel, kind, latent, canvas_w=None, canvas_h=None, pass_no=None):
@@ -2012,6 +2102,7 @@ def _tiling_flag() -> str:
 def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
     """Read this run's panel options onto the pipeline for the hooks."""
     _LABEL_LOG["done"] = False
+    _REFMODS_IN_USE["on"] = False
     if int(kwargs.get("window_no") or 1) <= 1:
         _LABEL_BASE["image"] = None   # a new generation
     # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None
@@ -2027,6 +2118,8 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
                              (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF))
                if two_phase else PHASE2_MODS_FULL)
     pipeline_self._h3_p2_mode = p2_mode
+    pipeline_self._h3_p1_full = two_phase and _state_option(
+        state_json, "phase1_mods", PHASE1_MODS_FIT, (PHASE1_MODS_FIT, PHASE1_MODS_FULL)) == PHASE1_MODS_FULL
     p2_off = p2_mode == PHASE2_MODS_OFF
     if p2_off and not fl2va and _has_live_visual_refs(kwargs):
         # Ref2VA lines phase 2's references up with phase 1's by position;
@@ -2039,6 +2132,8 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
         if pipeline_self._h3_fit_output:
             _log(f"fit to output: on -- visual mods bigger than {kwargs.get('width')}x"
                  f"{kwargs.get('height')} are made smaller to that pixel area")
+        if pipeline_self._h3_p1_full:
+            _log("Mods in phase 1: Full size -- mods are not shrunk to phase 1's half canvas")
         if two_phase and p2_mode != PHASE2_MODS_FULL:
             _log("Mods in phase 2: " + ("Off" if p2_off else "Fit to tile" if p2_mode == PHASE2_MODS_TILE
                                         else "Full")
@@ -2124,7 +2219,7 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
         canvas = _pass_canvas(pipeline_self, pass_no)
         latent = sentinel.latent
         if two_phase and pass_no == 1 and canvas[0]:
-            latent = _fit_latent_to_canvas(latent, canvas[0], canvas[1], 100.0, f"{kind} RefMod")
+            latent = _fit_phase_1(pipeline_self, sentinel, kind, latent, canvas[0], canvas[1], 100.0)
         return _apply_size_limits(pipeline_self, sentinel, kind, latent, *canvas, pass_no=pass_no)
 
     def build_pass(pass_no):
@@ -2152,6 +2247,7 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
         labels = [s.enc for s in image_sentinels + video_sentinels if isinstance(s.enc, dict)]
     if labels_on:
         labels += [s.enc for s in audio_sentinels if isinstance(s.enc, dict)]
+    _REFMODS_IN_USE["on"] = True
     _FL2VA.update(active=True, visual=visual, audio=[s.latent for s in audio_sentinels], entries=entries,
                   announced=False, presentation=labels, visual2=visual2, entries2=entries2, calls=0,
                   pass_no=1, label_mode=("keep" if later_window and STABLE_REFMOD_LABELS else "record"))
@@ -2225,6 +2321,7 @@ def _install_fl2va_hooks(Pipeline) -> None:
 
     @functools.wraps(_orig_forward)
     def patched_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload, *args, **kwargs):
+        _veda_full_references(self)
         if _FL2VA["active"] and _FL2VA["entries"] and isinstance(payload, dict) and not payload.get("refs"):
             payload["refs"] = list(_FL2VA["entries2"] if _FL2VA["pass_no"] == 2 else _FL2VA["entries"])
             if not _FL2VA["announced"]:

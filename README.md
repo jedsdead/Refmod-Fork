@@ -1,6 +1,6 @@
 # MiniMax H3 RefMods for Wan2GP — jedsdead fork
 
-**Version 0.38.1-fork.27** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.30** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
@@ -79,6 +79,7 @@ what the fork adds.
 ### Speed and sizing
 
 - **Fit mods to the output size.**
+- **Mods in phase 1**: Fit to phase 1 (default) or Full size.
 - **Mods in phase 2**: Full, Fit to tile (with phase 2 tiling) or Off.
 - **Shrink method** for the above: Re-encode (best quality) or Fast.
 - **FL2VA mods are fitted to phase 1** of two-phase runs, as Ref2VA mods are.
@@ -115,6 +116,26 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.30** — **Mods in phase 1** (two-phase runs): *Fit to phase 1*
+  (default, mods shrunk to phase 1's half canvas) or *Full size* (mods kept
+  full size in phase 1: sharper faces, slower phase 1). Explainer text across
+  the panel, Extract, Library and Decompile tabs cut down to short hints.
+- **0.38.1-fork.29** — **mods work on two-phase runs again.** Since fork.24,
+  phase 1 shrank mods to its half-size canvas with the original port's latent
+  resample, which averages VAE latent cells and blurs identity -- and phase 1
+  is where a two-phase run settles it. Phase 1 now re-encodes the mod
+  (decode, resize the picture, encode), as the fork did up to fork.23; *Shrink
+  method: Fast* keeps the resample. Applies to Ref2VA and FL2VA, Veda or not.
+
+- **0.38.1-fork.28** — **mods work on the Veda Sparse models.** Veda attends
+  to references sparsely, picked by a learned predictor; the FL2VA Veda
+  variants load the text-to-video predictor, which never saw references and
+  kept about 10% of them, so a mod reached the model but was mostly ignored.
+  While a generation carries mods, references are now attended in full
+  (Veda's own "keep all references" mode) on every Veda model, Ref2VA and
+  FL2VA; the generated video stays sparse, and the setting is put back when
+  the generation ends. The console says when it applies.
+
 - **0.38.1-fork.27** — **choose each mod's prompt label** (a *Label* dropdown
   per mod, and one for its soundtrack); the extractor's *Reference duration
   to use* slider is gone (the trim decides, whole video up to 15 s, with a
@@ -142,7 +163,7 @@ of the file for the model switches.
   - prompt labels and stored prompt-view frames (the port's format and
     extraction, including its *Prompt-view resolution* setting);
   - fitting mods to phase 1 of two-phase runs (the port's latent resample —
-    previously the fork re-encoded);
+    reverted to re-encoding in fork.29);
   - image output and **video mods on sliding windows 2, 3, ...** — the port's
     setting, whose default is *First frame as a still* (the fork's default
     was the whole clip; choose *Whole clip* to keep that behaviour);
