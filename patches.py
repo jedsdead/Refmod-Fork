@@ -497,7 +497,9 @@ def _count_refmod_visual_refs(state_json: str) -> int:
         # is pictures -- unless the row sends it as one video reference.
         pictures = kind == "image" or core.is_still_stack(kind, latent_t, meta.get("tags"),
                                                           meta.get("source", ""))
-        if pictures and row.get("as_video") and latent_t > 1:
+        if pictures and _row_send_as(row) == "sheet" and latent_t > 1:
+            total += copies   # fork.38: one contact sheet per copy
+        elif pictures and row.get("as_video") and latent_t > 1:
             total += 1
         elif pictures:
             total += latent_t * copies
@@ -1191,7 +1193,18 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
         image_sentinels, video_sentinels = [], []
         # A picture stack ComfyUI saved as kind "video" is still pictures (fork).
         pictures = mod.kind == "image" or mod.still_stack()
-        if pictures and row.get("as_video") and latent.shape[2] > 1:
+        send_as = _row_send_as(row)   # fork.38
+        if pictures and send_as == "sheet" and latent.shape[2] > 1:
+            # Fork.38, "Send as: Contact sheet": every picture side by side
+            # in ONE picture reference (one <Picture N>), laid out in latent
+            # space -- no VAE pass. The text encoder is shown the same grid.
+            sheet = _tile_stack(latent)
+            enc = _enc_sheet(mod, eff, latent.shape[2])
+            for _ in range(copies):
+                sentinel = _RefModImageSentinel(sheet)
+                sentinel.enc = dict(enc) if enc else None
+                image_sentinels.append(sentinel)
+        elif pictures and send_as == "video" and latent.shape[2] > 1:
             # Fork, "Send as one video": every picture of the mod in ONE video
             # reference -- one <Video N> label instead of one <Picture N> per
             # picture. "Copies" repeats the pictures inside that one slot.
@@ -1801,6 +1814,55 @@ def _dimmed(frames, strength):
     """The same dimming _enc_item applies: a weaker mod shows the encoder a
     weaker picture."""
     return frames * strength + 0.5 * (1.0 - strength) if strength < 1.0 else frames
+
+
+def _row_send_as(row) -> str:
+    """fork.38: how a multi-picture row is sent -- "pictures" (one reference
+    each), "video" (one video reference) or "sheet" (one contact sheet)."""
+    if str(row.get("send_as") or "") == "sheet":
+        return "sheet"
+    return "video" if row.get("as_video") else "pictures"
+
+
+def _sheet_grid(n: int):
+    """(rows, cols) of a contact sheet of n pictures: as square as possible."""
+    cols = max(1, math.ceil(n ** 0.5))
+    return math.ceil(n / cols), cols
+
+
+def _tile_stack(latent):
+    """A picture stack [1, C, T, H, W] laid out as one picture latent
+    [1, C, 1, rows*H, cols*W]; empty cells hold the stack's average."""
+    _, c, t, h, w = latent.shape
+    rows, cols = _sheet_grid(t)
+    fill = latent.float().mean(dim=(2, 3, 4), keepdim=True).to(latent.dtype)
+    sheet = fill.expand(1, c, 1, rows * h, cols * w).clone()
+    for j in range(t):
+        r, k = divmod(j, cols)
+        sheet[:, :, 0, r * h:(r + 1) * h, k * w:(k + 1) * w] = latent[:, :, j]
+    return sheet
+
+
+def _enc_sheet(mod, strength, count):
+    """The prompt entry for a contact sheet: the stored prompt-view pictures
+    in the same grid, as one picture (capped like any prompt-view frame)."""
+    frames = getattr(mod, "enc_frames", None)
+    if not PROMPT_LABELS_FOR_REFMODS or frames is None or not frames.shape[0]:
+        return None
+    try:
+        frames = frames[:count].float()
+        n, h, w, _ = frames.shape
+        rows, cols = _sheet_grid(n)
+        grid = torch.full((1, rows * h, cols * w, 3), 0.5)
+        for j in range(n):
+            r, k = divmod(j, cols)
+            grid[0, r * h:(r + 1) * h, k * w:(k + 1) * w] = frames[j]
+        grid = encframes.cap_long_edge(grid, core.ENC_MAX_EDGE)
+        _log(f"'{mod.name}': {n} pictures sent as one contact sheet ({rows}x{cols}) -- one <Picture N>")
+        return {"type": "image", "frames": _dimmed(grid, strength).clone()}
+    except Exception:
+        _log("could not build a contact sheet's prompt entry:\n" + traceback.format_exc())
+        return None
 
 
 def _enc_stack(mod, strength, shown):

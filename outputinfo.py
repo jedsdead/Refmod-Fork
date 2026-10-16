@@ -45,7 +45,9 @@ def h3_summary(payload: dict, labels: str = "") -> str:
         if not row.get("mod"):
             continue
         extra = []
-        if row.get("as_video"):
+        if row.get("send_as") == "sheet":
+            extra.append("as a contact sheet")
+        elif row.get("as_video"):
             extra.append("as one video")
         if row.get("use_audio") is False:
             extra.append("no audio")

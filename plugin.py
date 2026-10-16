@@ -345,12 +345,14 @@ def _row_restore_updates(row, kind):
     multi = (kind == "image" and bool(meta) and _is_picture_mod(meta)
              and int(meta.get("latent_t", 1) or 1) > 1)
     has_audio = bool(meta) and meta.get("kind") != "audio" and bool(meta.get("has_audio"))
-    as_video = bool(row.get("as_video")) and multi
+    send_as = (("sheet" if row.get("send_as") == "sheet" else "video" if row.get("as_video") else "pictures")
+               if multi else "pictures")
+    as_video = send_as == "video"
     use_audio = bool(row.get("use_audio", True))
     choices = _mod_choices(kind)
     return [gr.update(choices=choices if name in choices else choices + [name], value=name),
             gr.update(value=float(row.get("strength", 1.0) or 0.0)),
-            gr.update(visible=multi, value=as_video),
+            gr.update(visible=multi, value=send_as),
             gr.update(visible=has_audio, value=use_audio),
             gr.update(visible=True, choices=_label_choices("video" if as_video else kind),
                       value=_label_number(row.get("label")) or AUTO_LABEL),
@@ -373,7 +375,7 @@ def _row_boxes_update(name, kind="image", key=None):
     multi = (kind == "image" and bool(meta) and _is_picture_mod(meta)
              and int(meta.get("latent_t", 1) or 1) > 1)
     has_audio = bool(meta) and meta.get("kind") != "audio" and bool(meta.get("has_audio"))
-    return (gr.update(visible=multi, value=False), gr.update(visible=has_audio, value=True),
+    return (gr.update(visible=multi, value="pictures"), gr.update(visible=has_audio, value=True),
             gr.update(visible=bool(meta), choices=_label_choices(kind), value=AUTO_LABEL),
             gr.update(visible=has_audio, value=AUTO_LABEL))
 
@@ -438,7 +440,7 @@ def _as_video_label_update(on, name, key=None):
     <Picture N> choices, back to Auto (unless a restore is setting it)."""
     pending = _pending_row(key, name) if key is not None else None
     value = (_label_number(pending.get("label")) or AUTO_LABEL) if pending else AUTO_LABEL
-    return gr.update(choices=_label_choices("video" if on else "image"), value=value)
+    return gr.update(choices=_label_choices("video" if _send_as(on) == "video" else "image"), value=value)
 
 
 def _soundtrack_label_update(include_audio, name):
@@ -452,7 +454,7 @@ def _soundtrack_label_update(include_audio, name):
 def _cleared_row_updates():
     """gr.update()s returning one picker row to empty."""
     return [gr.update(value=NONE_CHOICE), gr.update(value=1.0),
-            gr.update(value=False, visible=False), gr.update(value=True, visible=False),
+            gr.update(value="pictures", visible=False), gr.update(value=True, visible=False),
             gr.update(value=AUTO_LABEL, visible=False), gr.update(value=AUTO_LABEL, visible=False)]
 
 
@@ -462,6 +464,18 @@ def _label_number(value):
     except (TypeError, ValueError):
         return None
     return number if number >= 1 else None
+
+
+# fork.38: how a multi-picture image row is sent (was the "Send as one video" box).
+SEND_AS_UI = [("Separate pictures", "pictures"), ("One video", "video"), ("Contact sheet", "sheet")]
+
+
+def _send_as(value) -> str:
+    """"pictures" / "video" / "sheet" from the row's Send-as value (older
+    callers pass the old checkbox's True / False)."""
+    if value in ("pictures", "video", "sheet"):
+        return value
+    return "video" if value is True else "pictures"
 
 
 def _rows_payload(values):
@@ -475,8 +489,11 @@ def _rows_payload(values):
         except (TypeError, ValueError):
             continue
         if name and name != NONE_CHOICE and strength > 0:
-            row = {"mod": name, "strength": strength, "as_video": bool(as_video),
+            send_as = _send_as(as_video)
+            row = {"mod": name, "strength": strength, "as_video": send_as == "video",
                    "use_audio": bool(use_audio)}
+            if send_as == "sheet":
+                row["send_as"] = "sheet"
             if _label_number(label):
                 row["label"] = _label_number(label)
             if use_audio and _label_number(audio_label):
@@ -493,7 +510,7 @@ def _normalize_rows(rows):
     for row in rows or []:
         row = tuple(row)
         out.append((row[0], row[1],
-                    bool(row[2]) if len(row) > 2 else False,
+                    _send_as(row[2]) if len(row) > 2 else "pictures",
                     bool(row[3]) if len(row) > 3 else True,
                     _label_number(row[4]) if len(row) > 4 else None,
                     _label_number(row[5]) if len(row) > 5 else None))
@@ -596,8 +613,10 @@ def _format_label_line(rows):
         kind = meta.get("kind", "image")
         latent_t = max(1, int(meta.get("latent_t", 1)))
         if _is_picture_mod(meta):
-            if as_video and latent_t > 1:
+            if as_video == "video" and latent_t > 1:
                 videos.append((name, 1, label))
+            elif as_video == "sheet" and latent_t > 1:
+                pictures.append((name, 1, label))
             else:
                 pictures.append((name, latent_t, label))
         elif kind == "video":
@@ -654,7 +673,9 @@ def _format_ref_counter(rows):
             continue
         kind = meta.get("kind", "image")
         latent_t = max(1, int(meta.get("latent_t", 1)))
-        if _is_picture_mod(meta) and as_video and latent_t > 1:
+        if _is_picture_mod(meta) and as_video == "sheet" and latent_t > 1:
+            n_images += 1          # fork.38: one contact sheet
+        elif _is_picture_mod(meta) and as_video == "video" and latent_t > 1:
             n_stacks += 1          # one video reference; pictures have no duration
         elif _is_picture_mod(meta):
             n_images += latent_t
@@ -934,7 +955,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.37"
+        self.version = "0.38.1-fork.38"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1314,7 +1335,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     label_dd = gr.Dropdown(choices=_label_choices(kind), value=AUTO_LABEL,
                                            label="Label", visible=False, scale=2, min_width=130)
                     with gr.Column(scale=2, min_width=150):
-                        as_video = gr.Checkbox(False, label="Send as one video", visible=False)
+                        as_video = gr.Dropdown(choices=SEND_AS_UI, value="pictures", label="Send as",
+                                               visible=False)   # fork.38 (was a checkbox)
                         use_audio = gr.Checkbox(True, label="Include audio", visible=False)
                         audio_label_dd = gr.Dropdown(choices=_label_choices("audio"), value=AUTO_LABEL,
                                                      label="Soundtrack label", visible=False)

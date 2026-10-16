@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.37** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.38** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -133,6 +133,15 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.38** — **contact sheets for H3 picture mods.** The
+  "Send as one video" box on multi-picture image rows is now a **Send as**
+  choice: *Separate pictures* (one `<Picture N>` each), *One video* (one
+  `<Video N>`), or *Contact sheet* -- all the pictures side by side in one
+  picture reference, one `<Picture N>`. The sheet is laid out from the stored
+  latents (no VAE pass, nothing to re-extract) and the text encoder is shown
+  the same grid. It costs the same tokens as separate pictures; anything that
+  shrinks a mod (phase 1, Fit mods to the output size, Fit to tile) shrinks
+  the whole sheet, so each picture in it gets smaller.
 - **0.38.1-fork.37** — **choose the order** of a mod's pictures and videos.
   Both extract tabs show an **Order** panel once more than one file is
   uploaded: thumbnails in order, numbered; click one and move it (first,

@@ -1,7 +1,7 @@
 {
   "name": "Refmods For Wan GP",
   "author": "fork by jedsdead; original Wan2GP port by g3n3rativ3; original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
-  "version": "0.38.1-fork.37",
+  "version": "0.38.1-fork.38",
   "description": "No-training 'reference mods' for MiniMax H3 (Ref2VA, FL2VA, FL2VA ControlNet) and Flux 2 / Flux 3: compress a reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation. Built on g3n3rativ3's MiniMax H3 RefMods port (0.38.1), with FL2VA and Flux support, mods with a voice as well as a look, phase options, a shared H3/Flux Library, Convert to Flux and a Decompile tab.",
   "type": [
     "app"
