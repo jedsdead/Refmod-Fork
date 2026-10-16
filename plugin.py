@@ -43,6 +43,7 @@ from shared.utils.plugins import WAN2GPPlugin
 from . import core, encframes, storage
 from . import flux, flux_ui   # fork.31
 from . import outputinfo   # fork.34
+from . import order_ui   # fork.37
 import time
 from .patches import (EXTRACT_WRAPPER_KEY, SETTING_GENERATE, STASH_KEY, install_patches,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
@@ -933,7 +934,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.36"
+        self.version = "0.38.1-fork.37"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1407,6 +1408,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     info="Each picture costs about 3-4 clip frames.")
         stills_estimate = gr.Markdown("")
         gr.Markdown("*Every image and video added goes into this one mod.*")
+        source_order = order_ui.build(ref_images, ref_videos)   # fork.37
         with gr.Accordion("Preview / trim reference videos", open=True):   # fork
             gr.Markdown("Untrimmed videos are used whole, up to 15 s.")
             with gr.Row():
@@ -1616,7 +1618,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                        remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
                        latent_frames, identity, multiplier, max_tokens, description, save,
                        use_clip_audio=False, trims=None, as_pictures=False, per_second=1.0,
-                       merge_refs=False, audio_seconds=DEFAULT_AUDIO_SECONDS):
+                       merge_refs=False, audio_seconds=DEFAULT_AUDIO_SECONDS, order=None):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
@@ -1646,6 +1648,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "video_as_pictures": bool(as_pictures), "pictures_per_second": float(per_second or 1.0),
                 "merge": bool(merge_refs),
                 "audio_seconds": max(MIN_AUDIO_SECONDS, float(audio_seconds or DEFAULT_AUDIO_SECONDS)),
+                "order": order_ui.merged_order(order, ref_images, ref_videos),   # fork.37
             }
             log = {"lines": []}
 
@@ -1684,7 +1687,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                    remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
                    latent_frames, identity, multiplier, max_tokens, description, save,
                    use_clip_audio, trim_state, video_as_pictures, pictures_per_second, merge,
-                   soundtrack_seconds],
+                   soundtrack_seconds, source_order],
             outputs=[extract_status],
             queue=False,
         )

@@ -211,12 +211,14 @@ def build_tab(plugin, api_session):
             videos = gr.Files(label="Videos (become pictures)", file_types=["video"], file_count="multiple")
             per_second = gr.Slider(0.25, 4, value=1.0, step=0.25, label="Pictures per second of video",
                                    info=f"Sharpest frame of each slot; up to {flux.MAX_VIDEO_PICTURES} per video.")
+    from . import order_ui
+    order = order_ui.build(images, videos, note="Separate references are numbered in this order.")
     layout = gr.Radio(label="Layout", choices=LAYOUT_UI, value=flux.LAYOUT_SEPARATE, info=LAYOUT_INFO)
     description = gr.Textbox(label="Description", lines=1, info="A note for you; the model never reads it.")
     extract_btn = gr.Button("Extract Flux RefMod", variant="primary")
     extract_status = gr.Markdown("")
 
-    def do_extract(model_type, mod_name, size, concept_type, files, video_files, rate, how, note):
+    def do_extract(model_type, mod_name, size, concept_type, files, video_files, rate, how, note, sequence=None):
         paths = [getattr(f, "name", f) for f in (files or [])]
         video_paths = [getattr(f, "name", f) for f in (video_files or [])]
         if not model_type:
@@ -226,10 +228,11 @@ def build_tab(plugin, api_session):
         ok, message = submit_extract(plugin, api_session, model_type,
                                      {"name": mod_name, "images": paths, "videos": video_paths,
                                       "pictures_per_second": float(rate or 1.0), "layout": how,
+                                      "order": order_ui.merged_order(sequence, files, video_files),
                                       "budget": int(size or flux.DEFAULT_BUDGET),
                                       "concept_type": concept_type, "description": note or ""})
         return ("✅ " if ok else "❌ ") + message
 
     extract_btn.click(fn=do_extract,
-                      inputs=[model_dd, name, budget, concept, images, videos, per_second, layout, description],
+                      inputs=[model_dd, name, budget, concept, images, videos, per_second, layout, description, order],
                       outputs=[extract_status])

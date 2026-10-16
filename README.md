@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.36** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.37** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -133,6 +133,13 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.37** — **choose the order** of a mod's pictures and videos.
+  Both extract tabs show an **Order** panel once more than one file is
+  uploaded: thumbnails in order, numbered; click one and move it (first,
+  earlier, later, last). Images and videos can be mixed in any order, and
+  the mod keeps it: the order of an H3 mod's pictures, and the reference
+  numbering of a Flux mod's separate references. "Use the clip's own audio"
+  takes the first video in this order.
 - **0.38.1-fork.36** — renamed **Refmods For Wan GP**; the plugin's tab is
   now **Refmods**, and the Media Generator panels are **Refmods: MiniMax H3**
   and **Refmods: Flux**. Console lines start with `[Refmods]`. Nothing else

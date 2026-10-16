@@ -2843,6 +2843,12 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     if not video_paths:
         video_paths = [p for p in (spec.get("video_path"), spec.get("video_path2")) if p]
     audio_path = spec.get("audio_path") or None
+    # fork.37: the order chosen in the extractor (images and videos mixed).
+    order = None
+    if spec.get("order"):
+        from .order_ui import apply_order
+        order = apply_order(spec.get("order"), image_paths, video_paths)
+        video_paths = [p for kind, p in order if kind == "vid"]   # also picks "the clip's own audio"
     ref_resolution = int(spec.get("ref_resolution", 1024))
     # Long edge of the frames shown to Qwen3-VL (the <Picture N> channel).
     # 0 / missing = the module default, which is live-reference parity.
@@ -2887,6 +2893,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             remove_background_images_ref = 0
 
     sources = []  # list of (cthw_tensor, is_video)
+    per_file = {}  # fork.37: (kind, path) -> its sources, put in order below
     for i, p in enumerate(image_paths):
         from PIL import Image
         with Image.open(p) as img:
@@ -2895,6 +2902,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             status(f"H3 RefMod: removing background from image {i + 1}/{len(image_paths)}")
             img = storage.remove_background_from_image(img, session=rembg_session)
         sources.append((storage.pil_to_cthw(img), False))
+        per_file.setdefault(("img", p), []).append(sources[-1])
     # Fork: "Turn reference videos into a picture stack" -- each video becomes
     # still pictures (the sharpest frame from every 1/N-second slot) instead
     # of a clip, keeping a clip's identity at a fraction of its tokens.
@@ -2928,6 +2936,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             status(f"H3 RefMod: {os.path.basename(str(vp))} -> {len(stills)} picture(s) "
                    f"({pictures_per_second:g} per second over {covered:.1f}s, sharpest frame of each slot)")
             sources.extend((still, False) for still in stills)
+            per_file.setdefault(("vid", vp), []).extend((still, False) for still in stills)
             from_stills += 1
             continue
         video = storage.load_video_cthw(vp, max_frames=max(64, latent_frames * 8),
@@ -2943,6 +2952,11 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         if video.shape[1] > target_px:
             video = video[:, :target_px]
         sources.append((video, video.shape[1] > 1))
+        per_file.setdefault(("vid", vp), []).append(sources[-1])
+
+    if order:   # fork.37
+        sources = [src for key in order for src in per_file.get(tuple(key), [])]
+        status("H3 RefMod: order -- " + ", ".join(os.path.basename(p) for _, p in order))
 
     canvas = None
     if mode == "encode" and len(sources) > 1:

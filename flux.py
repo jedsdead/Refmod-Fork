@@ -544,12 +544,16 @@ def run_extract(owner, job: dict, flux3: bool, set_progress_status=None, tile_si
     name = _clean_relpath(job.get("name") or "flux_refmod")
     budget = int(job.get("budget") or DEFAULT_BUDGET)
     layout = job.get("layout") if job.get("layout") in LAYOUTS else LAYOUT_SEPARATE
+    from .order_ui import apply_order   # fork.37: the order chosen in the extractor
+    images = [p for p in job.get("images") or [] if p and os.path.isfile(p)]
+    videos = [p for p in job.get("videos") or [] if p and os.path.isfile(p)]
     pictures = []
-    for path in [p for p in job.get("images") or [] if p and os.path.isfile(p)]:
-        with Image.open(path) as img:
-            pictures.append(img.convert("RGB"))
-    for path in [p for p in job.get("videos") or [] if p and os.path.isfile(p)]:
-        pictures += _video_pictures(path, job.get("pictures_per_second") or 1.0, status)
+    for kind, path in apply_order(job.get("order"), images, videos):
+        if kind == "img":
+            with Image.open(path) as img:
+                pictures.append(img.convert("RGB"))
+        else:
+            pictures += _video_pictures(path, job.get("pictures_per_second") or 1.0, status)
     if not pictures:
         status("Flux RefMod: nothing to do -- no pictures were given")
         return
