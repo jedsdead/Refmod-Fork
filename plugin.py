@@ -1,5 +1,5 @@
 """
-MiniMax H3 RefMods -- Wan2GP plugin.
+Refmods For Wan GP -- Wan2GP plugin (formerly MiniMax H3 RefMods).
 
 No-training "reference mods" for MiniMax H3 Ref2VA: compress an image/video
 reference into a small .safetensors file once (Extract tab), then reuse it at
@@ -41,6 +41,9 @@ from PIL import Image
 from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, encframes, storage
+from . import flux, flux_ui   # fork.31
+from . import outputinfo   # fork.34
+import time
 from .patches import (EXTRACT_WRAPPER_KEY, SETTING_GENERATE, STASH_KEY, install_patches,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
                       is_minimax_h3_refmod_capable,
@@ -51,7 +54,8 @@ try:
 except Exception:                                 # pragma: no cover
     RangeSlider = None
 
-PlugIn_Name = "MiniMax H3 RefMods"
+PlugIn_Name = "Refmods For Wan GP"
+PlugIn_Tab = "Refmods"   # fork.36: the tab's label
 PlugIn_Id = "H3RefMods"
 
 # Row counts are just how many picker slots the UI draws -- they are NOT the
@@ -122,7 +126,7 @@ def _diagnose(api_session, model_type, patch_error):
         if missing:
             lines.append(f"❌ This model does NOT declare {missing} under custom_settings -- RefMods will "
                          f"silently no-op for it (a real generation will run instead of an extraction, or "
-                         f"without the mods applied). Check the terminal log for '[H3RefMod]' lines at "
+                         f"without the mods applied). Check the terminal log for '[Refmods]' lines at "
                          f"Wan2GP startup -- the model-definition patch did not take effect for "
                          f"'{model_type}'.")
         else:
@@ -135,13 +139,13 @@ def _diagnose(api_session, model_type, patch_error):
         from . import patches
         if getattr(patches.install_prepare_inputs_dict_patch, patches._PREPARE_INPUTS_PATCH_MARKER, False):
             lines.append("✅ Inline panel hook active (prepare_inputs_dict patched) -- RefMods selected "
-                         "in the 'MiniMax H3 RefMods (inline)' accordion on the Media Generator page will "
+                         "in the 'Refmods: MiniMax H3' accordion on the Media Generator page will "
                          "apply to that page's own Generate button.")
         else:
             lines.append("❌ Inline panel hook NOT active -- the inline accordion on the Media Generator "
                          "page will be visible but selections made there will have no effect. Use this "
                          "plugin's own 'Generate' tab instead, or check the terminal log for a "
-                         "'[H3RefMod] prepare_inputs_dict' line explaining why.")
+                         "'[Refmods] prepare_inputs_dict' line explaining why.")
     except Exception as e:
         lines.append(f"⚠️ Could not check the inline panel hook status: {e!r}")
     return "\n".join(lines)
@@ -320,7 +324,42 @@ def _label_choices(kind):
                                       for n in range(1, LABEL_MAX[kind] + 1)]
 
 
-def _row_boxes_update(name, kind="image"):
+# fork.34: values a panel restore is putting into a row, so the row's own
+# change handlers (which start a newly picked mod fresh) keep them.
+_RESTORE_PENDING = {}
+_RESTORE_SECONDS = 15.0
+
+
+def _pending_row(key, name):
+    item = _RESTORE_PENDING.get(key)
+    if not item or time.time() - item[0] > _RESTORE_SECONDS or item[1].get("mod") != name:
+        return None
+    return item[1]
+
+
+def _row_restore_updates(row, kind):
+    """The six row widgets set to a saved row (see _rows_payload)."""
+    name = row["mod"]
+    meta = _row_meta(name, 1.0)
+    multi = (kind == "image" and bool(meta) and _is_picture_mod(meta)
+             and int(meta.get("latent_t", 1) or 1) > 1)
+    has_audio = bool(meta) and meta.get("kind") != "audio" and bool(meta.get("has_audio"))
+    as_video = bool(row.get("as_video")) and multi
+    use_audio = bool(row.get("use_audio", True))
+    choices = _mod_choices(kind)
+    return [gr.update(choices=choices if name in choices else choices + [name], value=name),
+            gr.update(value=float(row.get("strength", 1.0) or 0.0)),
+            gr.update(visible=multi, value=as_video),
+            gr.update(visible=has_audio, value=use_audio),
+            gr.update(visible=True, choices=_label_choices("video" if as_video else kind),
+                      value=_label_number(row.get("label")) or AUTO_LABEL),
+            gr.update(visible=has_audio and use_audio, value=_label_number(row.get("audio_label")) or AUTO_LABEL)]
+
+
+def _row_boxes_update(name, kind="image", key=None):
+    pending = _pending_row(key, name) if key is not None else None
+    if pending is not None:
+        return tuple(_row_restore_updates(pending, kind)[2:])
     """The per-row options after a row's mod changes, starting fresh for the
     newly picked mod (nothing chosen for the previous mod carries over).
 
@@ -336,6 +375,69 @@ def _row_boxes_update(name, kind="image"):
     return (gr.update(visible=multi, value=False), gr.update(visible=has_audio, value=True),
             gr.update(visible=bool(meta), choices=_label_choices(kind), value=AUTO_LABEL),
             gr.update(visible=has_audio, value=AUTO_LABEL))
+
+
+def _panel_restore_updates(raw):
+    """fork.34: the inline panel refilled from a loaded file's selection --
+    status, folder picker, every row widget, the panel controls, row
+    visibility and the per-kind shown counts (see restore_panel)."""
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        payload = {}
+    counts = {"image": IMAGE_ROWS, "video": VIDEO_ROWS, "audio": AUDIO_ROWS}
+    slots = {k: [] for k in counts}
+    missing = []
+    for row in payload.get("rows") or []:
+        name = row.get("mod")
+        meta = storage.read_refmod_meta(storage.mod_path(name)) if name else None
+        if meta is None:
+            missing.append(str(name))
+            continue
+        kind = meta.get("kind", "image")
+        if kind == "video" and core.is_still_stack(kind, int(meta.get("latent_t", 1) or 1),
+                                                   meta.get("tags"), meta.get("source", "")):
+            kind = "image"
+        kind = kind if kind in counts else "image"
+        if len(slots[kind]) < counts[kind]:
+            slots[kind].append(row)
+        else:
+            missing.append(str(name))
+    _RESTORE_PENDING.clear()
+    now = time.time()
+    widgets, ui, shown = [], [], []
+    for kind, count in counts.items():
+        for i in range(count):
+            if i < len(slots[kind]):
+                _RESTORE_PENDING[(kind, i)] = (now, slots[kind][i])
+                widgets += _row_restore_updates(slots[kind][i], kind)
+            else:
+                widgets += _cleared_row_updates()
+        n = max(1, len(slots[kind]))
+        ui += [gr.update(visible=i < n) for i in range(count)]
+        shown.append(n)
+    controls = [payload.get("stack_pictures", encframes.STACK_ALL),
+                payload.get("stack_pictures_n", encframes.STACK_DEFAULT_N),
+                payload.get("video_frames", encframes.STACK_UP_TO_N),
+                payload.get("video_frames_n", encframes.MAX_CLIP_FRAMES_SHOWN),
+                bool(payload.get("fit_to_output", False)), payload.get("phase2_mods", "full"),
+                payload.get("shrink_method", "reencode"), payload.get("window_mode", WINDOW_MODE_DEFAULT),
+                payload.get("phase1_mods", "fit")]
+    restored = sum(len(v) for v in slots.values())
+    status = (f"↺ {restored} RefMod(s) restored from the loaded settings." if restored
+              else "*No RefMods selected.*")
+    if missing:
+        status += " Not found here: " + ", ".join(missing) + "."
+    return ([status, gr.update(value=ALL_FOLDERS_CHOICE)] + widgets + [gr.update(value=v) for v in controls]
+            + ui + shown)
+
+
+def _as_video_label_update(on, name, key=None):
+    """The label dropdown after "Send as one video" flips: <Video N> or
+    <Picture N> choices, back to Auto (unless a restore is setting it)."""
+    pending = _pending_row(key, name) if key is not None else None
+    value = (_label_number(pending.get("label")) or AUTO_LABEL) if pending else AUTO_LABEL
+    return gr.update(choices=_label_choices("video" if on else "image"), value=value)
 
 
 def _soundtrack_label_update(include_audio, name):
@@ -640,7 +742,7 @@ def _hidden_from_api(build):
                         fn.show_api = False
                         hidden += 1
                 if hidden:
-                    print(f"[H3RefMod] {hidden} panel event handler(s) kept out of Gradio's API "
+                    print(f"[Refmods] {hidden} panel event handler(s) kept out of Gradio's API "
                           f"listing (faster first page load)")
     return wrapper
 
@@ -650,7 +752,7 @@ def _model_choices(api_session):
         records = api_session.list_model_defs(
             base_model_type=["minimax_h3_ref2va", "minimax_h3_ref2va_pruned"])
     except Exception as e:
-        print(f"[H3RefMod] could not list MiniMax H3 Ref2VA models: {e!r}")
+        print(f"[Refmods] could not list MiniMax H3 Ref2VA models: {e!r}")
         records = []
     return [(r.get("name") or r.get("model_type"), r.get("model_type")) for r in records]
 
@@ -714,32 +816,106 @@ def _decompile_details(mod):
     return "  \n".join(lines)
 
 
-def _library_rows(folder=None):
-    """Table rows for the Library tab. ``folder`` follows the same picker
-    convention as _mod_choices: None/ALL_FOLDERS_CHOICE lists every mod in
-    every subfolder, ROOT_FOLDER_CHOICE lists only the main folder, and any
-    other value lists that subfolder (and below)."""
+# fork.32: the Library lists H3 and Flux mods together. Its folder picker
+# reads "H3", "H3/<subfolder>", "Flux", "Flux/<subfolder>" (or every folder);
+# H3 mods live in loras/refmods_plugin/minimax_h3/, Flux mods in .../flux2/.
+LIB_H3, LIB_FLUX = "H3", "Flux"
+
+
+def _library_folder_choices():
+    return ([ALL_FOLDERS_CHOICE, LIB_H3] + [f"{LIB_H3}/{f}" for f in storage.list_mod_folders()]
+            + [LIB_FLUX] + [f"{LIB_FLUX}/{f}" for f in flux.list_folders()])
+
+
+def _library_destinations():
+    return ([(f"{LIB_H3} (top)", LIB_H3)] + [f"{LIB_H3}/{f}" for f in storage.list_mod_folders()]
+            + [(f"{LIB_FLUX} (top)", LIB_FLUX)] + [f"{LIB_FLUX}/{f}" for f in flux.list_folders()])
+
+
+def _library_subfolders():
+    return ([f"{LIB_H3}/{f}" for f in storage.list_mod_folders()]
+            + [f"{LIB_FLUX}/{f}" for f in flux.list_folders()])
+
+
+def _split_library_folder(folder):
+    """(model, subfolder) for a Library folder value. model None = both;
+    subfolder "" = all of that model's mods, None = its top level only."""
+    if not folder or folder == ALL_FOLDERS_CHOICE:
+        return None, ""
     if folder == ROOT_FOLDER_CHOICE:
-        list_folder, recursive = None, False
-    elif not folder or folder == ALL_FOLDERS_CHOICE:
-        list_folder, recursive = None, True
-    else:
-        list_folder, recursive = folder, True
-    return [[i["name"], i["kind"], i["mode"], i["tokens"],
-             (f'{i["prompt_view"]}px' if i.get("prompt_view") else "--"),
-             i["size_mb"], i["concept_type"], i["description"]]
-            for i in storage.list_refmods_info(folder=list_folder, recursive=recursive)]
+        return "h3", None
+    head, _, rest = str(folder).partition("/")
+    if head == LIB_FLUX:
+        return "flux", rest
+    if head == LIB_H3:
+        return "h3", rest
+    return "h3", str(folder)   # a plain H3 subfolder, as older code passes
+
+
+def _flux_library_names(folder=None):
+    model, sub = _split_library_folder(folder)
+    if model == "h3":
+        return []
+    names = flux.list_mods()
+    return [n for n in names if n.startswith(sub + "/")] if sub else names
+
+
+def _qualified_choices(folder=None):
+    """Dropdown choices naming H3 and Flux mods unambiguously."""
+    return ([(f"{LIB_H3} · {n}", f"h3:{n}") for n in _library_mod_names(folder)]
+            + [(f"{LIB_FLUX} · {n}", f"flux:{n}") for n in _flux_library_names(folder)])
+
+
+def _split_qualified(value):
+    model, _, name = str(value or "").partition(":")
+    return (model, name) if model in ("h3", "flux") else ("h3", str(value or ""))
+
+
+def _library_rows(folder=None):
+    """Table rows for the Library tab: H3 mods, then Flux mods, filtered by
+    the Library's folder picker (see _split_library_folder)."""
+    model, _ = _split_library_folder(folder)
+    rows = []
+    if model != "flux":
+        args = _h3_list_args(folder)
+        rows += [[LIB_H3, i["name"], i["kind"], i["mode"], i["tokens"],
+                  (f'{i["prompt_view"]}px' if i.get("prompt_view") else "--"),
+                  i["size_mb"], i["concept_type"], i["description"]]
+                 for i in storage.list_refmods_info(folder=args[0], recursive=args[1])]
+    for name in _flux_library_names(folder):
+        meta = flux.read_meta(name) or {}
+        rows.append([LIB_FLUX, name, "image", meta.get("mode", "encode"), meta.get("tokens", "?"), "--",
+                     meta.get("size_mb", "?"), meta.get("concept_type", ""),
+                     meta.get("description", "") if meta.get("usable", True)
+                     else "not a Flux 2 latent -- won't load"])
+    return rows
+
+
+def _h3_list_args(folder):
+    model, sub = _split_library_folder(folder)
+    if sub is None:
+        return None, False
+    return (sub or None), True
+
+
+def _convertible(folder=None):
+    """H3 picture mods (single pictures and picture stacks) Convert to Flux
+    can take, honouring the Library's folder picker."""
+    model, _ = _split_library_folder(folder)
+    if model == "flux":
+        return []
+    list_folder, recursive = _h3_list_args(folder)
+    return storage.list_refmods_by_kind("image", folder=list_folder, recursive=recursive)
 
 
 def _library_mod_names(folder=None):
-    """Just the folder-relative names for the Library's own dropdowns,
-    honouring the same folder filter as _library_rows()."""
-    if folder == ROOT_FOLDER_CHOICE:
-        return storage.list_refmods(folder=None, recursive=False)
-    if not folder or folder == ALL_FOLDERS_CHOICE:
-        return storage.list_refmods(folder=None, recursive=True)
-    return storage.list_refmods(folder=folder, recursive=True)
-
+    """H3 mod names (folder-relative) for the H3-only tools, honouring the
+    Library's folder picker; none when a Flux folder is picked."""
+    model, _ = _split_library_folder(folder)
+    if model == "flux":
+        return []
+    list_folder, recursive = _h3_list_args(folder)
+    return storage.list_refmods(folder=list_folder, recursive=recursive)
 
 
 def _lora_choices(api_session, model_type):
@@ -748,7 +924,7 @@ def _lora_choices(api_session, model_type):
     try:
         info = api_session.list_loras(model_type)
     except Exception as e:
-        print(f"[H3RefMod] could not list LoRAs for {model_type}: {e!r}")
+        print(f"[Refmods] could not list LoRAs for {model_type}: {e!r}")
         return []
     return list(info.get("loras") or [])
 
@@ -757,11 +933,16 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.30"
+        self.version = "0.38.1-fork.36"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
         self._patch_error = install_patches()
+        self._flux_error = flux.install()   # fork.31: Flux 2 / Flux 3
+        try:   # fork.32: every mod file in its model's folder (H3 / Flux)
+            flux.sort_mod_files()
+        except Exception as e:
+            print(f"[Refmods] could not sort mod files into their model folders: {e!r}")
 
     def setup_ui(self):
         self.request_component("state")
@@ -773,9 +954,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         self.request_global("get_state_model_type")
         self.request_global("get_model_settings")
         self.request_global("get_base_model_type")
-        self.add_tab(tab_id=PlugIn_Id, label=PlugIn_Name, component_constructor=self.create_ui)
+        self.request_global("set_model_settings")          # fork.34: restore on load
+        self.request_component("refresh_form_trigger")     # fork.34
+        try:   # fork.34: a readable RefMods line in each output's info
+            self.register_data_hook("before_metadata_save", outputinfo.before_metadata_save)
+        except Exception as e:
+            print(f"[Refmods] could not register the metadata hook ({e!r}); outputs won't list their RefMods")
+        self.add_tab(tab_id=PlugIn_Id, label=PlugIn_Tab, component_constructor=self.create_ui)
         self.insert_after(target_component_id="loras_multipliers",
                           new_component_constructor=self._build_inline_refmods_section)
+        self.insert_after(target_component_id="loras_multipliers",   # fork.31
+                          new_component_constructor=self._build_inline_flux_section)
 
     def post_ui_setup(self, components):
         """Wan2GP builds its whole model catalog (``models_def``, what
@@ -799,20 +988,20 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         if callable(refresh):
             try:
                 refresh()
-                print("[H3RefMod] refreshed Wan2GP's model catalog so the RefMod custom_settings "
+                print("[Refmods] refreshed Wan2GP's model catalog so the RefMod custom_settings "
                      "declaration takes effect on cached MiniMax H3 model definitions")
             except Exception as e:
-                print(f"[H3RefMod] refresh_model_defs() failed ({e!r}); MiniMax H3 model "
+                print(f"[Refmods] refresh_model_defs() failed ({e!r}); MiniMax H3 model "
                      "definitions may still be missing the RefMod custom_settings -- use "
                      "'Check setup for this model' in the plugin tab to confirm.")
         else:
-            print("[H3RefMod] refresh_model_defs was not exposed by Wan2GP's plugin globals; "
+            print("[Refmods] refresh_model_defs was not exposed by Wan2GP's plugin globals; "
                  "RefMods will likely not take effect until Wan2GP is restarted after this "
                  "plugin was enabled. Use 'Check setup for this model' in the plugin tab to confirm.")
 
         get_base_mt = getattr(self, "get_base_model_type", None)
         if not callable(get_base_mt):
-            print("[H3RefMod] get_base_model_type was not exposed by Wan2GP's plugin globals; "
+            print("[Refmods] get_base_model_type was not exposed by Wan2GP's plugin globals; "
                  "a MiniMax H3 Ref2VA finetune whose own model_type name doesn't start with "
                  "'minimax_h3_ref2va' (e.g. a custom-named checkpoint) may not be recognized -- "
                  "the inline panel would stay hidden for it, and RefMods wouldn't apply even if "
@@ -824,20 +1013,26 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         if callable(orig_prepare) and callable(get_state_mt):
             err = install_prepare_inputs_dict_patch(orig_prepare, get_state_mt, self.set_global, get_base_mt)
             if err:
-                print(f"[H3RefMod] {err}")
+                print(f"[Refmods] {err}")
         else:
-            print("[H3RefMod] prepare_inputs_dict / get_state_model_type were not exposed by "
+            print("[Refmods] prepare_inputs_dict / get_state_model_type were not exposed by "
                  "Wan2GP's plugin globals; the inline RefMods panel on the Media Generator page "
                  "will be visible but will not affect generations from that page's own Generate "
                  "button. Use the plugin's own 'Generate' tab instead.")
+
+        orig_set_model_settings = getattr(self, "set_model_settings", None)   # fork.34
+        if callable(orig_set_model_settings):
+            err3 = outputinfo.install_set_model_settings_patch(orig_set_model_settings, self.set_global, get_base_mt)
+            if err3:
+                print(f"[Refmods] {err3}")
 
         orig_get_model_settings = getattr(self, "get_model_settings", None)
         if callable(orig_get_model_settings):
             err2 = install_get_model_settings_patch(orig_get_model_settings, self.set_global, get_base_mt)
             if err2:
-                print(f"[H3RefMod] {err2}")
+                print(f"[Refmods] {err2}")
         else:
-            print("[H3RefMod] get_model_settings was not exposed by Wan2GP's plugin globals; "
+            print("[Refmods] get_model_settings was not exposed by Wan2GP's plugin globals; "
                  "a RefMod change right before clicking Generate (with no other field touched "
                  "in between) may not always be picked up from the inline panel -- change any "
                  "other field (e.g. click into the prompt box) once after picking mods as a "
@@ -859,9 +1054,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # panel out of sight for anyone who already has a MiniMax H3 Ref2VA model
         # selected by default and hasn't touched the model dropdown yet. The .change()
         # handler below still correctly hides it the moment any model switch happens.
-        with gr.Accordion("MiniMax H3 RefMods (inline)", open=False) as accordion:
+        with gr.Accordion("Refmods: MiniMax H3", open=False) as accordion:
             gr.Markdown(
-                "Works with **MiniMax H3 Ref2VA, FL2VA and FL2VA ControlNet**. Make mods in the **MiniMax H3 RefMods** tab.")
+                "Works with **MiniMax H3 Ref2VA, FL2VA and FL2VA ControlNet**. Make mods in the **Refmods** tab.")
             # Fork: the full panel (per-row options, sizing, text encoder).
             mod_rows, panel_controls = self._build_mod_picker_rows_full()
             with gr.Row():
@@ -898,6 +1093,24 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         clear_btn.click(fn=clear_selection, inputs=[self.state],
                         outputs=[self.state, status] + [c for row in mod_rows for c in row], queue=False)
 
+        # fork.34: loading a file's settings refills the panel (outputinfo).
+        parts = getattr(self, "_panel_parts", None)
+        refresh_trigger = getattr(self, "refresh_form_trigger", None)
+        triggers = [t.change for t in (refresh_trigger, target) if t is not None]
+        if parts is not None and triggers:
+            kinds = ("image", "video", "audio")
+            restore_outputs = ([status, parts["folder_dd"]] + widgets
+                               + [ui for k in kinds for ui in parts["kind_ui"][k]]
+                               + [parts["shown"][k] for k in kinds])
+
+            def restore_panel(state):
+                if not isinstance(state, dict) or outputinfo.RESTORE_H3 not in state:
+                    return [gr.update()] * len(restore_outputs)
+                return _panel_restore_updates(state.pop(outputinfo.RESTORE_H3))
+
+            gr.on(triggers=triggers, fn=restore_panel, inputs=[self.state], outputs=restore_outputs,
+                  queue=False)
+
         # One handler for every widget (gr.on), not one per widget: each takes
         # every widget as input, and Gradio's first page load does work for
         # every handler x input (see _hidden_from_api).
@@ -913,12 +1126,16 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
             target.change(fn=update_visibility, inputs=[target], outputs=[accordion], queue=False)
         else:
-            print("[H3RefMod] neither 'model_choice_target' nor 'wangp_model_choice_target' was "
+            print("[Refmods] neither 'model_choice_target' nor 'wangp_model_choice_target' was "
                  "exposed by Wan2GP -- the inline panel will stay visible for every model instead "
                  "of only MiniMax H3 Ref2VA ones (it still has no effect on other models, this "
                  "only affects whether it's shown).")
 
         return accordion
+
+    @_hidden_from_api
+    def _build_inline_flux_section(self):   # fork.31
+        return flux_ui.build_inline(self)
 
     def _submit(self, api_session, model_type, overrides, callbacks):
         """Build a full, validated settings dict for ``model_type`` -- starting
@@ -1078,6 +1295,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # then video rows, then audio rows, each a (dropdown, strength,
         # send-as-one-video) triple.
         mod_rows = []
+        kind_ui_all, shown_all = {}, {}   # fork.34
         counts = (IMAGE_ROWS, VIDEO_ROWS, AUDIO_ROWS)
         for kind, label, count in (("image", "Image RefMods", counts[0]),
                                    ("video", "Video RefMods", counts[1]),
@@ -1101,14 +1319,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                      label="Soundtrack label", visible=False)
                 kind_rows.append((mdd, strength, as_video, use_audio, label_dd, audio_label_dd))
                 kind_ui.append(row_ui)
-                mdd.change(fn=lambda name, _kind=kind: _row_boxes_update(name, _kind),
+                mdd.change(fn=lambda name, _kind=kind, _key=(kind, i): _row_boxes_update(name, _kind, _key),
                            inputs=[mdd], outputs=[as_video, use_audio, label_dd, audio_label_dd],
                            queue=False)
                 if kind == "image":
                     # One video reference: the label becomes a <Video N>.
-                    as_video.change(fn=lambda on: gr.update(choices=_label_choices("video" if on else "image"),
-                                                            value=AUTO_LABEL),
-                                    inputs=[as_video], outputs=[label_dd], queue=False)
+                    as_video.change(fn=lambda on, name, _key=(kind, i): _as_video_label_update(on, name, _key),
+                                    inputs=[as_video, mdd], outputs=[label_dd], queue=False)
                 if kind != "audio":
                     use_audio.change(fn=_soundtrack_label_update, inputs=[use_audio, mdd],
                                      outputs=[audio_label_dd], queue=False)
@@ -1116,6 +1333,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 add_btn = gr.Button(f"➕ Add {kind} mod", size="sm", scale=0, min_width=150)
                 remove_btn = gr.Button("➖ Remove last", size="sm", scale=0, min_width=150)
             shown = gr.State(1)
+            kind_ui_all[kind], shown_all[kind] = kind_ui, shown   # fork.34
             kind_widgets = [c for row in kind_rows for c in row]
 
             def add_slot(n, _count=count):
@@ -1162,6 +1380,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         video_mode.change(fn=lambda mode: gr.update(visible=mode == encframes.STACK_UP_TO_N),
                           inputs=[video_mode], outputs=[video_n], queue=False)
 
+        # fork.34: what a restore (outputinfo) needs to refill this panel.
+        self._panel_parts = {"folder_dd": folder_dd, "kind_ui": kind_ui_all, "shown": shown_all}
         return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods,
                           shrink_method, window_mode, phase1_mods)
 
@@ -1488,19 +1708,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     # ── Library ─────────────────────────────────────────────────────────
 
     def _build_library_section(self, api_session=None, model_dd=None):
-        gr.Markdown("### Saved RefMods\nIn `loras/refmods_plugin/minimax_h3/` (subfolders work). ComfyUI-MiniMaxH3Mod mods can be dropped in.")
+        gr.Markdown("### Saved RefMods\nH3 mods are in `loras/refmods_plugin/minimax_h3/`, Flux mods in "
+                    "`loras/refmods_plugin/flux2/`; both can have subfolders. Files are sorted into the "
+                    "right one when Wan2GP starts.")
         with gr.Row():
-            library_folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
+            library_folder_dd = gr.Dropdown(choices=_library_folder_choices(), value=ALL_FOLDERS_CHOICE,
                                             label="Folder", scale=3,
                                             info="Show one subfolder only.")
             refresh_btn = gr.Button("Refresh", scale=1)
         table = gr.Dataframe(
-            headers=["name", "kind", "mode", "DiT tokens", "prompt view", "size (MB)",
+            headers=["model", "name", "kind", "mode", "tokens", "prompt view", "size (MB)",
                      "concept type", "description"],
             value=_library_rows(), interactive=False, wrap=True)
         with gr.Row():
-            delete_name = gr.Textbox(label="Mod name to delete (include its folder, e.g. characters/tanya)",
-                                     scale=2)
+            delete_name = gr.Dropdown(label="Mod to delete", choices=_qualified_choices(), value=None,
+                                      scale=2)
             delete_btn = gr.Button("Delete", variant="stop")
         delete_status = gr.Textbox(label="", interactive=False, show_label=False)
         gr.Markdown(
@@ -1512,7 +1734,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         gr.Markdown(
             "**Rename, move or edit a description.** A path (`characters/tanya`) moves the mod; a leading `/` moves it to the main folder.")
         with gr.Row():
-            edit_name_dd = gr.Dropdown(label="Mod to edit", choices=_library_mod_names(), scale=2)
+            edit_name_dd = gr.Dropdown(label="Mod to edit", choices=_qualified_choices(), scale=2)
             edit_load_btn = gr.Button("Load")
         with gr.Row():
             edit_name_field = gr.Textbox(label="Name (optionally with a folder path)")
@@ -1525,14 +1747,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             """Mod names for the chosen folder, with the currently-selected
             one force-included even if it lives elsewhere -- otherwise
             switching folders would leave a stale value Gradio rejects."""
-            names = _library_mod_names(folder)
-            if current and current not in names:
-                names = names + [current]
+            names = _qualified_choices(folder)
+            if current and current not in [v for _, v in names]:
+                model, name = _split_qualified(current)
+                names = names + [(f"{LIB_FLUX if model == 'flux' else LIB_H3} · {name}", current)]
             return names
 
         def do_refresh(folder, current):
             return (_library_rows(folder),
-                    gr.update(choices=_folder_choices(), value=folder),
+                    _safe_choice_update(_library_folder_choices(), folder or ALL_FOLDERS_CHOICE),
                     gr.update(choices=_names_keeping(folder, current), value=current or None))
 
         refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
@@ -1540,29 +1763,35 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         library_folder_dd.change(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
                                  outputs=[table, library_folder_dd, edit_name_dd], queue=False)
 
-        def do_delete(name, folder):
-            if not name:
-                return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), "Enter a mod name first."
-            ok = storage.delete_refmod(name)
-            return (_library_rows(folder), gr.update(choices=_library_mod_names(folder)),
-                   (f"Deleted '{name}'." if ok else f"No mod named '{name}' found."))
+        def do_delete(value, folder):
+            if not value:
+                return (_library_rows(folder), gr.update(), gr.update(), "Pick a mod first.")
+            model, name = _split_qualified(value)
+            ok = flux.delete_mod(name) if model == "flux" else storage.delete_refmod(name)
+            label = f"{LIB_FLUX if model == 'flux' else LIB_H3} mod '{name}'"
+            choices = _qualified_choices(folder)
+            return (_library_rows(folder), gr.update(choices=choices, value=None),
+                    gr.update(choices=choices, value=None),
+                    (f"Deleted the {label}." if ok else f"No {label} found."))
 
         delete_btn.click(fn=do_delete, inputs=[delete_name, library_folder_dd],
-                         outputs=[table, edit_name_dd, delete_status], queue=False)
+                         outputs=[table, edit_name_dd, delete_name, delete_status], queue=False)
 
         def do_fix(folder):
             fixed, checked = storage.reclassify_all_mods()
             msg = (f"Checked {checked} mod(s), fixed {fixed}." if fixed else
                   f"Checked {checked} mod(s), all already correctly classified.")
-            return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), msg
+            return _library_rows(folder), gr.update(choices=_qualified_choices(folder)), msg
 
         fix_btn.click(fn=do_fix, inputs=[library_folder_dd],
                       outputs=[table, edit_name_dd, fix_status], queue=False)
 
-        def do_load_for_edit(name):
-            if not name:
+        def do_load_for_edit(value):
+            if not value:
                 return "", "", "Pick a mod first."
-            meta = storage.read_refmod_meta(storage.mod_path(name))
+            model, name = _split_qualified(value)
+            meta = (flux.read_meta(name) if model == "flux"
+                    else storage.read_refmod_meta(storage.mod_path(name)))
             if meta is None:
                 return "", "", f"No mod named '{name}' found."
             # Show the full folder-relative path, not the metadata's bare
@@ -1573,18 +1802,32 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         edit_load_btn.click(fn=do_load_for_edit, inputs=[edit_name_dd],
                             outputs=[edit_name_field, edit_description_field, edit_status], queue=False)
 
-        def do_save_edit(old_name, new_name, new_description, folder):
-            if not old_name:
+        def do_save_edit(old_value, new_name, new_description, folder):
+            if not old_value:
                 return _library_rows(folder), gr.update(), gr.update(), "Pick a mod first (use Load)."
+            model, old_name = _split_qualified(old_value)
+            typed = str(new_name or "").strip().replace("\\", "/")
+            head, _, rest = typed.lstrip("/").partition("/")
+            if rest and head in (LIB_H3, LIB_FLUX):   # "Flux/people/anna", as the folder picker reads
+                if (head == LIB_FLUX) != (model == "flux"):
+                    return (_library_rows(folder), gr.update(), gr.update(),
+                            "H3 and Flux mods stay in their own folders (use Convert to Flux).")
+                new_name = "/" + rest
             try:
-                final_name = storage.rename_and_update_mod(old_name, new_name=new_name,
-                                                            new_description=new_description)
+                if model == "flux":
+                    final_name = flux.rename_and_update(old_name, new_name=new_name,
+                                                        description=new_description)
+                else:
+                    final_name = storage.rename_and_update_mod(old_name, new_name=new_name,
+                                                                new_description=new_description)
             except Exception as e:
-                return _library_rows(folder), gr.update(), gr.update(), f"Could not save: {e!r}"
+                return _library_rows(folder), gr.update(), gr.update(), f"Could not save: {e}"
             msg = f"Saved as '{final_name}'." if final_name != old_name else "Saved."
-            names = _library_mod_names(folder)
-            return (_library_rows(folder), gr.update(choices=_folder_choices()),
-                    gr.update(choices=names, value=final_name if final_name in names else None), msg)
+            names = _qualified_choices(folder)
+            final_value = f"{model}:{final_name}"
+            return (_library_rows(folder), _safe_choice_update(_library_folder_choices(), folder),
+                    gr.update(choices=names, value=final_value if final_value in [v for _, v in names] else None),
+                    msg)
 
         edit_save_btn.click(fn=do_save_edit,
                             inputs=[edit_name_dd, edit_name_field, edit_description_field, library_folder_dd],
@@ -1618,18 +1861,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             gr.Markdown("Moves keep everything in the mod and never overwrite.")
             with gr.Row():
                 new_folder_name = gr.Textbox(label="New folder", scale=2,
-                                             placeholder="characters, or characters/female to nest")
+                                             placeholder="H3/characters or Flux/people (/ to nest)")
                 create_folder_btn = gr.Button("Create folder")
             with gr.Row():
-                move_dd = gr.Dropdown(label="Mods to move", choices=_library_mod_names(),
+                move_dd = gr.Dropdown(label="Mods to move", choices=_qualified_choices(),
                                       value=[], multiselect=True, scale=2)
-                move_target = gr.Dropdown(label="Destination",
-                                          choices=[ROOT_FOLDER_CHOICE] + storage.list_mod_folders(),
-                                          value=ROOT_FOLDER_CHOICE, scale=1)
+                move_target = gr.Dropdown(label="Destination", choices=_library_destinations(),
+                                          value=LIB_H3, scale=1)
                 move_btn = gr.Button("Move", variant="primary")
             with gr.Row():
                 delete_folder_dd = gr.Dropdown(label="Delete an empty folder",
-                                               choices=storage.list_mod_folders(), value=None, scale=2)
+                                               choices=_library_subfolders(), value=None, scale=2)
                 delete_folder_btn = gr.Button("Delete folder", variant="stop")
             folder_status = gr.Textbox(label="", interactive=False, show_label=False)
         with gr.Accordion("Soundtrack: add, replace or remove", open=False):
@@ -1654,6 +1896,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 frames_btn = gr.Button("Store for selected")
                 frames_all_btn = gr.Button("Store for every mod missing them", variant="primary")
             frames_status = gr.Textbox(label="", interactive=False, show_label=False)
+        with gr.Accordion("Convert to Flux", open=False):   # fork.32
+            gr.Markdown("Decodes H3 picture mods with the H3 model above, then encodes the pictures with "
+                        "a Flux model. Each picture becomes one Flux reference.")
+            with gr.Row():
+                convert_dd = gr.Dropdown(label="H3 picture mods", choices=_convertible(), value=[],
+                                         multiselect=True, scale=3)
+                flux_choices = flux_ui._model_choices(api_session)
+                convert_model = gr.Dropdown(label="Flux model", choices=flux_choices, scale=2,
+                                            value=flux_choices[0][1] if flux_choices else None)
+                convert_budget = gr.Dropdown(label="Size per picture", choices=flux_ui.BUDGET_UI,
+                                             value=flux.DEFAULT_BUDGET, scale=2)
+            convert_layout = gr.Radio(label="Layout", choices=flux_ui.LAYOUT_UI, value=flux.LAYOUT_SEPARATE,
+                                      info=flux_ui.LAYOUT_INFO)
+            convert_btn = gr.Button("Convert", variant="primary")
+            convert_status = gr.Textbox(label="", interactive=False, show_label=False, lines=2)
 
         def run_job(spec, model_type):
             """Run a Library job as a short task on the chosen model (it needs
@@ -1684,44 +1941,63 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         def picked(names):
             return [n for n in (names if isinstance(names, list) else [names]) if n]
 
-        fork_lists = [move_dd, move_target, delete_folder_dd, audio_target_dd, frames_target_dd]
+        fork_lists = [move_dd, move_target, delete_folder_dd, audio_target_dd, frames_target_dd,
+                      delete_name, convert_dd]
 
         def fork_list_updates(folder):
-            names, folders = _library_mod_names(folder), storage.list_mod_folders()
-            return [gr.update(choices=names, value=[]),
-                    _safe_choice_update([ROOT_FOLDER_CHOICE] + folders, ROOT_FOLDER_CHOICE),
-                    gr.update(choices=folders, value=None),
-                    gr.update(choices=names, value=[]), gr.update(choices=names, value=[])]
+            names, qualified = _library_mod_names(folder), _qualified_choices(folder)
+            return [gr.update(choices=qualified, value=[]),
+                    gr.update(choices=_library_destinations(), value=LIB_H3),
+                    gr.update(choices=_library_subfolders(), value=None),
+                    gr.update(choices=names, value=[]), gr.update(choices=names, value=[]),
+                    gr.update(choices=qualified, value=None),
+                    gr.update(choices=_convertible(folder), value=[])]
 
         def after_change(folder, message):
-            return [_library_rows(folder), _safe_choice_update(_folder_choices(), folder),
+            folder = folder if folder in _library_folder_choices() else ALL_FOLDERS_CHOICE
+            return [_library_rows(folder), gr.update(choices=_library_folder_choices(), value=folder),
                     *fork_list_updates(folder), message]
 
         change_outputs = [table, library_folder_dd] + fork_lists
 
         def do_create_folder(new_name, folder):
+            raw = str(new_name or "").strip().strip("/")
+            model, sub = _split_library_folder(raw) if raw.partition("/")[0] in (LIB_H3, LIB_FLUX) \
+                else ("h3", raw)
+            if not sub:
+                return after_change(folder, "Enter a folder name after H3/ or Flux/.")
             try:
-                return after_change(folder, f"Created '{storage.create_mod_folder(new_name)}'.")
+                made = flux.create_folder(sub) if model == "flux" else storage.create_mod_folder(sub)
+                return after_change(folder, f"Created '{LIB_FLUX if model == 'flux' else LIB_H3}/{made}'.")
             except Exception as e:
                 return after_change(folder, f"Could not create the folder: {e}")
 
-        def do_move_mods(names, destination, folder):
-            names = picked(names)
-            if not names:
+        def do_move_mods(values, destination, folder):
+            values = picked(values)
+            if not values:
                 return after_change(folder, "Pick at least one mod to move.")
-            target = "" if destination in (None, ROOT_FOLDER_CHOICE) else destination
-            moved, skipped = storage.move_mods(names, target)
-            parts = [f"Moved {len(moved)} mod(s) to " + ("the main folder." if not target else f"'{target}'.")] \
-                if moved else []
+            dest_model, dest_sub = _split_library_folder(destination or LIB_H3)
+            dest_sub = dest_sub or ""
+            same = [_split_qualified(v)[1] for v in values if _split_qualified(v)[0] == dest_model]
+            other = [_split_qualified(v)[1] for v in values if _split_qualified(v)[0] != dest_model]
+            moved, skipped = (flux.move_mods(same, dest_sub) if dest_model == "flux"
+                              else storage.move_mods(same, dest_sub))
+            where = f"{LIB_FLUX if dest_model == 'flux' else LIB_H3}" + (f"/{dest_sub}" if dest_sub else "")
+            parts = [f"Moved {len(moved)} mod(s) to {where}."] if moved else []
+            if other:
+                parts.append(f"Not moved: {', '.join(other)} -- H3 and Flux mods stay in their own "
+                             f"folders (use Convert to Flux).")
             if skipped:
                 parts.append("Skipped: " + "; ".join(f"'{n}' ({why})" for n, why in skipped))
             return after_change(folder, " ".join(parts) or "Nothing to do.")
 
-        def do_delete_folder(name, folder):
-            if not name:
+        def do_delete_folder(value, folder):
+            if not value:
                 return after_change(folder, "Pick a folder to delete.")
+            model, sub = _split_library_folder(value)
             try:
-                return after_change(folder, f"Deleted '{storage.delete_mod_folder(name)}'.")
+                gone = flux.delete_folder(sub) if model == "flux" else storage.delete_mod_folder(sub)
+                return after_change(folder, f"Deleted '{value}'." if gone else "Nothing to do.")
             except Exception as e:
                 return after_change(folder, f"Could not delete the folder: {e}")
 
@@ -1763,6 +2039,44 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         frames_all_btn.click(fn=do_store_frames,
                              inputs=[frames_target_dd, gr.State(True), library_folder_dd] + model_input,
                              outputs=[table, frames_target_dd, frames_status], queue=False)
+        def do_convert(names, flux_model, budget, layout, folder, model_type=None):   # fork.32
+            names = picked(names)
+            if not names:
+                return after_change(folder, "Pick at least one H3 picture mod.")
+            if not model_type:
+                return after_change(folder, "Pick the H3 model at the top of this tab (it decodes the mods).")
+            if not flux_model:
+                return after_change(folder, "Pick a Flux model (it encodes the pictures).")
+            lines, decoded = [], []
+            for name in names:   # every decode first, so each model loads once
+                message = run_job({"op": "decompile", "name": name}, model_type)
+                pictures = storage.list_decompiled(name)[0]
+                if pictures:
+                    decoded.append((name, pictures))
+                else:
+                    lines.append(f"'{name}': could not decode it ({message})")
+            for name, pictures in decoded:
+                meta = storage.read_refmod_meta(storage.mod_path(name)) or {}
+                target = flux.free_name(name)
+                ok, message = flux_ui.submit_extract(
+                    self, api_session, flux_model,
+                    {"name": target, "images": pictures, "budget": int(budget or flux.DEFAULT_BUDGET),
+                     "layout": layout or flux.LAYOUT_SEPARATE,
+                     "concept_type": meta.get("concept_type") or "identity",
+                     "description": meta.get("description") or "", "converted_from": name})
+                soft = (" Made in training mode, so its pictures are soft." if meta.get("mode") == "training"
+                        else "")
+                lines.append(f"'{name}' -> Flux/{target}: {message}{soft}" if ok
+                             else f"'{name}': {message}")
+            return after_change(folder, "\n".join(lines))
+
+        # Deleting or renaming changes the names every list offers.
+        delete_btn.click(fn=fork_list_updates, inputs=[library_folder_dd], outputs=fork_lists, queue=False)
+        edit_save_btn.click(fn=fork_list_updates, inputs=[library_folder_dd], outputs=fork_lists, queue=False)
+        convert_btn.click(fn=do_convert,
+                          inputs=[convert_dd, convert_model, convert_budget, convert_layout,
+                                  library_folder_dd] + model_input,
+                          outputs=change_outputs + [convert_status])
         # Keep these lists in step whenever the Library is refreshed or browsed.
         refresh_btn.click(fn=fork_list_updates, inputs=[library_folder_dd], outputs=fork_lists, queue=False)
         library_folder_dd.change(fn=fork_list_updates, inputs=[library_folder_dd], outputs=fork_lists,
@@ -1863,7 +2177,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     def _build_generate_section(self, api_session, model_dd):
         gr.Markdown(
-            "**Tip:** the **Media Generator** tab has every option, and RefMods are there too under *MiniMax H3 RefMods (inline)*.")
+            "**Tip:** the **Media Generator** tab has every option, and RefMods are there too under *Refmods: MiniMax H3*.")
         gr.Markdown("### Generate with RefMods\nA simpler form. Other settings come from the Media Generator (*Sync from the main form*) or the model's defaults.")
         synced = gr.State({})
         with gr.Row():
@@ -2027,10 +2341,10 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Column() as root:
             if self._patch_error:
                 gr.Markdown(f"⚠️ **RefMods could not hook into MiniMax H3**: {self._patch_error}")
-            gr.Markdown(f"## {PlugIn_Name}\nReference mods for MiniMax H3. See the README for details.")
+            gr.Markdown(f"## {PlugIn_Name}\nReference mods for MiniMax H3 and Flux. See the README for details.")
             model_choices = _model_choices(api_session)
             model_dd = gr.Dropdown(
-                label="MiniMax H3 Ref2VA model (used for Extract and Generate below)",
+                label="MiniMax H3 Ref2VA model (for the H3 tabs and for decoding in Convert to Flux)",
                 choices=model_choices, value=_default_model_choice(model_choices))
             with gr.Row():
                 refresh_models_btn = gr.Button("Refresh model list", size="sm")
@@ -2042,8 +2356,12 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                               inputs=[model_dd], outputs=[diagnose_status], queue=False)
 
             with gr.Tabs():
-                with gr.Tab("Extract"):
+                with gr.Tab("Extract (H3)"):
                     self._build_extract_section(api_session, model_dd)
+                with gr.Tab("Extract (Flux)"):   # fork.31
+                    if getattr(self, "_flux_error", None):
+                        gr.Markdown(f"⚠️ **Flux RefMods are off**: {self._flux_error}")
+                    flux_ui.build_tab(self, api_session)
                 with gr.Tab("Library"):
                     self._build_library_section(api_session, model_dd)
                 with gr.Tab("Decompile"):   # fork

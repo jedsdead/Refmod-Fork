@@ -335,7 +335,7 @@ class _RefModAudioSentinel:
 
 
 def _log(msg: str) -> None:
-    print(f"[H3RefMod] {msg}")
+    print(f"[Refmods] {msg}")
 
 
 # Which reference kwargs this Wan2GP build's generate() actually accepts.
@@ -559,7 +559,7 @@ def _install_model_def_patch() -> None:
     # Extraction jobs now travel inside this same slot (see EXTRACT_WRAPPER_KEY).
     extra_settings = [
         {"id": SETTING_GENERATE, "name": "H3RefModState",
-         "label": "RefMods selection (managed by the MiniMax H3 RefMods plugin -- leave blank)",
+         "label": "RefMods selection (managed by Refmods For Wan GP -- leave blank)",
          "type": "text", "default": "",
          # Fork: hidden on the Media Generator form (see HIDDEN_SETTING_FLAG);
          # it still travels with every task.
@@ -1013,7 +1013,9 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
         state = inputs.get("state") if isinstance(inputs, dict) else None
         result = orig_prepare_inputs_dict(target, inputs, model_type, model_filename)
         try:
-            if isinstance(state, dict) and isinstance(result, dict):
+            # fork.34: an output's metadata keeps the task's own selection --
+            # the panel may have changed while the task waited in the queue.
+            if isinstance(state, dict) and isinstance(result, dict) and target != "metadata":
                 resolved_type = model_type or get_state_model_type_fn(state)
                 if is_minimax_h3_refmod_capable(resolved_type, get_base_model_type_fn):
                     stash = state.get(STASH_KEY)
@@ -1024,6 +1026,9 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
                     elif SETTING_GENERATE in existing:
                         existing.pop(SETTING_GENERATE, None)
                         result["custom_settings"] = existing or None
+                else:   # fork.31: Flux 2 / Flux 3 panel
+                    from . import flux
+                    result = flux.fold_stash(state, result, resolved_type, get_base_model_type_fn)
         except Exception:
             _log("prepare_inputs_dict patch: RefMod injection failed, leaving settings "
                  "untouched for this call:\n" + traceback.format_exc())
@@ -1086,6 +1091,9 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
                     existing.pop(SETTING_GENERATE, None)
                     settings = dict(settings)
                     settings["custom_settings"] = existing or None
+            elif isinstance(settings, dict) and isinstance(state, dict):   # fork.31: Flux
+                from . import flux
+                settings = flux.fold_stash(state, settings, model_type, get_base_model_type_fn)
         except Exception:
             _log("get_model_settings patch: RefMod freshness check failed, leaving settings "
                  "untouched for this call:\n" + traceback.format_exc())
@@ -1568,7 +1576,7 @@ def _shown_frames_from_state(state) -> dict:
 # of the generation's own came ahead of the mods' pictures in window 1, so
 # later windows can put the mods' pictures back at the same numbers.
 _LABEL_BASE = {"image": None}
-_LABEL_LOG = {"done": False}
+_LABEL_LOG = {"done": False, "text": ""}   # fork.34: "text" goes into the output's info
 
 # Fork.28: whether this generation carries RefMods (either route), for the
 # Veda Sparse adjustment below.
@@ -1677,7 +1685,8 @@ def _log_prompt_labels(presentation) -> None:
                          + (f" (asked for <{_LABEL_WORDS[kind]} {want}>)" if want and want != counts[kind] else ""))
     if named:
         _LABEL_LOG["done"] = True
-        _log("RefMods in the prompt: " + ", ".join(named))
+        _LABEL_LOG["text"] = ", ".join(named)
+        _log("RefMods in the prompt: " + _LABEL_LOG["text"])
 
 
 # ── Caches ────────────────────────────────────────────────────────────────
@@ -2105,6 +2114,7 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
     _REFMODS_IN_USE["on"] = False
     if int(kwargs.get("window_no") or 1) <= 1:
         _LABEL_BASE["image"] = None   # a new generation
+        _LABEL_LOG["text"] = ""
     # pipeline.py: two_phase = int(guide_phases) > 1 and frozen_target_video is None
     two_phase = (int(kwargs.get("guide_phases") or 1) > 1
                  and kwargs.get("frozen_control_video") is None)

@@ -1,12 +1,12 @@
 {
-  "name": "MiniMax H3 RefMods (jedsdead fork)",
+  "name": "Refmods For Wan GP",
   "author": "fork by jedsdead; original Wan2GP port by g3n3rativ3; original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
-  "version": "0.38.1-fork.30",
-  "description": "No-training 'reference mods' for MiniMax H3 Ref2VA, FL2VA and FL2VA ControlNet: compress an image/video/audio reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation. The original port's 0.38.1 with the fork's additions: FL2VA support, mods with a voice as well as a look, per-mod size limits, phase-2 options and a Decompile tab.",
+  "version": "0.38.1-fork.36",
+  "description": "No-training 'reference mods' for MiniMax H3 (Ref2VA, FL2VA, FL2VA ControlNet) and Flux 2 / Flux 3: compress a reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation. Built on g3n3rativ3's MiniMax H3 RefMods port (0.38.1), with FL2VA and Flux support, mods with a voice as well as a look, phase options, a shared H3/Flux Library, Convert to Flux and a Decompile tab.",
   "type": [
     "app"
   ],
-  "date": "2026-10-14",
+  "date": "2026-10-16",
   "wan2gp_version": "",
   "url": "https://github.com/jedsdead/Refmod-Fork"
 }

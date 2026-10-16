@@ -1,8 +1,13 @@
-# MiniMax H3 RefMods for Wan2GP — jedsdead fork
+# Refmods For Wan GP
 
-**Version 0.38.1-fork.30** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.36** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
-This is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
+Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
+**Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
+under LoRAs on the Media Generator page. (Formerly "MiniMax H3 RefMods —
+jedsdead fork".)
+
+It is a fork of [g3n3rativ3's Wan2GP port](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP)
 of [Luisa's ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod).
 
 Since fork.24 it is the original port's 0.38.1 **with the fork's features added
@@ -26,6 +31,18 @@ what the fork adds.
 
 ### Models
 
+- **Flux 2 and Flux 3** (fork.31): Flux 2 Dev, Flux 2 Klein 4B / 9B, pi-Flux2
+  and Flux 3 Klein. Flux mods are made in the **Extract (Flux)** tab (pictures
+  only; each picture becomes one reference) and picked in the *Refmods: Flux*
+  panel under LoRAs. They go after your own reference images: the
+  console logs each one's prompt label ("image N" for Flux 2,
+  `<ref_image_N>` for Flux 3). The Library lists them beside the H3 mods, and
+  *Convert to Flux* makes Flux mods from H3 picture mods. Flux 2 and Flux 3
+  use the same VAE, so one
+  mod works in all of them. Files live in `loras/refmods_plugin/flux2/` and
+  use the ComfyUI-Flux2Klein9Mod layout, so mods move between the two. Flux 1
+  models use a different VAE and aren't supported; H3 mods and Flux mods
+  don't mix.
 - **FL2VA**, including FL2VA finetunes such as VDN. FL2VA has no reference
   inputs, so the mods go straight into the transformer's reference list, the
   mechanism the ComfyUI original's Apply node uses. Every mod gets its prompt
@@ -116,6 +133,44 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.36** — renamed **Refmods For Wan GP**; the plugin's tab is
+  now **Refmods**, and the Media Generator panels are **Refmods: MiniMax H3**
+  and **Refmods: Flux**. Console lines start with `[Refmods]`. Nothing else
+  changed: mod files, folders and settings are the same.
+- **0.38.1-fork.35** — bug fixes: editing a Flux mod's description without
+  renaming it could fail on Windows (the file was rewritten while still
+  open); typing a folder-picker style name (`Flux/people/anna`) when renaming
+  made a folder called "Flux" inside the Flux folder; the startup sort could
+  remove empty folders it hadn't emptied; the Library's lists went stale
+  after a delete or rename; the Flux panel pointed to the old tab name. Flux 3
+  now notes in the console when mods take it past 10 references.
+- **0.38.1-fork.34** — **RefMods in the output's info** (new `outputinfo.py`):
+  every video or image made with mods gets a readable *RefMods* (or *Flux
+  RefMods*) line in its file info: each mod with its strength, the prompt
+  label it actually got, and any non-default panel options. **Loading a
+  file's settings** (the settings file button, or using a gallery item's
+  settings) refills the RefMod panels with that file's mods; mods that
+  aren't in your library are named in the panel. Fixed: an output's metadata
+  could record the panel's current mods instead of the ones its task used,
+  if the panel changed while the task was queued.
+- **0.38.1-fork.33** — Flux extraction has its own **Extract (Flux)** tab
+  beside **Extract (H3)**. Videos can go into a Flux mod: each becomes still
+  pictures (the sharpest frame of each slot, up to 32 per video). A **Layout**
+  choice for mods with several pictures: *Separate references* (default),
+  *Contact sheet* (all pictures side by side as one reference, no detail
+  lost) or *Merge into one picture* (averaged; small and soft). Convert to
+  Flux has the same choice.
+- **0.38.1-fork.32** — **one Library for H3 and Flux mods**: a *model*
+  column, a folder picker with H3 and Flux folders (each with its own
+  subfolders), and delete, rename, move and folder tools that work on both.
+  **Convert to Flux** turns H3 picture mods into Flux mods (decoded with the
+  H3 VAE, re-encoded with the Flux VAE; subfolders kept, never overwrites).
+  At startup, mod files are sorted into `minimax_h3/` or `flux2/` by what
+  they contain. The Flux tab is now extraction only.
+- **0.38.1-fork.31** — **Flux 2 and Flux 3 support** (new `flux.py`,
+  `flux_ui.py`): a Flux tab to extract and manage Flux mods, and a Flux
+  RefMods panel on the Media Generator. Compatible with ComfyUI-Flux2Klein9Mod
+  files.
 - **0.38.1-fork.30** — **Mods in phase 1** (two-phase runs): *Fit to phase 1*
   (default, mods shrunk to phase 1's half canvas) or *Full size* (mods kept
   full size in phase 1: sharper faces, slower phase 1). Explainer text across

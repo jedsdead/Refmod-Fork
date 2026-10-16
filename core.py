@@ -279,7 +279,7 @@ def optimize_latent(
             loss.backward()
             opt.step()
             if progress_every and (i + 1) % progress_every == 0:
-                print(f"[H3RefMod] identity refinement {i + 1}/{steps}")
+                print(f"[Refmods] identity refinement {i + 1}/{steps}")
             if progress_cb is not None and (i + 1) % max(1, steps // 20) == 0:
                 progress_cb((i + 1) / steps)
         refined = param.detach().to(z_small.dtype)
@@ -339,7 +339,7 @@ def merge_latents(pooled: List[torch.Tensor], fulls: List[torch.Tensor], latent_
                 del up, current
             opt.step()
             if progress_every and (i + 1) % progress_every == 0:
-                print(f"[H3RefMod] merge refinement {i + 1}/{steps}")
+                print(f"[Refmods] merge refinement {i + 1}/{steps}")
             if progress_cb is not None and (i + 1) % max(1, steps // 20) == 0:
                 progress_cb((i + 1) / steps)
         return param.detach().cpu()
@@ -797,7 +797,7 @@ class H3RefMod:
         try:
             enc_frames = decode_enc_frames(tensors)
         except Exception as e:
-            print(f"[H3RefMod] could not read encoder frames from {path_no_ext}: {e!r}")
+            print(f"[Refmods] could not read encoder frames from {path_no_ext}: {e!r}")
             enc_frames = None
         # NOTE: dict.get(key, fallback) always evaluates `fallback` eagerly, even
         # when `key` is present and the fallback goes unused -- so the fallback

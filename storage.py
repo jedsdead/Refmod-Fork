@@ -203,7 +203,7 @@ def list_refmods_info(folder: Optional[str] = None, recursive: bool = False) -> 
                 "size_mb": round(size_mb, 3),
             })
         except Exception as e:
-            print(f"[H3RefMod] could not read {name}: {e}")
+            print(f"[Refmods] could not read {name}: {e}")
     return out
 
 
@@ -263,7 +263,7 @@ def reclassify_all_mods() -> Tuple[int, int]:
             if reclassify_mod(name):
                 fixed += 1
         except Exception as e:
-            print(f"[H3RefMod] could not check/fix classification for '{name}': {e!r}")
+            print(f"[Refmods] could not check/fix classification for '{name}': {e!r}")
     return fixed, len(names)
 
 
