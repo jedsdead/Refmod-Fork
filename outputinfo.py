@@ -60,8 +60,8 @@ def h3_summary(payload: dict, labels: str = "") -> str:
     options = []
     if payload.get("fit_to_output"):
         options.append("fit to output")
-    if payload.get("phase1_mods") == "full":
-        options.append("phase 1: full size")
+    if payload.get("phase1_mods") == "fit":
+        options.append("phase 1: fit")
     if payload.get("phase2_mods") in ("tile", "off"):
         options.append("phase 2: " + ("fit to tile" if payload["phase2_mods"] == "tile" else "off"))
     if payload.get("shrink_method") == "fast":

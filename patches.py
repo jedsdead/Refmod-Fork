@@ -58,6 +58,7 @@ import math
 import os
 import random
 import traceback
+import weakref
 from typing import Optional
 
 import torch
@@ -202,8 +203,16 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 # FL2VA ControlNet-Union model, which is FL2VA plus a control branch. See the
 # "FL2VA support" section below for how mods reach a model with no reference
 # inputs of its own.
-FL2VA_REFMODS = True
-CONTROLNET_REFMODS = True
+# fork.40: either half can be switched off without editing code, to isolate a
+# problem (same variables as g3n3rativ3's 0.42.0):
+#   set H3REFMOD_FL2VA=0        -> mods only on Ref2VA
+#   set H3REFMOD_CONTROLNET=0   -> FL2VA yes, the FL2VA ControlNet model no
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+FL2VA_REFMODS = _env_on("H3REFMOD_FL2VA")
+CONTROLNET_REFMODS = _env_on("H3REFMOD_CONTROLNET")
 
 
 def _fl2va_family_prefixes():
@@ -378,7 +387,44 @@ _STATE_ATTR = "_h3refmod_gen_state"
 # helper with no `self`, so this is how the video path reaches that call's
 # bookkeeping. Generation is single-threaded per pipeline, so one slot is
 # enough; it is only ever read, never trusted to exist.
+#
+# fork.40: held WEAKLY and put back to its previous value when generate()
+# ends (from g3n3rativ3's 0.42.0, which found the leak). A plain reference
+# here kept the whole H3 pipeline -- transformer, text encoder, VAEs -- alive
+# after the generation, so when Wan2GP unloaded H3 it could not give back its
+# pinned RAM (~20 GiB) and loading the next model failed with an
+# out-of-memory error.
 _ACTIVE = {"pipeline": None}
+
+
+def _set_active_pipeline(pipeline_self):
+    """Point _ACTIVE at ``pipeline_self`` (weakly); returns what was there,
+    for _restore_active_pipeline."""
+    previous = _ACTIVE.get("pipeline")
+    try:
+        _ACTIVE["pipeline"] = weakref.ref(pipeline_self) if pipeline_self is not None else None
+    except TypeError:   # not weak-referenceable: hold nothing rather than the model
+        _ACTIVE["pipeline"] = None
+    return previous
+
+
+def _restore_active_pipeline(previous) -> None:
+    _ACTIVE["pipeline"] = previous
+
+
+def _active_pipeline():
+    ref = _ACTIVE.get("pipeline")
+    return ref() if callable(ref) else None
+
+
+def _drop_gen_state(pipeline_self) -> None:
+    """fork.40: the per-call bookkeeping holds mod latents; it has no reason
+    to outlive the call."""
+    try:
+        if hasattr(pipeline_self, _STATE_ATTR):
+            delattr(pipeline_self, _STATE_ATTR)
+    except Exception:
+        pass
 
 # Wan2GP's own native reference caps, enforced inline in generate() between
 # the reference-building loop and the point where `refs` is read. They are a
@@ -897,7 +943,7 @@ def install_patches() -> Optional[str]:
             # latent goes into the packed sequence at its own saved
             # resolution, exactly as it did before this step existed.
             if isinstance(video, _RefModVideoSentinel):
-                active = _ACTIVE.get("pipeline")
+                active = _active_pipeline()
                 if active is None or not _should_fit(active, width, height):
                     return video
                 fitted = _fit_phase_1(active, video, "video", video.latent, width, height, 100.0)
@@ -951,7 +997,7 @@ def install_patches() -> Optional[str]:
         # Fresh bookkeeping for this call -- every generate() (and every
         # sliding window, each of which is its own call) starts at phase 1.
         state = _reset_gen_state(self)
-        _ACTIVE["pipeline"] = self
+        previous_active = _set_active_pipeline(self)   # fork.40: weak, restored below
         # The full output canvas for this call. Phase 1 of a two-phase run is
         # handed a *smaller* canvas (H3_TWO_PHASE_SCALE); comparing against
         # this is how _should_fit tells the phases apart, so single-phase and
@@ -990,6 +1036,8 @@ def install_patches() -> Optional[str]:
             _clear_fl2va()   # fork: never let staged FL2VA mods leak into the next generation
             _veda_restore(self)
             _REFMODS_IN_USE["on"] = False
+            _restore_active_pipeline(previous_active)   # fork.40: never hold the model
+            _drop_gen_state(self)
 
     Pipeline._add_image_reference = patched_add_image_reference
     Pipeline._add_video_reference = patched_add_video_reference
@@ -2161,7 +2209,9 @@ def _reencode_smaller(pipeline_self, latent, kind, is_stack, width, height):
         else:
             video = _decode_cthw(pipeline_self, latent)
             smaller = pipeline_self._encode_video(h3_pipeline._resize_video(video, int(height), int(width)))
-        smaller = smaller.to(latent.dtype)
+        # fork.40: cached in regular memory (as stored mods are), not on the
+        # graphics card, so it holds no VRAM between generations.
+        smaller = smaller.to(device="cpu", dtype=latent.dtype)
         return _cache_put(_SHRINK_CACHE, key, smaller, _SHRINK_CACHE_MAX)
     except Exception:
         _log("could not rebuild a RefMod smaller; using it at its stored size:\n" + traceback.format_exc())
@@ -2215,8 +2265,9 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
                              (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF))
                if two_phase else PHASE2_MODS_FULL)
     pipeline_self._h3_p2_mode = p2_mode
+    # fork.40: Full size is the default (as in g3n3rativ3's 0.42.0).
     pipeline_self._h3_p1_full = two_phase and _state_option(
-        state_json, "phase1_mods", PHASE1_MODS_FIT, (PHASE1_MODS_FIT, PHASE1_MODS_FULL)) == PHASE1_MODS_FULL
+        state_json, "phase1_mods", PHASE1_MODS_FULL, (PHASE1_MODS_FIT, PHASE1_MODS_FULL)) == PHASE1_MODS_FULL
     p2_off = p2_mode == PHASE2_MODS_OFF
     if p2_off and not fl2va and _has_live_visual_refs(kwargs):
         # Ref2VA lines phase 2's references up with phase 1's by position;
@@ -2229,8 +2280,8 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
         if pipeline_self._h3_fit_output:
             _log(f"fit to output: on -- visual mods bigger than {kwargs.get('width')}x"
                  f"{kwargs.get('height')} are made smaller to that pixel area")
-        if pipeline_self._h3_p1_full:
-            _log("Mods in phase 1: Full size -- mods are not shrunk to phase 1's half canvas")
+        if two_phase and not pipeline_self._h3_p1_full:
+            _log("Mods in phase 1: Fit -- mods are shrunk to phase 1's half canvas")
         if two_phase and p2_mode != PHASE2_MODS_FULL:
             _log("Mods in phase 2: " + ("Off" if p2_off else "Fit to tile" if p2_mode == PHASE2_MODS_TILE
                                         else "Full")
@@ -2374,6 +2425,38 @@ def _append_fl2va_rows(pipeline_self, visual_latents, audio_latents) -> None:
 _FL2VA_HOOKS_MARKER = "_h3refmod_fl2va_hooks"
 
 
+def _fl2va_check(model, video_x, audio_x, payload, pass_no) -> None:
+    """fork.40: a one-line row check the first time each pass reaches the
+    transformer with mods attached (idea from g3n3rativ3's 0.42.0). It asks the
+    model's own packer for its layout and compares the rows that layout
+    expects with the rows the forward will actually put into it -- condition
+    rows plus the target's -- for video, audio and (ControlNet) control.
+    A MISMATCH line is the cause of a broken FL2VA render. Diagnostic only:
+    the layout is cached by the model, so the forward reuses this one."""
+    try:
+        from models.minimax_h3 import transformer as h3_transformer
+        _, _, latent_t, latent_h, latent_w = video_x.shape
+        text_tags = payload["text_token_tags"].view(-1).cpu()
+        layout = model._layout(text_tags, latent_t, latent_h, latent_w, audio_x.shape[-1], payload)
+        target_video = int(h3_transformer.patchify_video(video_x[:1, :, :, :, :].float().cpu(),
+                                                         model.patch_size).shape[0])
+        target_audio = int(h3_transformer.pack_audio(audio_x[:1].float().cpu()).shape[0])
+        rows = lambda key: 0 if payload.get(key) is None else int(payload[key].shape[0])
+        fed_video, fed_audio = rows("cond_video_rows") + target_video, rows("cond_audio_rows") + target_audio
+        want_video, want_audio = int(layout.video_indices.numel()), int(layout.audio_indices.numel())
+        checks = [("video", fed_video, want_video), ("audio", fed_audio, want_audio)]
+        if payload.get("control_rows") is not None:
+            checks.append(("control", rows("control_rows"), want_video))
+        refs = payload.get("refs") or ()
+        parts = [f"{name} {fed}/{want} {'OK' if fed == want else 'MISMATCH'}" for name, fed, want in checks]
+        _log(f"FL2VA check, pass {pass_no} ({len(refs)} reference(s)): " + " | ".join(parts))
+        if any(fed != want for _, fed, want in checks):
+            _log("FL2VA check: the rows fed and the packed layout disagree -- this render will break. "
+                 "Please report these lines (H3REFMOD_FL2VA=0 turns RefMods off on FL2VA meanwhile).")
+    except Exception as e:
+        _log(f"FL2VA check could not run (diagnostic only): {e!r}")
+
+
 def _install_fl2va_hooks(Pipeline) -> None:
     if getattr(Pipeline, _FL2VA_HOOKS_MARKER, False):
         return
@@ -2425,6 +2508,9 @@ def _install_fl2va_hooks(Pipeline) -> None:
                 _FL2VA["announced"] = True
                 _log(f"FL2VA: {len(_FL2VA['entries'])} RefMod reference(s) attached to the "
                      f"transformer payload -- the reference-aware packer is now in use")
+            if _FL2VA["pass_no"] not in _FL2VA.setdefault("checked", set()):
+                _FL2VA["checked"].add(_FL2VA["pass_no"])
+                _fl2va_check(self, video_x, audio_x, payload, _FL2VA["pass_no"])
         return _orig_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
                              *args, **kwargs)
 

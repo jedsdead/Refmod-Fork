@@ -315,7 +315,7 @@ LABEL_MAX = {"image": 20, "video": 9, "audio": 9}
 LABEL_WORDS = {"image": "Picture", "video": "Video", "audio": "Audio"}
 AUTO_LABEL = "auto"
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
-PHASE1_MODS_UI = [("Fit to phase 1", "fit"), ("Full size", "full")]   # fork.30
+PHASE1_MODS_UI = [("Full size", "full"), ("Fit to phase 1", "fit")]   # fork.30; Full is the default since fork.40
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
@@ -425,7 +425,7 @@ def _panel_restore_updates(raw):
                 payload.get("video_frames_n", encframes.MAX_CLIP_FRAMES_SHOWN),
                 bool(payload.get("fit_to_output", False)), payload.get("phase2_mods", "full"),
                 payload.get("shrink_method", "reencode"), payload.get("window_mode", WINDOW_MODE_DEFAULT),
-                payload.get("phase1_mods", "fit")]
+                payload.get("phase1_mods", "full")]
     restored = sum(len(v) for v in slots.values())
     status = (f"↺ {restored} RefMod(s) restored from the loaded settings." if restored
               else "*No RefMods selected.*")
@@ -553,7 +553,7 @@ def _is_picture_mod(meta):
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
                    fit_to_output=False, phase2_mods="full", shrink_method="reencode",
-                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="fit"):
+                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="full"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown, plus the
@@ -575,7 +575,7 @@ def _stack_payload(stack_mode, stack_n,
             # "Mods in phase 2": full / tile / off.
             "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
             # "Mods in phase 1": fit / full (fork.30).
-            "phase1_mods": phase1_mods if phase1_mods in ("fit", "full") else "fit",
+            "phase1_mods": phase1_mods if phase1_mods in ("fit", "full") else "full",
             # "Shrink method": reencode / fast.
             "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode",
             # "Video mods on sliding windows 2, 3, ...": still / full / first.
@@ -1016,7 +1016,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.39"
+        self.version = "0.38.1-fork.40"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1376,8 +1376,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Row():
             # fork.30: two-phase runs only.
             phase1_mods = gr.Dropdown(
-                choices=PHASE1_MODS_UI, value="fit", label="Mods in phase 1 (two-phase)", scale=1,
-                info="Full size: sharper faces, slower phase 1.")
+                choices=PHASE1_MODS_UI, value="full", label="Mods in phase 1 (two-phase)", scale=1,
+                info="Fit: shrink to phase 1's half canvas, if phase 1 gets slow.")
             phase2_mods = gr.Dropdown(
                 choices=PHASE2_MODS_UI, value="full", label="Mods in phase 2 (two-phase)", scale=1,
                 info="Off: no visual mods (fastest).")

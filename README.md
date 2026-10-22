@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.39** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.40** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -23,6 +23,25 @@ exactly as it does in the port.
 
 Mod files are unchanged: mods move freely between this fork, the original port
 and the ComfyUI packs.
+
+## Credits
+
+- **Luisa** ([ComfyUI-MiniMaxH3Mod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod))
+  -- the RefMod idea and file format: a reference encoded once and reused.
+- **g3n3rativ3** ([MiniMaxH3Mod-for-WanGP](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP))
+  -- the Wan2GP port this fork is built on (0.38.1). From its later releases
+  (0.42.0) this fork has taken the fix for the pipeline being kept in memory
+  after a generation, the idea of an FL2VA row check, the
+  `H3REFMOD_FL2VA` / `H3REFMOD_CONTROLNET` switches, and *Full size* as the
+  default for *Mods in phase 1* (with its measurements behind it). Those
+  0.42.0 releases in turn ported this fork's FL2VA support, Shrink method and
+  Mods in phase 1 option.
+- **malcolmrey** ([ComfyUI-Flux2Klein9Mod](https://github.com/malcolmamal/ComfyUI-Flux2Klein9Mod))
+  -- the Flux 2 / Klein RefMod file layout, which this fork's Flux mods use so
+  they move between the two.
+- **anxioproject** (H3 Audio Refinement Controls) -- built to work alongside
+  RefMods; checked compatible with this fork (fork.39).
+- **jedsdead** -- this fork.
 
 The original port's documentation follows below the line; this section lists
 what the fork adds.
@@ -96,7 +115,7 @@ what the fork adds.
 ### Speed and sizing
 
 - **Fit mods to the output size.**
-- **Mods in phase 1**: Fit to phase 1 (default) or Full size.
+- **Mods in phase 1**: Full size (default since fork.40) or Fit to phase 1.
 - **Mods in phase 2**: Full, Fit to tile (with phase 2 tiling) or Off.
 - **Shrink method** for the above: Re-encode (best quality) or Fast.
 - **FL2VA mods are fitted to phase 1** of two-phase runs, as Ref2VA mods are.
@@ -126,13 +145,32 @@ of the file for the model switches.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. |
-| `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model. |
+| `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. Set the environment variable `H3REFMOD_FL2VA=0` to turn it off without editing code. |
+| `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model. `H3REFMOD_CONTROLNET=0` turns it off. |
 | `FL2VA_PROMPT_LABELS` | `"on"` | Every mod gets its prompt label in FL2VA, as in Ref2VA. `"none"` labels nothing, like the ComfyUI original. |
 | `STABLE_REFMOD_LABELS` | `True` | On windows 2+, picture mods are numbered ahead of the carried-over frame, so their labels match window 1. |
 
 ### Release history
 
+- **0.38.1-fork.40** — from g3n3rativ3's 0.42.0 (see Credits):
+  - **Fixed a memory leak**: after a generation the plugin kept a hold on the
+    whole H3 pipeline, so when Wan2GP unloaded H3 (to load Flux, say) it could
+    not give back its pinned RAM (~20 GiB) and the next model failed to load
+    with an out-of-memory error. The hold is now weak and released when each
+    generation ends, and the per-generation state (which holds mod latents)
+    is dropped too.
+  - Shrunk (re-encoded) mods are cached in regular memory, not on the graphics
+    card, so they hold no VRAM between generations.
+  - **Mods in phase 1** now defaults to **Full size**. Full-size mods cost
+    several times the reference tokens in phase 1, but those are a small share
+    of the sequence and it made no measurable difference to speed in the
+    original's tests; *Fit to phase 1* is there if phase 1 gets slow.
+  - **FL2VA check**: the first time each pass reaches the model with mods
+    attached, one console line compares the rows fed with the layout the
+    model's own packer expects (video, audio, and control on ControlNet) and
+    says OK or MISMATCH.
+  - `H3REFMOD_FL2VA=0` / `H3REFMOD_CONTROLNET=0` switch RefMods off on FL2VA /
+    the ControlNet model without editing code.
 - **0.38.1-fork.39** — fix for newer Wan2GP builds: extract, decompile,
   Library jobs, Flux extraction and Convert to Flux could report *"Generation
   finished queue processing but no output with client_id ... was found in the
