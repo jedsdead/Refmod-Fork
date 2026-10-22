@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.38** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.39** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -133,6 +133,14 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.39** — fix for newer Wan2GP builds: extract, decompile,
+  Library jobs, Flux extraction and Convert to Flux could report *"Generation
+  finished queue processing but no output with client_id ... was found in the
+  gallery"* (or "no confirmation captured") even when they worked. Wan2GP's
+  API now samples status text and can miss a job's last line, and these jobs
+  make no video on purpose. Each job now keeps its own record of what it did,
+  which the plugin reads when the job ends; Wan2GP's message is only shown if
+  the job never ran.
 - **0.38.1-fork.38** — **contact sheets for H3 picture mods.** The
   "Send as one video" box on multi-picture image rows is now a **Send as**
   choice: *Separate pictures* (one `<Picture N>` each), *One video* (one

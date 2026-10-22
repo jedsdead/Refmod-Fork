@@ -951,11 +951,72 @@ def _lora_choices(api_session, model_type):
     return list(info.get("loras") or [])
 
 
+def _patches_module():
+    from . import patches
+    return patches
+
+
+def _tag_job(overrides):
+    """(overrides, job id) -- the id put into a plugin job's spec, or None
+    for an ordinary generation."""
+    import uuid
+    custom = dict((overrides or {}).get("custom_settings") or {})
+    for key, wrapper in ((SETTING_GENERATE, EXTRACT_WRAPPER_KEY), (flux.FLUX_SETTING, flux.FLUX_EXTRACT_KEY)):
+        try:
+            data = json.loads(custom.get(key) or "")
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get(wrapper), dict):
+            job_id = uuid.uuid4().hex
+            data[wrapper] = dict(data[wrapper], job_id=job_id)
+            custom[key] = json.dumps(data)
+            return dict(overrides, custom_settings=custom), job_id
+    return overrides, None
+
+
+_NO_OUTPUT_ERROR = "no output with client_id"
+
+
+class _JobCallbacks:
+    """Holds a job's status lines and errors until it ends, then hands the
+    caller the job's own record (or, if the job never ran, what Wan2GP said)."""
+
+    def __init__(self, inner):
+        self.inner, self.status, self.errors = inner, [], []
+
+    def on_status(self, message):
+        if message:
+            self.status.append(str(message))
+
+    def on_error(self, error):
+        self.errors.append(getattr(error, "message", None) or str(error))
+
+    def on_progress(self, update):
+        method = getattr(self.inner, "on_progress", None)
+        if callable(method):
+            method(update)
+
+    def finish(self, recorded):
+        relay_status = getattr(self.inner, "on_status", None)
+        relay_error = getattr(self.inner, "on_error", None)
+        lines = list(recorded) if recorded else self.status
+        for line in lines:
+            if callable(relay_status):
+                relay_status(line)
+        for message in self.errors:
+            if recorded and _NO_OUTPUT_ERROR in message:
+                continue   # expected: a job makes no video
+            if callable(relay_error):
+                relay_error(message)
+            elif callable(relay_status):
+                relay_status(f"error: {message}")
+
+
 class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.38"
+        self.version = "0.38.1-fork.39"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1160,6 +1221,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         return flux_ui.build_inline(self)
 
     def _submit(self, api_session, model_type, overrides, callbacks):
+        """fork.39: a plugin job (extract, decompile, Library job, Flux
+        extraction) is tagged with an id, and its own record of what it
+        reported is handed to ``callbacks`` once it ends -- Wan2GP's API can
+        miss a job's last status line, and reports "no output ... in the
+        gallery" for every job, since jobs make no video on purpose."""
+        overrides, job_id = _tag_job(overrides)
+        if not job_id:
+            return self._submit_task(api_session, model_type, overrides, callbacks)
+        relay = _JobCallbacks(callbacks)
+        try:
+            return self._submit_task(api_session, model_type, overrides, relay)
+        finally:
+            relay.finish(_patches_module().JOB_RESULTS.pop(job_id, None))
+
+    def _submit_task(self, api_session, model_type, overrides, callbacks):
         """Build a full, validated settings dict for ``model_type`` -- starting
         from that model's own factory defaults, then applying ``overrides`` --
         and submit it. Any field this plugin doesn't have a widget for still

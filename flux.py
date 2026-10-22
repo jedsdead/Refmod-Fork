@@ -586,6 +586,12 @@ def run_extract(owner, job: dict, flux3: bool, set_progress_status=None, tile_si
     status(f"Flux RefMod '{name}' finished: {what}, {tokens:,} tokens")
 
 
+def _recorder(job, kwargs):
+    """fork.39: the job's status lines, also kept for the plugin (patches.JOB_RESULTS)."""
+    from .patches import job_status_recorder
+    return job_status_recorder(job, kwargs.get("set_progress_status"))
+
+
 # ── Hooks ─────────────────────────────────────────────────────────────────
 
 _ORIG: Dict[str, object] = {}
@@ -637,9 +643,10 @@ def _wrap_flux2() -> bool:
             return orig_generate(self, *args, **kwargs)
         if job:
             try:
-                run_extract(self, job, flux3=False, set_progress_status=kwargs.get("set_progress_status"))
+                run_extract(self, job, flux3=False, set_progress_status=_recorder(job, kwargs))
             except Exception:
                 _log("extraction failed:\n" + traceback.format_exc())
+                _recorder(job, {})("Flux RefMod extraction failed -- see the console")
             return None
         if not selection:
             return orig_generate(self, *args, **kwargs)
@@ -693,10 +700,11 @@ def _wrap_flux3() -> bool:
         if job:
             tiled, size = kwargs.get("VAE_tile_size") or (True, 1024)
             try:
-                run_extract(self, job, flux3=True, set_progress_status=kwargs.get("set_progress_status"),
+                run_extract(self, job, flux3=True, set_progress_status=_recorder(job, kwargs),
                             tile_size=size if tiled else 0)
             except Exception:
                 _log("extraction failed:\n" + traceback.format_exc())
+                _recorder(job, {})("Flux RefMod extraction failed -- see the console")
             return None
         mods = selected_latents(selection) if selection else []
         if not mods:

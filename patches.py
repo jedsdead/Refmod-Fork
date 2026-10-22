@@ -89,6 +89,31 @@ MIN_AUDIO_SECONDS = 2.0
 REFERENCE_SECONDS_MAX = 15.0   # fork: H3's limit for a reference video
 
 
+# fork.39: what each plugin job (extract, decompile, Library jobs, Flux
+# extraction) reported, by the job id the plugin gave it. Wan2GP's API samples
+# status text and can miss a job's last line -- the one that says whether it
+# worked -- so the plugin reads the job's own record instead.
+JOB_RESULTS = {}
+_JOB_RESULTS_MAX = 32
+
+
+def job_status_recorder(job, set_progress_status):
+    """A set_progress_status that also records every line for ``job``."""
+    job_id = str(job.get("job_id") or "") if isinstance(job, dict) else ""
+    lines = None
+    if job_id:
+        while len(JOB_RESULTS) >= _JOB_RESULTS_MAX:
+            JOB_RESULTS.pop(next(iter(JOB_RESULTS)))
+        lines = JOB_RESULTS.setdefault(job_id, [])
+
+    def status(message):
+        if lines is not None:
+            lines.append(str(message))
+        if callable(set_progress_status):
+            set_progress_status(message)
+    return status
+
+
 class ExtractionBlocked(ValueError):
     """An extraction refused for a reason the user can fix; its message is
     shown in the status box instead of a traceback."""
@@ -904,7 +929,7 @@ def install_patches() -> Optional[str]:
         # earlier fork builds wrote.
         state_json, extract_job = read_refmod_payload(custom_settings)
         if extract_job:
-            set_progress_status = kwargs.get("set_progress_status")
+            set_progress_status = job_status_recorder(extract_job, kwargs.get("set_progress_status"))   # fork.39
             try:
                 _run_extract_job(self, extract_job, set_progress_status=set_progress_status)
             except ExtractionBlocked as blocked:   # fork: a refusal the user can fix
