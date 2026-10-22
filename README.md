@@ -33,9 +33,7 @@ and the ComfyUI packs.
   (0.42.0) this fork has taken the fix for the pipeline being kept in memory
   after a generation, the idea of an FL2VA row check, the
   `H3REFMOD_FL2VA` / `H3REFMOD_CONTROLNET` switches, and *Full size* as the
-  default for *Mods in phase 1* (with its measurements behind it). Those
-  0.42.0 releases in turn ported this fork's FL2VA support, Shrink method and
-  Mods in phase 1 option.
+  default for *Mods in phase 1* (with its measurements behind it).
 - **malcolmrey** ([ComfyUI-Flux2Klein9Mod](https://github.com/malcolmamal/ComfyUI-Flux2Klein9Mod))
   -- the Flux 2 / Klein RefMod file layout, which this fork's Flux mods use so
   they move between the two.
