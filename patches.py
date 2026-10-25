@@ -2743,6 +2743,8 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
         pass
     waveform = storage.load_audio_waveform(audio_path, max_seconds=target_seconds)
     duration = _require_audio_length(waveform, f"The audio file {os.path.basename(str(audio_path))}")
+    if spec.get("clean_audio"):   # fork.41
+        waveform = _clean_waveform(waveform, status)
     status(f"H3 RefMod: encoding audio reference (~{duration:.1f}s)")
 
     latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
@@ -2781,6 +2783,30 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
 
 
 # ── Fork: soundtracks, and the Library / Decompile jobs ───────────────────
+
+def _clean_waveform(waveform: torch.Tensor, status) -> torch.Tensor:
+    """fork.41: voices only -- Wan2GP's own "Remove Background Music / Noise"
+    separator (preprocessing.extract_vocals). [1, 2, samples] in and out, the
+    same length."""
+    import shutil
+    import tempfile
+    import soundfile as sf
+    from preprocessing.extract_vocals import get_vocals
+    status("H3 RefMod: removing background music / noise (voices kept)")
+    tmpdir = tempfile.mkdtemp(prefix="refmods_clean_")
+    try:
+        src = os.path.join(tmpdir, "audio.wav")
+        sf.write(src, waveform[0].float().clamp(-1, 1).T.cpu().numpy(), storage.AUDIO_SAMPLE_RATE)
+        cleaned = storage.load_audio_waveform(get_vocals(src, os.path.join(tmpdir, "audio_clean.wav")))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    want = waveform.shape[-1]
+    if cleaned.shape[-1] > want:
+        cleaned = cleaned[..., :want]
+    elif cleaned.shape[-1] < want:
+        cleaned = F.pad(cleaned, (0, want - cleaned.shape[-1]))
+    return cleaned.to(waveform.dtype)
+
 
 def _require_audio_length(waveform, what: str) -> float:
     """Refuse audio shorter than MIN_AUDIO_SECONDS; returns its length."""
@@ -2839,6 +2865,8 @@ def _read_soundtrack(spec, image_paths, video_paths, status):
                f"not be picked up.")
     elif not from_clip:
         got = _require_audio_length(waveform, where)
+    if spec.get("clean_audio"):   # fork.41
+        waveform = _clean_waveform(waveform, status)
     status(f"H3 RefMod: soundtrack ~{got:.1f}s (Soundtrack length {seconds:g}s)")
     return waveform
 
@@ -2888,6 +2916,8 @@ def _run_attach_audio_job(pipeline_self, spec: dict, status) -> None:
         except ExtractionBlocked as blocked:
             status(f"Attach audio refused: {blocked}")
             return
+        if spec.get("clean"):   # fork.41
+            waveform = _clean_waveform(waveform, status)
         latent = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
     done = skipped = failed = 0
     for index, name in enumerate(names, 1):
@@ -2983,8 +3013,55 @@ def _run_decompile_job(pipeline_self, spec: dict, status) -> None:
     status(f"Decompile finished: '{name}' -> " + ", ".join(written) + f" in {out}")
 
 
+def _decode_audio_latent(pipeline_self, latent: torch.Tensor) -> torch.Tensor:
+    """[1, 32, 2, T] audio latent -> [1, 2, samples] waveform (cpu)."""
+    audio_vae = getattr(pipeline_self, "audio_vae", None)
+    if audio_vae is None:
+        raise RuntimeError("this pipeline has no audio VAE to decode with")
+    waveform = audio_vae.decode(latent.to(device=pipeline_self.device, dtype=torch.float32))[0]
+    waveform = waveform.float().clamp(-1, 1).cpu()
+    return waveform.unsqueeze(0) if waveform.dim() == 2 else waveform
+
+
+def _run_clean_audio_job(pipeline_self, spec: dict, status) -> None:
+    """fork.41, Library "Clean audio": remove background music / noise from
+    audio mods and soundtracks already saved. Decode, separate, re-encode;
+    saved as a copy (name_clean) unless "Save as copy" is off."""
+    names = [n for n in (spec.get("names") or []) if n]
+    as_copy = bool(spec.get("as_copy", True))
+    if not names:
+        status("Clean audio: nothing selected.")
+        return
+    done = skipped = failed = 0
+    for index, name in enumerate(names, 1):
+        try:
+            mod = storage.load_refmod(name)
+            latent = mod.latent if mod.kind == "audio" else mod.audio_latent
+            if latent is None:
+                skipped += 1
+                status(f"[{index}/{len(names)}] '{name}': no audio -- nothing to do")
+                continue
+            waveform = _clean_waveform(_decode_audio_latent(pipeline_self, latent), status)
+            cleaned = _encode_ref_audio(pipeline_self, waveform).to(torch.float16)
+            if mod.kind == "audio":
+                mod.latent, mod.latent_t = cleaned, int(cleaned.shape[-1])
+            else:
+                mod.audio_latent, mod.audio_t = cleaned, int(cleaned.shape[-1])
+            mod.tags = list(dict.fromkeys(list(mod.tags or []) + ["clean audio"]))
+            target = storage.free_mod_name(name) if as_copy else name
+            if as_copy:
+                mod.name = storage._split_folder(target)[1]
+            mod.save(storage.mod_path(target))
+            done += 1
+            status(f"[{index}/{len(names)}] '{name}': cleaned" + (f", saved as '{target}'" if as_copy else ""))
+        except Exception:
+            failed += 1
+            _log(f"could not clean the audio of {name!r}:\n" + traceback.format_exc())
+    status(f"Clean audio finished: {done} cleaned, {skipped} skipped, {failed} failed.")
+
+
 _EXTRA_JOBS = {"attach_audio": _run_attach_audio_job, "store_frames": _run_store_frames_job,
-               "decompile": _run_decompile_job}
+               "decompile": _run_decompile_job, "clean_audio": _run_clean_audio_job}
 
 
 def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> None:

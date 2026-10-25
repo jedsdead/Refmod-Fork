@@ -930,6 +930,18 @@ def _convertible(folder=None):
     return storage.list_refmods_by_kind("image", folder=list_folder, recursive=recursive)
 
 
+CLEAN_AUDIO_INFO = "Keeps voices only (Wan2GP's own separator); music and effects go."
+
+
+def _audio_mod_names(folder=None):
+    """fork.41: H3 audio mods and mods with a soundtrack, for Clean audio."""
+    model, _ = _split_library_folder(folder)
+    if model == "flux":
+        return []
+    list_folder, recursive = _h3_list_args(folder)
+    return storage.list_refmods_with_audio(folder=list_folder, recursive=recursive)
+
+
 def _library_mod_names(folder=None):
     """H3 mod names (folder-relative) for the H3-only tools, honouring the
     Library's folder picker; none when a Flux folder is picked."""
@@ -1016,7 +1028,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.40"
+        self.version = "0.38.1-fork.41"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1524,8 +1536,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             trim_status = gr.Markdown("")
         with gr.Row():
             ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath", scale=2)
-            use_clip_audio = gr.Checkbox(False, label="Use the clip's own audio", scale=1,
-                                         info="Ignored if an audio file is set.")
+            with gr.Column(scale=1):
+                use_clip_audio = gr.Checkbox(False, label="Use the clip's own audio",
+                                             info="Ignored if an audio file is set.")
+                clean_audio = gr.Checkbox(False, label="Remove background music / noise",   # fork.41
+                                          info=CLEAN_AUDIO_INFO)
         soundtrack_seconds = gr.Slider(
             MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS, step=0.5,
             label="Audio length (seconds)",
@@ -1716,7 +1731,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                        remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
                        latent_frames, identity, multiplier, max_tokens, description, save,
                        use_clip_audio=False, trims=None, as_pictures=False, per_second=1.0,
-                       merge_refs=False, audio_seconds=DEFAULT_AUDIO_SECONDS, order=None):
+                       merge_refs=False, audio_seconds=DEFAULT_AUDIO_SECONDS, order=None,
+                       clean=False):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
@@ -1747,6 +1763,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "merge": bool(merge_refs),
                 "audio_seconds": max(MIN_AUDIO_SECONDS, float(audio_seconds or DEFAULT_AUDIO_SECONDS)),
                 "order": order_ui.merged_order(order, ref_images, ref_videos),   # fork.37
+                "clean_audio": bool(clean),   # fork.41
             }
             log = {"lines": []}
 
@@ -1785,7 +1802,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                    remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
                    latent_frames, identity, multiplier, max_tokens, description, save,
                    use_clip_audio, trim_state, video_as_pictures, pictures_per_second, merge,
-                   soundtrack_seconds, source_order],
+                   soundtrack_seconds, source_order, clean_audio],
             outputs=[extract_status],
             queue=False,
         )
@@ -1987,8 +2004,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 audio_seconds = gr.Slider(MIN_AUDIO_SECONDS, 15.0, value=DEFAULT_AUDIO_SECONDS,
                                           step=0.5, label="Seconds to use", scale=1,
                                           info=f"At least {MIN_AUDIO_SECONDS:g}s; shorter is refused.")
-                audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")
+                with gr.Column(scale=1):
+                    audio_clean = gr.Checkbox(False, label="Remove background music / noise",   # fork.41
+                                              info=CLEAN_AUDIO_INFO)
+                    audio_remove = gr.Checkbox(False, label="Remove existing soundtrack instead")
             audio_status = gr.Textbox(label="", interactive=False, show_label=False)
+        with gr.Accordion("Clean audio", open=False):   # fork.41
+            gr.Markdown("Removes background music / noise from audio mods and soundtracks you already have. "
+                        "Voices are kept. Runs a short task on the model above.")
+            with gr.Row():
+                clean_dd = gr.Dropdown(label="Mods with audio", choices=_audio_mod_names(), value=[],
+                                       multiselect=True, scale=2)
+                clean_copy = gr.Checkbox(True, label="Save as copy",
+                                         info="Saves name_clean and keeps the original. Off: overwrites.")
+                clean_btn = gr.Button("Clean audio", variant="primary")
+            clean_status = gr.Textbox(label="", interactive=False, show_label=False)
         with gr.Accordion("Encoder frames", open=False):
             gr.Markdown("Stores prompt-view frames in mods that lack them, so they aren't decoded every session.")
             with gr.Row():
@@ -2043,7 +2073,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             return [n for n in (names if isinstance(names, list) else [names]) if n]
 
         fork_lists = [move_dd, move_target, delete_folder_dd, audio_target_dd, frames_target_dd,
-                      delete_name, convert_dd]
+                      delete_name, convert_dd, clean_dd]
 
         def fork_list_updates(folder):
             names, qualified = _library_mod_names(folder), _qualified_choices(folder)
@@ -2052,7 +2082,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     gr.update(choices=_library_subfolders(), value=None),
                     gr.update(choices=names, value=[]), gr.update(choices=names, value=[]),
                     gr.update(choices=qualified, value=None),
-                    gr.update(choices=_convertible(folder), value=[])]
+                    gr.update(choices=_convertible(folder), value=[]),
+                    gr.update(choices=_audio_mod_names(folder), value=[])]
 
         def after_change(folder, message):
             folder = folder if folder in _library_folder_choices() else ALL_FOLDERS_CHOICE
@@ -2109,14 +2140,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         delete_folder_btn.click(fn=do_delete_folder, inputs=[delete_folder_dd, library_folder_dd],
                                 outputs=change_outputs + [folder_status], queue=False)
 
-        def do_attach_audio(names, audio_path, seconds, remove, folder, model_type=None):
+        def do_attach_audio(names, audio_path, seconds, remove, folder, clean=False, model_type=None):
             names = picked(names)
             if not names:
                 return gr.update(), "Pick at least one mod first."
             if not audio_path and not remove:
                 return gr.update(), "Choose an audio file, or tick 'Remove existing soundtrack'."
             message = run_job({"op": "attach_audio", "names": names, "audio_path": audio_path,
-                               "seconds": float(seconds), "remove": bool(remove)}, model_type)
+                               "seconds": float(seconds), "remove": bool(remove),
+                               "clean": bool(clean) and not remove}, model_type)
             return gr.update(choices=_library_mod_names(folder), value=[]), message
 
         def do_store_frames(names, all_missing, folder, model_type=None):
@@ -2132,8 +2164,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         model_input = [model_dd] if model_dd is not None else []
         attach_btn.click(fn=do_attach_audio,
                          inputs=[audio_target_dd, audio_file, audio_seconds, audio_remove,
-                                 library_folder_dd] + model_input,
+                                 library_folder_dd, audio_clean] + model_input,
                          outputs=[audio_target_dd, audio_status], queue=False)
+        def do_clean_audio(names, as_copy, folder, model_type=None):   # fork.41
+            names = picked(names)
+            if not names:
+                return after_change(folder, "Pick at least one mod with audio.")
+            message = run_job({"op": "clean_audio", "names": names, "as_copy": bool(as_copy)}, model_type)
+            return after_change(folder, message)
+
+        clean_btn.click(fn=do_clean_audio, inputs=[clean_dd, clean_copy, library_folder_dd] + model_input,
+                        outputs=change_outputs + [clean_status], queue=False)
         frames_btn.click(fn=do_store_frames,
                          inputs=[frames_target_dd, gr.State(False), library_folder_dd] + model_input,
                          outputs=[table, frames_target_dd, frames_status], queue=False)

@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.40** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.41** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -76,6 +76,11 @@ what the fork adds.
   video becomes the mod's soundtrack — stored beside the visual latent and
   injected as its own `<Audio N>` reference. Or tick **Use the clip's own
   audio** to take it from the reference video.
+- **Remove background music / noise** for a mod's audio, as in Wan2GP's own
+  audio references: voices are kept, music and effects removed. In Extract,
+  in the Library's Soundtrack tool, and as a Library **Clean audio** job for
+  mods you already have (saved as a copy, `name_clean`, unless *Save as copy*
+  is off).
 - **Audio length** slider (4 s by default, 2 s minimum). Audio shorter than
   H3's 2-second minimum is refused with a clear message; a clip's own audio is
   kept with a warning instead.
@@ -150,6 +155,17 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.41** — **Remove background music / noise for audio.**
+  - A *Remove background music / noise* checkbox in Extract (H3) and in the
+    Library's Soundtrack tool. It runs Wan2GP's own separator (the one behind
+    its *Remove Background Music / Noise* option) and keeps only the voices,
+    for audio mods, soundtracks from a file and a clip's own audio.
+  - A new Library job, **Clean audio**, for audio mods and mods with a
+    soundtrack you already have: the audio is decoded, cleaned and encoded
+    again. *Save as copy* (on by default) saves `name_clean` beside the
+    original; off, the mod is overwritten.
+  - The separator model downloads the first time it is used, if Wan2GP hasn't
+    already fetched it.
 - **0.38.1-fork.40** — from g3n3rativ3's 0.42.0 (see Credits):
   - **Fixed a memory leak**: after a generation the plugin kept a hold on the
     whole H3 pipeline, so when Wan2GP unloaded H3 (to load Flux, say) it could
@@ -866,6 +882,13 @@ apply as for image/video, just with the audio VAE's own, exact conversion
 rate (40 latents/second at 32kHz, verified against
 `components/audio_autoencoder.py`'s own docstring -- not an fps-based
 estimate the way the video duration figure is).
+
+**Removing background music / noise** (fork.41). Tick it in Extract or in
+the Library's Soundtrack tool and the audio goes through Wan2GP's own vocal
+separator before it is encoded, so only the voices are kept. For mods you
+already have, the Library's **Clean audio** job decodes the stored audio,
+cleans it and encodes it again. Each pass through the audio VAE loses a
+little, so cleaning while extracting from the original file is best.
 
 **Using one.** Same as image/video RefMods: pick it in an "Audio Mod 1/2"
 slot (Generate tab or the inline panel) and it goes straight into

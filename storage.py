@@ -207,6 +207,25 @@ def list_refmods_info(folder: Optional[str] = None, recursive: bool = False) -> 
     return out
 
 
+def list_refmods_with_audio(folder: Optional[str] = None, recursive: bool = False) -> List[str]:
+    """Audio mods and mods with a soundtrack (fork.41: Clean audio)."""
+    out = []
+    for name in list_refmods(folder=folder, recursive=recursive):
+        meta = read_refmod_meta(mod_path(name)) or {}
+        if meta.get("kind") == "audio" or meta.get("has_audio"):
+            out.append(name)
+    return out
+
+
+def free_mod_name(name: str, suffix: str = "_clean") -> str:
+    """``name`` + ``suffix`` (then _2, _3 ...) that no mod uses yet."""
+    base = name + suffix
+    candidate, n = base, 2
+    while os.path.isfile(mod_path(candidate) + ".safetensors"):
+        candidate, n = f"{base}_{n}", n + 1
+    return candidate
+
+
 def list_refmods_missing_frames() -> List[str]:
     """Every visual mod, in every subfolder, that has no usable encoder
     frames stored (see core.encoder_frames_status)."""
