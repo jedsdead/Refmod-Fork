@@ -602,8 +602,8 @@ def _ordered_labels(items, word):
 def _format_label_line(rows):
     """Which <Picture N> / <Video N> / <Audio N> each picked mod will get in
     window 1 -- its chosen number, or the next free one on Auto. Assumes no
-    start image and no references of the generation's own: those take the
-    first numbers, so with a start image pick <Picture 2> onwards (the
+    start image, Continue Video or references of the generation's own: those
+    take the first numbers, so with a start image pick <Picture 2> onwards (the
     console reports the labels each generation really used)."""
     pictures, videos, audios = [], [], []    # (mod name, count, wanted number)
     for name, strength, as_video, use_audio, label, audio_label in _normalize_rows(rows):
@@ -634,8 +634,8 @@ def _format_label_line(rows):
     extra = ""
     if len(videos) > 3:
         extra = " (videos past the third have no label -- only 3 reference-video slots)"
-    return ("**Prompt labels** (with no start image or references of your own -- those come "
-            "first): " + " · ".join(parts) + extra)
+    return ("**Prompt labels** (with no start image, Continue Video or references of your own -- "
+            "those come first): " + " · ".join(parts) + extra)
 
 
 def _format_ref_counter(rows):
@@ -1028,7 +1028,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.41"
+        self.version = "0.38.1-fork.42"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1050,6 +1050,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         self.request_global("get_model_settings")
         self.request_global("get_base_model_type")
         self.request_global("set_model_settings")          # fork.34: restore on load
+        self.request_global("collect_custom_settings_from_inputs")   # fork.42
         self.request_component("refresh_form_trigger")     # fork.34
         try:   # fork.34: a readable RefMods line in each output's info
             self.register_data_hook("before_metadata_save", outputinfo.before_metadata_save)
@@ -1120,6 +1121,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             err3 = outputinfo.install_set_model_settings_patch(orig_set_model_settings, self.set_global, get_base_mt)
             if err3:
                 print(f"[Refmods] {err3}")
+
+        orig_collect = getattr(self, "collect_custom_settings_from_inputs", None)   # fork.42
+        if callable(orig_collect):
+            from . import patches
+            err4 = patches.install_collect_custom_settings_patch(orig_collect, self.set_global)
+            if err4:
+                print(f"[Refmods] {err4}")
 
         orig_get_model_settings = getattr(self, "get_model_settings", None)
         if callable(orig_get_model_settings):
@@ -1410,8 +1418,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         for kind, label, count in (("image", "Image RefMods", counts[0]),
                                    ("video", "Video RefMods", counts[1]),
                                    ("audio", "Audio RefMods", counts[2])):
-            gr.Markdown(f"**{label}**" + (" -- a start image or your own references take the "
-                                           "first label numbers." if kind == "image" else ""))
+            gr.Markdown(f"**{label}**" + (" -- a start image, Continue Video or your own references "
+                                           "take the first label numbers." if kind == "image" else ""))
             kind_rows, kind_ui = [], []
             for i in range(count):
                 with gr.Row(visible=i == 0) as row_ui:

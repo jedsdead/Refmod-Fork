@@ -241,7 +241,7 @@ def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> boo
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent", "hide_ref", "enc", "max_short", "label_first")
+    __slots__ = ("latent", "hide_ref", "enc", "max_short", "label_first", "sheet")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
@@ -249,6 +249,7 @@ class _RefModImageSentinel:
         self.enc = None   # presentation payload: dict or None
         self.max_short = None     # fork: the row's "Max size" (short edge, px)
         self.label_first = False  # fork: see STABLE_REFMOD_LABELS
+        self.sheet = None         # fork.42: (rows, cols, pictures) of a contact sheet
 
     @property
     def dtype(self):
@@ -1122,6 +1123,64 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
 
 
 _GET_MODEL_SETTINGS_PATCH_MARKER = "_h3refmod_get_model_settings_patched"
+_COLLECT_PATCH_MARKER = "_h3refmod_collect_custom_settings_patched"
+
+
+def _hidden_setting_ids(model_def) -> set:
+    """Our own hidden custom settings declared on this model (H3 and Flux)."""
+    ids = {SETTING_GENERATE}
+    try:
+        from . import flux
+        ids.add(flux.FLUX_SETTING)
+    except Exception:
+        pass
+    declared = (model_def or {}).get("custom_settings") if isinstance(model_def, dict) else None
+    return {d.get("id") for d in (declared or []) if isinstance(d, dict) and d.get("id") in ids
+            and HIDDEN_SETTING_FLAG in str(d.get("video_prompt_type") or "")}
+
+
+def install_collect_custom_settings_patch(orig_collect, set_global_fn) -> Optional[str]:
+    """fork.42: Wan2GP (from 29 Oct 2026, "checkpoint charly") drops every
+    custom setting that isn't visible on the form when it queues a task. The
+    plugin's own setting is hidden on purpose, so the mods, extraction and
+    Library jobs it carries were thrown away before they reached the model.
+    This wraps ``collect_custom_settings_from_inputs`` and puts our hidden
+    setting back -- only ours, only when it was dropped. Older Wan2GP builds
+    never drop it, so nothing changes there."""
+    if getattr(install_collect_custom_settings_patch, _COLLECT_PATCH_MARKER, False):
+        return None
+
+    @functools.wraps(orig_collect)
+    def patched_collect_custom_settings_from_inputs(model_def, inputs, *args, **kwargs):
+        result = orig_collect(model_def, inputs, *args, **kwargs)
+        try:
+            if not (isinstance(result, tuple) and len(result) == 2) or result[1] is not None:
+                return result
+            existing = inputs.get("custom_settings") if isinstance(inputs, dict) else None
+            if not isinstance(existing, dict):
+                return result
+            parsed = result[0]
+            restored = dict(parsed) if isinstance(parsed, dict) else {}
+            changed = False
+            for setting_id in _hidden_setting_ids(model_def):
+                value = existing.get(setting_id)
+                if value and setting_id not in restored:
+                    restored[setting_id] = value
+                    changed = True
+            if changed:
+                return restored, None
+        except Exception:
+            _log("could not keep the RefMods setting on this task:\n" + traceback.format_exc())
+        return result
+
+    try:
+        set_global_fn("collect_custom_settings_from_inputs", patched_collect_custom_settings_from_inputs)
+    except Exception as e:
+        return (f"could not hook collect_custom_settings_from_inputs ({e!r}); on Wan2GP builds from "
+                f"29 Oct 2026 on, RefMods would not reach the model")
+    setattr(install_collect_custom_settings_patch, _COLLECT_PATCH_MARKER, True)
+    _log("hooked collect_custom_settings_from_inputs so Wan2GP keeps the hidden RefMods setting")
+    return None
 
 
 def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
@@ -1275,6 +1334,7 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
             enc = _enc_sheet(mod, eff, latent.shape[2])
             for _ in range(copies):
                 sentinel = _RefModImageSentinel(sheet)
+                sentinel.sheet = (*_sheet_grid(latent.shape[2]), latent.shape[2])   # fork.42
                 sentinel.enc = dict(enc) if enc else None
                 image_sentinels.append(sentinel)
         elif pictures and send_as == "video" and latent.shape[2] > 1:
@@ -1707,6 +1767,17 @@ def _veda_restore(pipeline_self) -> None:
         policy.reset()
 
 
+def _continues_video(kwargs) -> bool:
+    """fork.42: Continue Video -- the source's last frame comes first, as
+    <Picture 1> (pipeline.py: continuation_count, only without a start image
+    and never for still images)."""
+    try:
+        return (kwargs.get("input_video") is not None and int(kwargs.get("prefix_frames_count") or 0) > 0
+                and kwargs.get("image_start") is None and int(kwargs.get("image_mode") or 0) == 0)
+    except (TypeError, ValueError):
+        return False
+
+
 def _label_offsets(kwargs, later_window, stable, ref2va):
     """How many labels of each kind the generation's own inputs take ahead of
     the mods: start/end frames (a sliding window's carried-over frame takes
@@ -1717,7 +1788,8 @@ def _label_offsets(kwargs, later_window, stable, ref2va):
     if later_window and stable and _LABEL_BASE["image"] is not None:
         images = _LABEL_BASE["image"]
     else:
-        images = (1 if (later_window or kwargs.get("image_start") is not None) else 0) \
+        images = (1 if (later_window or kwargs.get("image_start") is not None
+                        or _continues_video(kwargs)) else 0) \
             + (1 if kwargs.get("image_end") is not None else 0)
     if not ref2va:
         return {"image": images, "video": 0, "audio": 0}
@@ -2150,7 +2222,8 @@ def _fit_phase_1(pipeline_self, sentinel, kind, latent, target_width, target_hei
     if new_h >= h and new_w >= w:
         return latent
     smaller = _reencode_smaller(pipeline_self, latent, kind, getattr(sentinel, "is_stack", False),
-                                new_w * _VAE_SPATIAL_FACTOR, new_h * _VAE_SPATIAL_FACTOR)
+                                new_w * _VAE_SPATIAL_FACTOR, new_h * _VAE_SPATIAL_FACTOR,
+                                sheet=getattr(sentinel, "sheet", None))
     if smaller is None:
         return _fit_latent_to_canvas(latent, target_width, target_height, relative_size, f"{kind} RefMod")
     _log(f"fitted {kind} RefMod to phase 1's canvas (re-encoded): {w}x{h} -> "
@@ -2177,7 +2250,7 @@ def _apply_size_limits(pipeline_self, sentinel, kind, latent, canvas_w=None, can
         smaller = _fit_latent_to_canvas(latent, new_w, new_h, 100.0, f"{kind} RefMod ({reason})")
     else:
         smaller = _reencode_smaller(pipeline_self, latent, kind, getattr(sentinel, "is_stack", False),
-                                    new_w, new_h)
+                                    new_w, new_h, sheet=getattr(sentinel, "sheet", None))
     if smaller is None or smaller.shape[-2] * smaller.shape[-1] >= latent.shape[-2] * latent.shape[-1]:
         return latent
     _log(f"{kind} RefMod shrunk ({reason}, pass {pass_no}): "
@@ -2188,18 +2261,41 @@ def _apply_size_limits(pipeline_self, sentinel, kind, latent, canvas_w=None, can
     return smaller
 
 
-def _reencode_smaller(pipeline_self, latent, kind, is_stack, width, height):
+def _reencode_sheet(pipeline_self, latent, sheet, width, height):
+    """fork.42: a contact sheet rebuilt picture by picture. Decoding the whole
+    sheet at once can need several GB of VRAM (a sheet of 1024px pictures is
+    thousands of pixels across); each picture alone decodes like any picture
+    mod. Each is resized to its share of (width, height), encoded, and the
+    sheet is laid out again."""
+    from models.minimax_h3 import pipeline as h3_pipeline
+    rows, cols, count = (int(v) for v in sheet)
+    cell_h, cell_w = latent.shape[-2] // rows, latent.shape[-1] // cols
+    px_w = max(_VAE_SPATIAL_FACTOR, int(round(width / cols / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
+    px_h = max(_VAE_SPATIAL_FACTOR, int(round(height / rows / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
+    cells = []
+    for j in range(count):
+        r, k = divmod(j, cols)
+        cell = latent[:, :, :1, r * cell_h:(r + 1) * cell_h, k * cell_w:(k + 1) * cell_w]
+        picture = _decode_cthw(pipeline_self, cell)[:, :1]
+        cells.append(pipeline_self._encode_video(h3_pipeline._resize_video(picture, px_h, px_w)))
+    return _tile_stack(torch.cat(cells, dim=2))
+
+
+def _reencode_smaller(pipeline_self, latent, kind, is_stack, width, height, sheet=None):
     """Decode, resize the pixels to (width, height), re-encode. Pictures
-    (single or a stack) are rebuilt one at a time, never as frames of a clip.
+    (single or a stack) are rebuilt one at a time, never as frames of a clip,
+    and so are the pictures of a contact sheet (fork.42).
     Returns None to keep the stored latent."""
     try:
         key = (tuple(latent.shape), round(float(latent.float().sum()), 3), kind, bool(is_stack),
-               int(width), int(height))
+               int(width), int(height), tuple(sheet) if sheet else None)
         if key in _SHRINK_CACHE:
             _SHRINK_CACHE.move_to_end(key)
             return _SHRINK_CACHE[key]
         from models.minimax_h3 import pipeline as h3_pipeline
-        if kind == "image" or is_stack:
+        if sheet and latent.shape[2] == 1 and int(sheet[2]) > 1:
+            smaller = _reencode_sheet(pipeline_self, latent, sheet, width, height)
+        elif kind == "image" or is_stack:
             parts = []
             for j in range(latent.shape[2]):
                 picture = _decode_cthw(pipeline_self, latent[:, :, j:j + 1])[:, :1]

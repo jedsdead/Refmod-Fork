@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.41** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.42** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -155,6 +155,20 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.42** — **Works with Wan2GP from 29 October 2026.**
+  - That Wan2GP update drops every custom setting that isn't visible on the
+    form when a task is queued. The plugin's setting is hidden on purpose,
+    so armed mods never reached the model (a plain video was made), and
+    extraction / training jobs ran as ordinary generations. The plugin now
+    keeps its own hidden setting on the task; nothing else changes, and
+    older Wan2GP builds are unaffected.
+  - **Continue Video labels.** With Continue Video the source's last frame
+    is `<Picture 1>`, so image mods start at `<Picture 2>`, as with a start
+    image. Labels picked in the panel now count it, and the panel says so.
+  - **Contact sheets shrink one picture at a time.** A large sheet decoded
+    whole could run out of video memory and fall back to the rougher fast
+    shrink; each picture is now rebuilt on its own and the sheet laid out
+    again.
 - **0.38.1-fork.41** — **Remove background music / noise for audio.**
   - A *Remove background music / noise* checkbox in Extract (H3) and in the
     Library's Soundtrack tool. It runs Wan2GP's own separator (the one behind
