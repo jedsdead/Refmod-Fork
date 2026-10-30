@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.42** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.43** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -155,6 +155,12 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.43** — **Fixed contact sheets crashing two-phase runs.**
+  Fork.42's picture-by-picture shrink could leave a contact sheet an odd
+  number of latent cells high or wide (27 × 51, say). H3 works in 2 × 2
+  blocks, so the run stopped with a "shape ... is invalid" error. Each
+  picture is now sized in 32-pixel steps so a sheet is always even, and a
+  sheet with an odd side is padded by one cell of its own average colour.
 - **0.38.1-fork.42** — **Works with Wan2GP from 29 October 2026.**
   - That Wan2GP update drops every custom setting that isn't visible on the
     form when a task is queued. The plugin's setting is hidden on purpose,

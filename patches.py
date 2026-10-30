@@ -1981,7 +1981,10 @@ def _tile_stack(latent):
     _, c, t, h, w = latent.shape
     rows, cols = _sheet_grid(t)
     fill = latent.float().mean(dim=(2, 3, 4), keepdim=True).to(latent.dtype)
-    sheet = fill.expand(1, c, 1, rows * h, cols * w).clone()
+    # fork.43: H3 patchifies latents in 2x2 cells, so a sheet with an odd side
+    # can't be used. Cells are always even (see _reencode_sheet); a stored stack
+    # with odd sides still gets one extra row / column of the fill.
+    sheet = fill.expand(1, c, 1, rows * h + (rows * h) % 2, cols * w + (cols * w) % 2).clone()
     for j in range(t):
         r, k = divmod(j, cols)
         sheet[:, :, 0, r * h:(r + 1) * h, k * w:(k + 1) * w] = latent[:, :, j]
@@ -2270,8 +2273,12 @@ def _reencode_sheet(pipeline_self, latent, sheet, width, height):
     from models.minimax_h3 import pipeline as h3_pipeline
     rows, cols, count = (int(v) for v in sheet)
     cell_h, cell_w = latent.shape[-2] // rows, latent.shape[-1] // cols
-    px_w = max(_VAE_SPATIAL_FACTOR, int(round(width / cols / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
-    px_h = max(_VAE_SPATIAL_FACTOR, int(round(height / rows / _VAE_SPATIAL_FACTOR)) * _VAE_SPATIAL_FACTOR)
+    # fork.43: each picture an even number of latent cells (32px steps), so the
+    # sheet stays even on both sides -- 16px steps could make it odd (27x51),
+    # which H3 can't patchify.
+    step = 2 * _VAE_SPATIAL_FACTOR
+    px_w = max(step, int(round(width / cols / step)) * step)
+    px_h = max(step, int(round(height / rows / step)) * step)
     cells = []
     for j in range(count):
         r, k = divmod(j, cols)
