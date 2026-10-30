@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.43** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.44** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -155,6 +155,11 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.44** — **Works with Pika H3 Flex Ref2VA.** Pika needs at least
+  one picture or video reference, and Wan2GP's check only counted the form's
+  own, so a run with only RefMods was refused. Image and video mods now count
+  (audio-only mods don't). Extraction and Library jobs aren't blocked when
+  your saved settings use the Pika profile.
 - **0.38.1-fork.43** — **Fixed contact sheets crashing two-phase runs.**
   Fork.42's picture-by-picture shrink could leave a contact sheet an odd
   number of latent cells high or wide (27 × 51, say). H3 works in 2 × 2

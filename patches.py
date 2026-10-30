@@ -585,6 +585,8 @@ def _count_refmod_visual_refs(state_json: str) -> int:
 
 _VALIDATE_PATCH_MARKER = "_h3refmod_validate_patched"
 _INSUFFICIENT_VISUAL_MARKER = "at least as many reference images and videos as audio references"
+# fork.44: Pika H3 Flex Ref2VA's own check ("requires at least one image or video reference")
+_PIKA_NEEDS_VISUAL_MARKER = "requires at least one image or video reference"
 
 
 def _install_model_def_patch() -> None:
@@ -671,6 +673,16 @@ def _install_model_def_patch() -> None:
     @staticmethod
     def patched_validate_generative_settings(base_model_type, model_def, inputs):
         error = _orig_validate(base_model_type, model_def, inputs)
+        if error and _PIKA_NEEDS_VISUAL_MARKER in error:
+            # fork.44, Pika H3 Flex Ref2VA: it needs one picture or video, and
+            # counts only the form's own. Mods count too; and a plugin job
+            # (extraction, Library) makes no video, so the rule doesn't apply.
+            state_json, job = read_refmod_payload(inputs.get("custom_settings"))
+            if job:
+                return None
+            if state_json and _count_refmod_visual_refs(state_json) > 0:
+                _log("Pika H3 Flex: RefMods supply the picture / video reference it needs")
+                return None
         # Wan2GP's own pre-flight check (called before pipeline.generate() ever
         # runs) only counts *native* image_refs/video_guide fields -- it has no
         # visibility into RefMods, which only turn into visual references much
