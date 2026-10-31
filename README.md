@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.44** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.45** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -155,6 +155,12 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.45** — **No requirements.txt, so installing never fails.**
+  The plugin needs no packages of its own (everything it uses ships with
+  Wan2GP), and the file only held a note saying so. Wan2GP runs
+  `pip install -r requirements.txt` whenever the file exists, which fails
+  outright on an install whose environment has no pip -- as the WanGP Manager
+  environments do. With the file gone that step is skipped.
 - **0.38.1-fork.44** — **Works with Pika H3 Flex Ref2VA.** Pika needs at least
   one picture or video reference, and Wan2GP's check only counted the form's
   own, so a run with only RefMods was refused. Image and video mods now count
