@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.45** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.50** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -69,6 +69,37 @@ what the fork adds.
   vary more than in Ref2VA.
 - **FL2VA ControlNet-Union.** Its control rows are padded for the mods, which
   would otherwise stop the run with a row-count mismatch.
+- **P-H3-Image** (fork.50) — *MiniMax H3 P-H3-Image 8-Step 20B*, Pruna's
+  still-image model. It runs on FL2VA's transformer but, unlike FL2VA, has
+  reference pictures of its own, so mods travel the ordinary Ref2VA route and
+  use the same encoder your existing mods were made with: no new mod format,
+  nothing to convert. Your own pictures keep `<Picture 1>`, `<Picture 2>`…
+  and the mods number on after them.
+
+  Three things behave differently from a video model, by design:
+
+  - **Video and audio mods.** A video mod becomes one still per mod (its
+    first frame); a picture stack sent as one video goes back to being all of
+    its pictures. Audio mods, and the *Include audio* soundtrack of a
+    picture or video mod, are left out — a single frame has no soundtrack, so
+    an `<Audio N>` label would point at nothing. The console says which were
+    dropped.
+  - **Size.** The model is single-phase, so the phase options do nothing and
+    *Fit mods to the output size* never grows a mod towards an 8 MP canvas
+    (fit only ever shrinks). Mods go in at their own size under their row's
+    *Max size*, which is what this model does with its own references too.
+  - **The prompt.** Wan2GP turns a prompt into `Edit <Picture 1>. …`
+    whenever anything is in the prompt view, and an armed mod counts. Open
+    the prompt with `subject_definitions:` (the Ref2VA form) if you want a
+    picture *generated from* the mod rather than an edit *of* it; this model
+    accepts that opening as well as `Edit <Picture 1>.`.
+
+  P-H3-Image edits with at most 8 pictures and Wan2GP counts only the ones on
+  the form, so armed mods can take the total past 8. Nothing refuses them —
+  the pipeline has no hard cap — but the console says so when it happens.
+  Mods are still *made* on a Ref2VA model; this model's decoder is
+  single-frame, so it isn't offered in the Extract tab. Set
+  `H3REFMOD_IMAGE=0` to turn this support off.
 
 ### Making mods (Extract and Library tabs)
 
@@ -96,6 +127,12 @@ what the fork adds.
 - **Library**: folders (create, move mods between them, delete empty ones),
   add / replace / remove a soundtrack on existing mods, and store prompt-view
   frames in mods saved without them.
+- **Mods for other apps** (fork.46, fork.47): tick *Also use these for
+  Showrunner, Deepy and API tasks* in the panel and its whole selection,
+  options and all, is used by generations that bring none of their own --
+  Showrunner shots, Deepy and API tasks. Each mod can take keywords, so it
+  only applies to shots whose prompt mentions one. The **Auto-arm** tab shows
+  what is saved.
 - **Decompile tab**: turns a mod back into viewable pictures, video and audio,
   with a summary of what it holds.
 
@@ -118,7 +155,7 @@ what the fork adds.
 ### Speed and sizing
 
 - **Fit mods to the output size.**
-- **Mods in phase 1**: Full size (default since fork.40) or Fit to phase 1.
+- **Mods in phase 1**: Fit to phase 1 (the default again since fork.49) or Full size.
 - **Mods in phase 2**: Full, Fit to tile (with phase 2 tiling) or Off.
 - **Shrink method** for the above: Re-encode (best quality) or Fast.
 - **FL2VA mods are fitted to phase 1** of two-phase runs, as Ref2VA mods are.
@@ -150,11 +187,54 @@ of the file for the model switches.
 |---|---|---|
 | `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. Set the environment variable `H3REFMOD_FL2VA=0` to turn it off without editing code. |
 | `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model. `H3REFMOD_CONTROLNET=0` turns it off. |
+| `P_H3_IMAGE_REFMODS` | `True` | Allow mods on P-H3-Image. `H3REFMOD_IMAGE=0` turns it off. |
 | `FL2VA_PROMPT_LABELS` | `"on"` | Every mod gets its prompt label in FL2VA, as in Ref2VA. `"none"` labels nothing, like the ComfyUI original. |
 | `STABLE_REFMOD_LABELS` | `True` | On windows 2+, picture mods are numbered ahead of the carried-over frame, so their labels match window 1. |
 
 ### Release history
 
+- **0.38.1-fork.50** — **Mods on P-H3-Image.** The panel now appears for
+  *MiniMax H3 P-H3-Image 8-Step 20B* and mods go in as its reference
+  pictures. It shares H3's VAE encoder, so existing mods work unchanged. A
+  video mod becomes one still, a picture stack goes back to being its
+  pictures, and audio — an audio mod, or a visual mod's soundtrack — is left
+  out, since a single frame has nowhere to carry it. The console says so if
+  mods take the picture count past the 8 the model was trained on, a limit
+  Wan2GP's own check cannot see them against. See **Models** above for the
+  prompt wrinkle worth knowing, and `H3REFMOD_IMAGE=0` to turn it off.
+- **0.38.1-fork.49** — **New defaults: fit to output on, phase 1 fit.**
+  A mod bigger than the output costs time for detail the render cannot show,
+  and phase 1 of a two-phase run draws at half the canvas, so a full-size mod
+  there buys nothing. Both are now the defaults, in the panel and for any
+  selection that does not say otherwise (a per-shot `h3_refmod_state` written
+  by hand or by Showrunner, say). Fork.40 had taken Full in phase 1 from
+  g3n3rativ3's 0.42.0; this reverses that. A selection that sets either option
+  keeps its own value, and nothing about already-saved settings files changes
+  except where they left the option unset.
+- **0.38.1-fork.48** — **One switch, and a keyword per mod.**
+  The tick in the panel is now the only place mods are armed for other apps;
+  the Auto-arm tab is read-only (it shows what is saved, with a Refresh), so
+  a stale switch in the tab can no longer overwrite the panel's. Ticking it
+  reveals a **Keyword for <mod>** box beside each armed mod: a mod with
+  keywords waits until the shot's prompt mentions one, so a single saved
+  selection can cover several characters. Blank means every generation, as
+  before. Keywords never travel into the generation itself.
+- **0.38.1-fork.47** — **Arm mods for other apps from the panel itself.**
+  The RefMods panel on the Media Generator page has a new tick, *Also use
+  these for Showrunner, Deepy and API tasks*. With it on, the panel's whole
+  selection is saved for generations that arrive with no mods armed -- every
+  option included: contact sheets, max size, copies, label numbers,
+  soundtracks, fit to output, phase 1 and 2, shrink method. The Auto-arm tab
+  is now a status page for it (what is saved, an off switch, and the words
+  that gate it) rather than a second, simpler mod picker.
+- **0.38.1-fork.46** — **Auto-arm: mods for apps that don't know about them.**
+  A new **Auto-arm** tab. Pick up to four mods, each with a strength and,
+  optionally, words to watch for in the prompt; when a MiniMax H3 generation
+  arrives with no mods armed, those are used. That covers Showrunner shots,
+  Deepy and anything submitted through the API, none of which can pick mods.
+  Your own generations are never touched: a selection in the Media Generator
+  panel, the Generate tab, a queued task or a loaded settings file always
+  wins, and the plugin's own extraction and Library jobs are left alone.
 - **0.38.1-fork.45** — **No requirements.txt, so installing never fails.**
   The plugin needs no packages of its own (everything it uses ships with
   Wan2GP), and the file only held a note saying so. Wan2GP runs

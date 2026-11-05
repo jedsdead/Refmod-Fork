@@ -7,6 +7,7 @@ pipeline uses internally (see models/minimax_h3/pipeline.py's ``_pil_to_video``
 
 from __future__ import annotations
 
+import json
 import os
 from typing import List, Optional, Tuple
 
@@ -44,6 +45,32 @@ def refmods_dir() -> str:
     d = os.path.join(os.getcwd(), *_REFMODS_DIR_REL)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def auto_arm_path() -> str:
+    """fork.46: the Auto-arm tab's picks, beside the mod folders rather than
+    inside one, so they survive a mod folder being emptied."""
+    return os.path.join(os.path.dirname(refmods_dir()), "auto_arm.json")
+
+
+def read_auto_arm() -> dict:
+    """{"on": bool, "rows": [{"mod", "strength", "when"}]} -- empty when unset."""
+    try:
+        with open(auto_arm_path(), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[Refmods] could not read the auto-arm picks ({e!r}); ignoring them")
+        return {}
+
+
+def write_auto_arm(data: dict) -> str:
+    path = auto_arm_path()
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    return path
 
 
 def mod_path(name: str) -> str:

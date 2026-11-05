@@ -164,6 +164,85 @@ def _folder_choices():
     return [ALL_FOLDERS_CHOICE, ROOT_FOLDER_CHOICE] + storage.list_mod_folders()
 
 
+def _armed_row_indexes(row_vals, n_rows) -> list:
+    """Which picker rows are armed, in order -- the same rule _rows_payload
+    uses, so a row lines up with its entry in the payload (fork.48)."""
+    armed = []
+    for index in range(n_rows):
+        name = row_vals[index * ROW_WIDTH]
+        try:
+            strength = float(row_vals[index * ROW_WIDTH + 1])
+        except (TypeError, ValueError):
+            continue
+        if name and name != NONE_CHOICE and strength > 0:
+            armed.append(index)
+    return armed
+
+
+def _mirror_for_other_apps(payload, shared: bool, keywords=()) -> None:
+    """fork.47: keep the panel's selection where the pipeline can find it for
+    a generation that brings none -- Showrunner shots, Deepy, API tasks. The
+    whole payload, so every option the panel sets travels with it. Unticking
+    leaves the copy in place but switched off, so ticking again restores it."""
+    try:
+        saved = storage.read_auto_arm() or {}
+        if shared:
+            rows = payload.get("rows") or []
+            if not rows:
+                return   # an empty panel never wipes what is saved
+            kept = [{**row, **({"when": str(word).strip()} if str(word or "").strip() else {})}
+                    for row, word in zip(rows, list(keywords) + [""] * len(rows))]
+            saved.update({"on": True, "state": {**payload, "rows": kept}})
+            saved.pop("when", None)   # fork.48: keywords are per mod now
+        elif not saved.get("on"):
+            return
+        else:
+            saved["on"] = False
+        storage.write_auto_arm(saved)
+    except Exception as e:
+        print(f"[Refmods] could not save the mods for other apps ({e!r})")
+
+
+def _autoarm_summary(config: dict) -> str:
+    """What other apps would get right now, in words."""
+    state = config.get("state") if isinstance(config, dict) else None
+    rows = (state or {}).get("rows") or []
+    if not rows:
+        return ("*Nothing saved yet.* Pick mods in the panel on the Media Generator page and tick "
+                "*Also use these for Showrunner, Deepy and API tasks*.")
+    parts = []
+    for row in rows:
+        bits = [f"×{float(row.get('strength', 1.0)):.2f}"]
+        if row.get("send_as") == "sheet":
+            bits.append("contact sheet")
+        elif row.get("as_video"):
+            bits.append("as one video")
+        if int(row.get("copies") or 1) > 1:
+            bits.append(f"{int(row['copies'])} copies")
+        if row.get("label"):
+            bits.append(f"<Picture {int(row['label'])}>")
+        if row.get("use_audio") is False:
+            bits.append("no soundtrack")
+        if str(row.get("when") or "").strip():
+            bits.append(f"only when the prompt mentions *{row['when']}*")
+        parts.append(f"**{row.get('mod')}** ({', '.join(bits)})")
+    options = []
+    if state.get("fit_to_output"):
+        options.append("fit to output")
+    if state.get("phase1_mods") == "fit":
+        options.append("phase 1: fit")
+    if state.get("phase2_mods") in ("tile", "off"):
+        options.append("phase 2: " + ("fit to tile" if state["phase2_mods"] == "tile" else "off"))
+    if state.get("shrink_method") == "fast":
+        options.append("shrink: fast")
+    lines = [("**On.** " if config.get("on") else "**Off.** ") + "; ".join(parts)]
+    if options:
+        lines.append("Options: " + " · ".join(options) + ".")
+    if config.get("when"):
+        lines.append(f"Only when the prompt mentions *{config['when']}*.")
+    return "  \n".join(lines)
+
+
 def _mod_choices(kind=None, folder=ALL_FOLDERS_CHOICE):
     """[(none), name, name, ...], optionally restricted to mods of a given
     "image"/"video"/"audio" kind so a slot can only ever offer mods that
@@ -315,7 +394,7 @@ LABEL_MAX = {"image": 20, "video": 9, "audio": 9}
 LABEL_WORDS = {"image": "Picture", "video": "Video", "audio": "Audio"}
 AUTO_LABEL = "auto"
 PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
-PHASE1_MODS_UI = [("Full size", "full"), ("Fit to phase 1", "fit")]   # fork.30; Full is the default since fork.40
+PHASE1_MODS_UI = [("Fit to phase 1", "fit"), ("Full size", "full")]   # fork.30; Fit is the default again since fork.49
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
 
@@ -423,9 +502,9 @@ def _panel_restore_updates(raw):
                 payload.get("stack_pictures_n", encframes.STACK_DEFAULT_N),
                 payload.get("video_frames", encframes.STACK_UP_TO_N),
                 payload.get("video_frames_n", encframes.MAX_CLIP_FRAMES_SHOWN),
-                bool(payload.get("fit_to_output", False)), payload.get("phase2_mods", "full"),
+                bool(payload.get("fit_to_output", True)), payload.get("phase2_mods", "full"),
                 payload.get("shrink_method", "reencode"), payload.get("window_mode", WINDOW_MODE_DEFAULT),
-                payload.get("phase1_mods", "full")]
+                payload.get("phase1_mods", "fit")]
     restored = sum(len(v) for v in slots.values())
     status = (f"↺ {restored} RefMod(s) restored from the loaded settings." if restored
               else "*No RefMods selected.*")
@@ -552,8 +631,8 @@ def _is_picture_mod(meta):
 
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
-                   fit_to_output=False, phase2_mods="full", shrink_method="reencode",
-                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="full"):
+                   fit_to_output=True, phase2_mods="full", shrink_method="reencode",
+                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="fit"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown, plus the
@@ -575,7 +654,7 @@ def _stack_payload(stack_mode, stack_n,
             # "Mods in phase 2": full / tile / off.
             "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
             # "Mods in phase 1": fit / full (fork.30).
-            "phase1_mods": phase1_mods if phase1_mods in ("fit", "full") else "full",
+            "phase1_mods": phase1_mods if phase1_mods in ("fit", "full") else "fit",
             # "Shrink method": reencode / fast.
             "shrink_method": shrink_method if shrink_method in ("reencode", "fast") else "reencode",
             # "Video mods on sliding windows 2, 3, ...": still / full / first.
@@ -1028,7 +1107,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.38.1-fork.45"
+        self.version = "0.38.1-fork.49"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -1165,23 +1244,53 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             with gr.Row():
                 status = gr.Markdown("*No RefMods selected.*")
                 clear_btn = gr.Button("Clear RefMods", size="sm", scale=0)
+            saved_arm = storage.read_auto_arm() or {}   # fork.47
+            share = gr.Checkbox(
+                bool(saved_arm.get("on")),
+                label="Also use these for Showrunner, Deepy and API tasks",
+                info="They can't pick mods themselves, so these are used whenever a generation "
+                     "brings none. Every option set here comes with them.")
+            # fork.48: a keyword box per armed mod, shown once the box above is
+            # ticked. A mod with keywords waits until the prompt mentions one,
+            # which is how one saved selection covers several characters.
+            saved_rows = (saved_arm.get("state") or {}).get("rows") or []
+            keyword_boxes = []
+            for index in range(len(mod_rows)):
+                keyword_boxes.append(gr.Textbox(
+                    value=str(saved_rows[index].get("when") or "") if index < len(saved_rows) else "",
+                    label="", visible=False, scale=1,
+                    info="Commas for several. Blank = every generation."))
 
         widgets = [c for row in mod_rows for c in row] + list(panel_controls)
 
         def apply_selection(state, *vals):
             n_rows = IMAGE_ROWS + VIDEO_ROWS + AUDIO_ROWS
-            rows = _rows_payload(vals[:n_rows * ROW_WIDTH])
+            row_vals = vals[:n_rows * ROW_WIDTH]
+            rows = _rows_payload(row_vals)
             payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
                        **_stack_payload(*vals[n_rows * ROW_WIDTH:n_rows * ROW_WIDTH + STACK_CONTROLS])}
+            extras = vals[n_rows * ROW_WIDTH + STACK_CONTROLS:]   # fork.47: the "also use these" box
+            shared = bool(extras[0]) if extras else False
+            keywords = list(extras[1:1 + n_rows])                  # fork.48: one per picker row
+            armed = _armed_row_indexes(row_vals, n_rows)
+            _mirror_for_other_apps(payload, shared, [keywords[i] if i < len(keywords) else ""
+                                                     for i in armed])
+            boxes = []
+            for index in range(n_rows):
+                name = row_vals[index * ROW_WIDTH]
+                boxes.append(gr.update(visible=shared and index in armed,
+                                       label=f"Keyword for {name}" if index in armed else ""))
             if not isinstance(state, dict):
-                return state, "⚠️ Could not access session state -- try reloading the page."
+                return [state, "⚠️ Could not access session state -- try reloading the page."] + boxes
             if rows:
                 state[STASH_KEY] = json.dumps(payload)
                 msg = f"✅ {len(rows)} RefMod(s) armed for the next MiniMax H3 generation from this page."
+                if shared:
+                    msg += " Showrunner, Deepy and API tasks use them too."
             else:
                 state.pop(STASH_KEY, None)
                 msg = "*No RefMods selected.*"
-            return state, msg
+            return [state, msg] + boxes
 
         def clear_selection(state):
             # Fork: empties the slots as well, so the panel never shows mods
@@ -1217,8 +1326,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         # One handler for every widget (gr.on), not one per widget: each takes
         # every widget as input, and Gradio's first page load does work for
         # every handler x input (see _hidden_from_api).
-        gr.on(triggers=[w.change for w in widgets], fn=apply_selection,
-              inputs=[self.state] + widgets, outputs=[self.state, status], queue=False)
+        gr.on(triggers=[w.change for w in widgets + [share] + keyword_boxes], fn=apply_selection,
+              inputs=[self.state] + widgets + [share] + keyword_boxes,
+              outputs=[self.state, status] + keyword_boxes, queue=False)
 
         if target is not None:
             get_base_mt = getattr(self, "get_base_model_type", None)
@@ -1388,7 +1498,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                     maximum=256, label="N", scale=1)
         with gr.Row():
             fit_to_output = gr.Checkbox(
-                False, label="Fit mods to the output size (faster)", scale=2,
+                True, label="Fit mods to the output size (faster)", scale=2,
                 info="Shrink mods larger than the output. Less detail.")
             shrink_method = gr.Dropdown(
                 choices=SHRINK_METHOD_UI, value="reencode", label="Shrink method", scale=1,
@@ -1396,7 +1506,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Row():
             # fork.30: two-phase runs only.
             phase1_mods = gr.Dropdown(
-                choices=PHASE1_MODS_UI, value="full", label="Mods in phase 1 (two-phase)", scale=1,
+                choices=PHASE1_MODS_UI, value="fit", label="Mods in phase 1 (two-phase)", scale=1,
                 info="Fit: shrink to phase 1's half canvas, if phase 1 gets slow.")
             phase2_mods = gr.Dropdown(
                 choices=PHASE2_MODS_UI, value="full", label="Mods in phase 2 (two-phase)", scale=1,
@@ -2325,6 +2435,22 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                             outputs=[decompile_status, out_gallery, out_video, out_audio],
                             queue=False)
 
+    @_hidden_from_api
+    def _build_autoarm_section(self):
+        """fork.48: what other apps would get, read-only. Everything is set in
+        the panel on the Media Generator page -- one place, one switch."""
+        gr.Markdown("### Mods for Showrunner, Deepy and API tasks\n"
+                    "Those can't pick mods themselves, so a MiniMax H3 generation that arrives with "
+                    "none armed uses the selection below. It is set in the **Refmods: MiniMax H3** "
+                    "panel on the Media Generator page: arm mods there and tick *Also use these for "
+                    "Showrunner, Deepy and API tasks*. Every option set there comes with them, and a "
+                    "mod given a keyword waits until the prompt mentions it. Your own generations are "
+                    "never affected.")
+        current = gr.Markdown(_autoarm_summary(storage.read_auto_arm() or {}))
+        refresh_btn = gr.Button("🔄 Refresh", size="sm", scale=0)
+        refresh_btn.click(fn=lambda: _autoarm_summary(storage.read_auto_arm() or {}),
+                          inputs=None, outputs=[current], queue=False)
+
     def _build_generate_section(self, api_session, model_dd):
         gr.Markdown(
             "**Tip:** the **Media Generator** tab has every option, and RefMods are there too under *Refmods: MiniMax H3*.")
@@ -2518,4 +2644,6 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     self._build_decompile_section(api_session, model_dd)
                 with gr.Tab("Generate"):
                     self._build_generate_section(api_session, model_dd)
+                with gr.Tab("Auto-arm"):   # fork.46
+                    self._build_autoarm_section()
         return root

@@ -207,23 +207,58 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 # problem (same variables as g3n3rativ3's 0.42.0):
 #   set H3REFMOD_FL2VA=0        -> mods only on Ref2VA
 #   set H3REFMOD_CONTROLNET=0   -> FL2VA yes, the FL2VA ControlNet model no
+#   set H3REFMOD_IMAGE=0        -> no mods on P-H3-Image (fork.50)
 def _env_on(name: str) -> bool:
     return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off", "no")
 
 
 FL2VA_REFMODS = _env_on("H3REFMOD_FL2VA")
 CONTROLNET_REFMODS = _env_on("H3REFMOD_CONTROLNET")
+P_H3_IMAGE_REFMODS = _env_on("H3REFMOD_IMAGE")
+
+# fork.50: P-H3-Image's own limit on reference pictures. Wan2GP checks it
+# against the form's pictures only, so mods go past it unnoticed -- see
+# _warn_image_reference_cap.
+P_H3_IMAGE_ARCHITECTURE = "minimax_h3_image"
+P_H3_IMAGE_MAX_IMAGES = 8
 
 
 def _fl2va_family_prefixes():
     return ("minimax_h3_fl2va",) + (("minimax_h3_control",) if CONTROLNET_REFMODS else ())
 
 
+def _resolved_architecture(model_type, get_base_model_type_fn) -> str:
+    """``model_def["architecture"]`` where Wan2GP can resolve it (a finetune's
+    own name is not its architecture), else the model type as given."""
+    model_type = str(model_type or "")
+    if callable(get_base_model_type_fn):
+        try:
+            base = get_base_model_type_fn(model_type)
+            if base:
+                return str(base)
+        except Exception:
+            pass
+    return model_type
+
+
+def is_p_h3_image(model_type, get_base_model_type_fn=None) -> bool:
+    """fork.50: P-H3-Image, Pruna's still-image model. It runs on FL2VA's
+    transformer but, unlike FL2VA, has reference inputs of its own (the
+    pipeline is built with reference_mode=True), so mods travel the ordinary
+    Ref2VA route rather than the FL2VA one -- the same VAE encoder means an
+    existing mod is already a valid latent for it."""
+    if not P_H3_IMAGE_REFMODS:
+        return False
+    return _resolved_architecture(model_type, get_base_model_type_fn) == P_H3_IMAGE_ARCHITECTURE
+
+
 def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
     """Models RefMods can be used with: Ref2VA, plus (fork) FL2VA, its
-    finetunes and the FL2VA ControlNet model. Resolves finetunes to their
-    architecture exactly as is_minimax_h3_ref2va does."""
+    finetunes, the FL2VA ControlNet model and P-H3-Image. Resolves finetunes
+    to their architecture exactly as is_minimax_h3_ref2va does."""
     if is_minimax_h3_ref2va(model_type, get_base_model_type_fn):
+        return True
+    if is_p_h3_image(model_type, get_base_model_type_fn):
         return True
     model_type = str(model_type or "")
     if not FL2VA_REFMODS or not model_type:
@@ -1007,6 +1042,12 @@ def install_patches() -> Optional[str]:
                         pass
             return None  # graceful no-output outcome, same as a user-initiated abort
 
+        # fork.46: nothing armed -> the Auto-arm tab's picks, if it has any.
+        # Only when the generation brought none: anything armed in the panel,
+        # a queued task or a settings file always wins.
+        if not state_json:
+            state_json = _auto_arm_state(args[0] if args else kwargs.get("input_prompt")) or state_json
+
         # Fresh bookkeeping for this call -- every generate() (and every
         # sliding window, each of which is its own call) starts at phase 1.
         state = _reset_gen_state(self)
@@ -1324,6 +1365,7 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
     # in the order of the labels picked in the panel. A group is
     # [wanted label number or None, display name, [sentinels]].
     image_groups, video_groups, audio_groups = [], [], []
+    audio_group_tokens = []   # fork.50: what each audio group costs, if it has to be dropped
     total_tokens = 0
     for mod, strength, copies, row in loaded_rows:
         eff = max(0.0, min(2.0, strength * retention))
@@ -1413,6 +1455,7 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
             # whole thing -- so an audio mod always gets one.
             sentinel.enc = {"type": "audio"} if PROMPT_LABELS_FOR_REFMODS else None
             audio_groups.append([want, mod.name, [_named(sentinel, mod.name, want)]])
+            audio_group_tokens.append(mod.token_count)
 
         if image_sentinels:
             image_groups.append([want, mod.name, [_named(s, mod.name, want) for s in image_sentinels]])
@@ -1428,10 +1471,23 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
                 audio_want = _row_label(row, "audio_label")
                 audio_groups.append([audio_want, mod.name + " (soundtrack)",
                                      [_named(soundtrack, mod.name + " (soundtrack)", audio_want)]])
+                audio_group_tokens.append(int(mod.audio_latent.shape[-1]) * 2)
                 _log(f"'{mod.name}' carries a soundtrack (~{mod.audio_latent.shape[-1] / AUDIO_LATENTS_PER_SECOND:.1f}s) "
                      f"-- injected as its own <Audio N> reference")
             else:
                 _log(f"'{mod.name}': soundtrack left out (Include audio unticked)")
+
+    # fork.50: a still output has no soundtrack, so an <Audio N> row has
+    # nowhere to go -- it would only spend reference tokens and give the text
+    # encoder a label pointing at nothing. Audio mods and visual mods'
+    # soundtracks are both dropped here; the pictures of the same selection
+    # still go in.
+    if image_output and audio_groups:
+        dropped = ", ".join(name for _want, name, _sentinels in audio_groups)
+        _log(f"image output mode: {len(audio_groups)} audio reference(s) left out ({dropped}) "
+             f"-- a single-frame output carries no audio.")
+        total_tokens = max(0, total_tokens - sum(audio_group_tokens))
+        audio_groups = []
 
     if not image_groups and not video_groups and not audio_groups:
         return None
@@ -1529,13 +1585,87 @@ def _order_by_label(groups, offset, kind):
     return ordered
 
 
+def _auto_arm_state(prompt) -> Optional[str]:
+    """fork.46: the Auto-arm tab's selection, as a selection payload, for a
+    generation that brought none of its own -- Showrunner shots, Deepy and
+    API tasks, none of which know about mods. Words in "when" hold the whole
+    selection back unless the prompt mentions one of them. None when nothing
+    applies."""
+    try:
+        config = storage.read_auto_arm()
+    except Exception:
+        return None
+    if not config.get("on"):
+        return None
+    text = str(prompt or "").casefold()
+    words = [word.strip().casefold() for word in str(config.get("when") or "").split(",") if word.strip()]
+    if words and not any(word in text for word in words):
+        return None
+    # fork.47: the panel's own selection, mirrored whole -- every option it
+    # sets (contact sheets, max size, copies, labels, phase 1 / 2, fit to
+    # output, shrink method, retention) comes along, not just mod + strength.
+    state = config.get("state")
+    if isinstance(state, dict) and (state.get("rows") or []):
+        live, held, gone = [], [], []
+        for row in state["rows"]:
+            name = row.get("mod")
+            if not name:
+                continue
+            # fork.48: each mod carries its own keyword(s), set beside it in the
+            # panel. A mod with keywords waits until the prompt mentions one.
+            keywords = [word.strip().casefold() for word in str(row.get("when") or "").split(",")
+                        if word.strip()]
+            if keywords and not any(word in text for word in keywords):
+                held.append(name)
+                continue
+            if not os.path.isfile(storage.mod_path(name) + ".safetensors"):
+                gone.append(name)
+                continue
+            live.append({key: value for key, value in row.items() if key != "when"})
+        for name in gone:
+            _log(f"auto-arm: no mod named {name!r} any more -- skipping it")
+        if not live:
+            if held:
+                _log("auto-arm: nothing armed -- this prompt mentions none of the keywords set for "
+                     + ", ".join(sorted(set(held))))
+            return None
+        _log("auto-armed from the panel (this generation brought no mods of its own): "
+             + "; ".join(f"{row['mod']} x{float(row.get('strength', 1.0)):.2f}" for row in live)
+             + (f" -- held back: {', '.join(sorted(set(held)))}" if held else ""))
+        return json.dumps({**state, "rows": live})
+    rows, skipped = [], []
+    for row in config.get("rows") or []:
+        name = row.get("mod")
+        if not name:
+            continue
+        words = [word.strip().casefold() for word in str(row.get("when") or "").split(",") if word.strip()]
+        if words and not any(word in text for word in words):
+            continue
+        if not os.path.isfile(storage.mod_path(name) + ".safetensors"):
+            skipped.append(name)
+            continue
+        try:
+            strength = float(row.get("strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        if strength > 0:
+            rows.append({"mod": name, "strength": strength})
+    for name in skipped:
+        _log(f"auto-arm: no mod named {name!r} any more -- skipping it")
+    if not rows:
+        return None
+    _log("auto-armed (this generation brought no mods of its own): "
+         + "; ".join(f"{row['mod']} x{row['strength']:.2f}" for row in rows))
+    return json.dumps({"rows": rows})
+
+
 def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     window_no = kwargs.get("window_no")
     later_window = isinstance(window_no, int) and window_no > 1
     stable = STABLE_REFMOD_LABELS and not kwargs.get("input_ref_images")
     built = _build_refmod_sentinels(
         pipeline_self, state_json, window_no,
-        image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False),
+        image_output=_image_output(pipeline_self, kwargs),
         offsets=_label_offsets(kwargs, later_window, stable, ref2va=True))
     if built is None:
         return kwargs
@@ -1562,6 +1692,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         if stable:
             for sentinel in image_sentinels:   # fork: see STABLE_REFMOD_LABELS
                 sentinel.label_first = "keep" if later_window else "record"
+        _warn_image_reference_cap(pipeline_self, kwargs, len(image_sentinels))
 
     native_videos = []
     if video_sentinels:
@@ -1788,6 +1919,38 @@ def _continues_video(kwargs) -> bool:
                 and kwargs.get("image_start") is None and int(kwargs.get("image_mode") or 0) == 0)
     except (TypeError, ValueError):
         return False
+
+
+def _image_output(pipeline_self, kwargs) -> bool:
+    """True when this render's output is a single frame, which is what decides
+    whether a reference video or a soundtrack has anywhere to go. Matches
+    Wan2GP's own ``image_outputs = image_mode > 0 and not self.audio_only``,
+    and (fork.50) treats an image model as a still output even if nothing
+    passed image_mode."""
+    try:
+        image_mode = int(kwargs.get("image_mode") or 0) > 0
+    except (TypeError, ValueError):
+        image_mode = False
+    return ((image_mode or bool(getattr(pipeline_self, "image_model", False)))
+            and not getattr(pipeline_self, "audio_only", False))
+
+
+def _warn_image_reference_cap(pipeline_self, kwargs, added) -> None:
+    """fork.50: P-H3-Image edits with at most 8 pictures, and Wan2GP's
+    pre-flight check counts only the form's own -- mods are added much later,
+    inside this plugin's generate(), so they slip past it. Nothing refuses
+    them here (the pipeline itself has no cap, and a run that works should not
+    be stopped), but each render that goes over says so rather than let a weak
+    result go unexplained."""
+    if not getattr(pipeline_self, "image_model", False) or added <= 0:
+        return
+    total = len(kwargs.get("input_ref_images") or [])
+    if total <= P_H3_IMAGE_MAX_IMAGES:
+        return
+    _log(f"warning: this render has {total} reference pictures ({total - added} of its own "
+         f"plus {added} from mods) and P-H3-Image was trained on at most "
+         f"{P_H3_IMAGE_MAX_IMAGES}. It will still run; drop a mod, or send a multi-picture "
+         f"mod as one contact sheet, if the result is poor.")
 
 
 def _label_offsets(kwargs, later_window, stable, ref2va):
@@ -2372,7 +2535,9 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
                  and kwargs.get("frozen_control_video") is None)
     pipeline_self._h3_two_phase = two_phase
     pipeline_self._h3_out_size = (kwargs.get("width"), kwargs.get("height"))
-    pipeline_self._h3_fit_output = bool(_state_option(state_json, "fit_to_output", False))
+    # fork.49: on by default -- a mod bigger than the output costs time for
+    # detail the render cannot show. A selection that sets it keeps its own.
+    pipeline_self._h3_fit_output = bool(_state_option(state_json, "fit_to_output", True))
     pipeline_self._h3_shrink_fast = _state_option(state_json, "shrink_method", SHRINK_REENCODE,
                                                   (SHRINK_REENCODE, SHRINK_FAST)) == SHRINK_FAST
     pipeline_self._h3_tiled_p2 = two_phase and _tiling_flag() in str(kwargs.get("video_prompt_type") or "")
@@ -2380,9 +2545,11 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
                              (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF))
                if two_phase else PHASE2_MODS_FULL)
     pipeline_self._h3_p2_mode = p2_mode
-    # fork.40: Full size is the default (as in g3n3rativ3's 0.42.0).
+    # fork.49: Fit is the default again (fork.40 took Full from g3n3rativ3's
+    # 0.42.0). Phase 1 renders at half the canvas, so a full-size mod there
+    # buys detail that phase 1 cannot use.
     pipeline_self._h3_p1_full = two_phase and _state_option(
-        state_json, "phase1_mods", PHASE1_MODS_FULL, (PHASE1_MODS_FIT, PHASE1_MODS_FULL)) == PHASE1_MODS_FULL
+        state_json, "phase1_mods", PHASE1_MODS_FIT, (PHASE1_MODS_FIT, PHASE1_MODS_FULL)) == PHASE1_MODS_FULL
     p2_off = p2_mode == PHASE2_MODS_OFF
     if p2_off and not fl2va and _has_live_visual_refs(kwargs):
         # Ref2VA lines phase 2's references up with phase 1's by position;
@@ -2466,7 +2633,7 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
     later_window = isinstance(window_no, int) and window_no > 1
     built = _build_refmod_sentinels(
         pipeline_self, state_json, window_no,
-        image_output=int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False),
+        image_output=_image_output(pipeline_self, kwargs),
         visual_labels=visual_labels,
         offsets=_label_offsets(kwargs, later_window, STABLE_REFMOD_LABELS, ref2va=False))
     if built is None:
