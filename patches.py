@@ -1477,17 +1477,29 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
             else:
                 _log(f"'{mod.name}': soundtrack left out (Include audio unticked)")
 
-    # fork.50: a still output has no soundtrack, so an <Audio N> row has
-    # nowhere to go -- it would only spend reference tokens and give the text
-    # encoder a label pointing at nothing. Audio mods and visual mods'
-    # soundtracks are both dropped here; the pictures of the same selection
-    # still go in.
-    if image_output and audio_groups:
-        dropped = ", ".join(name for _want, name, _sentinels in audio_groups)
-        _log(f"image output mode: {len(audio_groups)} audio reference(s) left out ({dropped}) "
-             f"-- a single-frame output carries no audio.")
-        total_tokens = max(0, total_tokens - sum(audio_group_tokens))
-        audio_groups = []
+    # fork.50/51: two reasons an audio reference has nowhere to go. Without an
+    # audio VAE it cannot even be encoded, so sending one would stop the
+    # generation; and on a still output it would spend reference tokens and
+    # give the text encoder a label pointing at nothing. Audio mods and
+    # visual mods' soundtracks go the same way, and the pictures and videos of
+    # the same selection are unaffected.
+    if audio_groups:
+        # fork.51: the pipeline, not the model name, which a finetune can
+        # change -- P-H3-Image is built with audio_vae=None
+        # (minimax_h3_main.model_factory), and _encode_audio would raise on
+        # it. Taken from g3n3rativ3's 0.43.0 (see Credits).
+        reason = None
+        if getattr(pipeline_self, "audio_vae", None) is None:
+            reason = ("this model has no audio VAE, so an audio reference would stop the "
+                      "generation")
+        elif image_output:
+            reason = "a single-frame output carries no audio"
+        if reason:
+            dropped = ", ".join(name for _want, name, _sentinels in audio_groups)
+            _log(f"{len(audio_groups)} audio reference(s) left out ({dropped}) -- {reason}. "
+                 f"Picture and video mods are unaffected.")
+            total_tokens = max(0, total_tokens - sum(audio_group_tokens))
+            audio_groups = []
 
     if not image_groups and not video_groups and not audio_groups:
         return None

@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.50** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.51** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -30,10 +30,12 @@ and the ComfyUI packs.
   -- the RefMod idea and file format: a reference encoded once and reused.
 - **g3n3rativ3** ([MiniMaxH3Mod-for-WanGP](https://github.com/g3n3rativ3/MiniMaxH3Mod-for-WanGP))
   -- the Wan2GP port this fork is built on (0.38.1). From its later releases
-  (0.42.0) this fork has taken the fix for the pipeline being kept in memory
-  after a generation, the idea of an FL2VA row check, the
+  this fork has taken: from 0.42.0, the fix for the pipeline being kept in
+  memory after a generation, the idea of an FL2VA row check, the
   `H3REFMOD_FL2VA` / `H3REFMOD_CONTROLNET` switches, and *Full size* as the
-  default for *Mods in phase 1* (with its measurements behind it).
+  default for *Mods in phase 1* (with its measurements behind it); from
+  0.43.0, asking the pipeline whether it has an audio VAE before sending it an
+  audio reference (fork.51).
 - **malcolmrey** ([ComfyUI-Flux2Klein9Mod](https://github.com/malcolmamal/ComfyUI-Flux2Klein9Mod))
   -- the Flux 2 / Klein RefMod file layout, which this fork's Flux mods use so
   they move between the two.
@@ -81,9 +83,10 @@ what the fork adds.
   - **Video and audio mods.** A video mod becomes one still per mod (its
     first frame); a picture stack sent as one video goes back to being all of
     its pictures. Audio mods, and the *Include audio* soundtrack of a
-    picture or video mod, are left out — a single frame has no soundtrack, so
-    an `<Audio N>` label would point at nothing. The console says which were
-    dropped.
+    picture or video mod, are left out — this model is built without an audio
+    VAE, so an audio reference cannot be encoded at all, and a single frame
+    has no soundtrack to carry one anyway. The console says which were
+    dropped and why.
   - **Size.** The model is single-phase, so the phase options do nothing and
     *Fit mods to the output size* never grows a mod towards an 8 MP canvas
     (fit only ever shrinks). Mods go in at their own size under their row's
@@ -193,6 +196,15 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.51** — **An audio mod is left out of any model that cannot
+  encode one.** Fork.50 dropped audio mods and soundtracks when the output was
+  a still, which covers P-H3-Image. This asks the loaded pipeline whether it
+  has an audio VAE at all, which is the reason the reference would fail rather
+  than merely be useless: P-H3-Image is built with `audio_vae=None`, so an
+  audio reference would stop the generation outright. The console says which
+  reason applied. The idea is from g3n3rativ3's 0.43.0 (see Credits); the
+  still-output rule stays alongside it, so audio is still left out of FL2VA
+  image mode, which does have an audio VAE.
 - **0.38.1-fork.50** — **Mods on P-H3-Image.** The panel now appears for
   *MiniMax H3 P-H3-Image 8-Step 20B* and mods go in as its reference
   pictures. It shares H3's VAE encoder, so existing mods work unchanged. A
