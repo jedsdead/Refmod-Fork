@@ -783,9 +783,17 @@ def install_patches() -> Optional[str]:
         pass
     _orig_as_video = getattr(h3_pipeline, "_as_video", None)
 
+    # fork.52: every wrapper below takes *args/**kwargs and passes them on.
+    # Wan2GP adds parameters to these methods between releases -- 19.27 gave
+    # _add_video_reference a `latent=` (the phase-1 draft's, so phase 2 need
+    # not re-encode it) -- and a wrapper with a fixed signature turns that
+    # into a TypeError at the caller, which is a crash and not a fallback. A
+    # RefMod sentinel never arrives with extras of its own, so the sentinel
+    # branches ignore them and only the pass-through carries them.
     @functools.wraps(_orig_add_image_reference)
     def patched_add_image_reference(self, image, target_width, target_height,
-                                     image_refs_relative_size, presentation, visual_latents, refs):
+                                     image_refs_relative_size, presentation, visual_latents, refs,
+                                     *extra, **extra_kwargs):
         if isinstance(image, _RefModImageSentinel):
             latent = (_fit_phase_1(self, image, "image", image.latent, target_width, target_height,
                                    image_refs_relative_size)
@@ -827,10 +835,12 @@ def install_patches() -> Optional[str]:
             return
         _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
-                                          image_refs_relative_size, presentation, visual_latents, refs)
+                                          image_refs_relative_size, presentation, visual_latents, refs,
+                                          *extra, **extra_kwargs)
 
     @functools.wraps(_orig_add_video_reference)
-    def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
+    def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents,
+                                    audio_latents, refs, *extra, **extra_kwargs):
         if isinstance(video, _RefModImageSentinel):
             # Symmetric guard: a still RefMod on the video path is simply a
             # one-frame clip, which is a valid video latent.
@@ -854,11 +864,12 @@ def install_patches() -> Optional[str]:
                                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
             return
         _note_refs(self, refs)
-        return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs)
+        return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents,
+                                         audio_latents, refs, *extra, **extra_kwargs)
 
     if _orig_add_audio_reference is not None and _orig_load_audio_reference is not None:
         @functools.wraps(_orig_load_audio_reference)
-        def patched_load_audio_reference(self, path):
+        def patched_load_audio_reference(self, path, *extra, **extra_kwargs):
             # generate() calls self._load_audio_reference(audio_guide) inline,
             # *before* _add_audio_reference (which is the only place that
             # recognizes a RefMod sentinel) ever sees it -- the original does a
@@ -866,11 +877,12 @@ def install_patches() -> Optional[str]:
             # exactly the same problem _as_video patch solves for video.
             if isinstance(path, _RefModAudioSentinel):
                 return path
-            return _orig_load_audio_reference(self, path)
+            return _orig_load_audio_reference(self, path, *extra, **extra_kwargs)
         Pipeline._load_audio_reference = patched_load_audio_reference
 
         @functools.wraps(_orig_add_audio_reference)
-        def patched_add_audio_reference(self, waveform, presentation, audio_latents, refs):
+        def patched_add_audio_reference(self, waveform, presentation, audio_latents, refs,
+                                        *extra, **extra_kwargs):
             if isinstance(waveform, _RefModAudioSentinel):
                 latent = waveform.latent
                 _present_refmod(presentation, waveform)
@@ -879,7 +891,8 @@ def install_patches() -> Optional[str]:
                                   {"kind": "audio", "ref_audio_t": latent.shape[-1]})
                 return
             _note_refs(self, refs)
-            return _orig_add_audio_reference(self, waveform, presentation, audio_latents, refs)
+            return _orig_add_audio_reference(self, waveform, presentation, audio_latents, refs,
+                                             *extra, **extra_kwargs)
         Pipeline._add_audio_reference = patched_add_audio_reference
     else:
         _log("could not find _add_audio_reference / _load_audio_reference on MiniMaxH3Pipeline "
@@ -902,7 +915,7 @@ def install_patches() -> Optional[str]:
     _orig_prepare_audio_references = getattr(Pipeline, "_prepare_audio_references", None)
     if _orig_prepare_audio_references is not None:
         @functools.wraps(_orig_prepare_audio_references)
-        def patched_prepare_audio_references(self, sources):
+        def patched_prepare_audio_references(self, sources, *extra, **extra_kwargs):
             # Newer Wan2GP builds route every audio reference through this
             # function *before* _add_audio_reference ever sees it. It computes
             # a shared 15s duration budget across all sources up front
@@ -920,6 +933,18 @@ def install_patches() -> Optional[str]:
             # sentinel so _add_audio_reference downstream still recognizes it.
             # Every non-sentinel source is delegated to the untouched original
             # per-source logic, unchanged.
+            #
+            # fork.52: this one replicates the original rather than calling it,
+            # so an argument Wan2GP adds here would be accepted and then
+            # quietly ignored -- say so once instead, since the replica has
+            # then fallen behind.
+            if (extra or extra_kwargs) and not getattr(patched_prepare_audio_references, "_warned_extra", False):
+                patched_prepare_audio_references._warned_extra = True
+                _log(f"this Wan2GP passes _prepare_audio_references "
+                     f"{len(extra) + len(extra_kwargs)} argument(s) this plugin does not know about "
+                     f"({', '.join(list(extra_kwargs) or ['positional'])}); audio RefMods still work, "
+                     f"but please report this line -- the plugin's copy of that function needs "
+                     f"updating.")
             import soundfile as sf
 
             sources = [source for source in sources if source is not None]
@@ -1138,9 +1163,11 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
     if getattr(install_prepare_inputs_dict_patch, _PREPARE_INPUTS_PATCH_MARKER, False):
         return None
 
-    def patched_prepare_inputs_dict(target, inputs, model_type=None, model_filename=None):
+    def patched_prepare_inputs_dict(target, inputs, model_type=None, model_filename=None,
+                                    *extra, **extra_kwargs):
         state = inputs.get("state") if isinstance(inputs, dict) else None
-        result = orig_prepare_inputs_dict(target, inputs, model_type, model_filename)
+        result = orig_prepare_inputs_dict(target, inputs, model_type, model_filename,
+                                          *extra, **extra_kwargs)
         try:
             # fork.34: an output's metadata keeps the task's own selection --
             # the panel may have changed while the task waited in the queue.
@@ -1263,8 +1290,8 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
     if getattr(install_get_model_settings_patch, _GET_MODEL_SETTINGS_PATCH_MARKER, False):
         return None
 
-    def patched_get_model_settings(state, model_type):
-        settings = orig_get_model_settings(state, model_type)
+    def patched_get_model_settings(state, model_type, *extra, **extra_kwargs):
+        settings = orig_get_model_settings(state, model_type, *extra, **extra_kwargs)
         try:
             if (isinstance(settings, dict) and isinstance(state, dict)
                     and is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn)):

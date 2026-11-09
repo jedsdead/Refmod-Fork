@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.51** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.52** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -196,6 +196,17 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.52** — **Wan2GP 19.27 compatibility.** 19.27 gave
+  `_add_video_reference` a `latent=` argument (the phase-1 draft's, so phase 2
+  need not re-encode it). This plugin wraps that method, and its wrapper had a
+  fixed signature, so the new argument raised
+  `TypeError: _add_video_reference() got an unexpected keyword argument
+  'latent'` at the caller — a crash rather than a fallback, on any two-phase
+  run. Every wrapper around a Wan2GP method now takes `*args`/`**kwargs` and
+  passes them on, so the next parameter added upstream travels through instead
+  of stopping the render. `_prepare_audio_references` is the one the plugin
+  replicates rather than calls, so there an unknown argument is reported once
+  in the console instead of being silently dropped.
 - **0.38.1-fork.51** — **An audio mod is left out of any model that cannot
   encode one.** Fork.50 dropped audio mods and soundtracks when the output was
   a still, which covers P-H3-Image. This asks the loaded pipeline whether it
