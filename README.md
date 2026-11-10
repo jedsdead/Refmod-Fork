@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.53** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.54** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -196,6 +196,41 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.54** — **Mods beside the Regenerate 2K IC draft** — a new
+  *Mods in phase 2* choice, **Full + the Regenerate 2K IC draft**.
+
+  Open-H3-Regenerate-2K-IC turns phase 2 into a Ref2VA task: the phase-1 draft
+  becomes the only reference, named `<Video 1>`, under a fixed instruction to
+  enhance it and change nothing else. To do that Wan2GP skips the branch that
+  re-adds the generation's own references at the phase-2 size — the branch
+  this plugin's hooks sit on — so on an IC run the mods were not in phase 2 at
+  all, whatever *Mods in phase 2* said. Pick the new choice and they are: each
+  armed visual mod goes in behind the draft, re-weighted from the mod itself
+  (weighting blends toward a blurred copy, so a second strength cannot be
+  applied to an already-weighted latent) and sized for the phase-2 canvas.
+  **Mod strength beside the IC draft** multiplies each row's own strength, for
+  when the draft — a whole scene — and a mod — one subject — need balancing.
+
+  This suits mods better than the old Regenerate 2K, which had nothing in
+  context at all: the upscaled latent was the only carrier of identity and the
+  LoRA was free to redraw a face. Under IC the labels also line up by
+  themselves, because H3 numbers each kind separately: the draft takes
+  `<Video 1>` and a picture mod keeps the `<Picture N>` it had in phase 1, so
+  nothing in the prompt has to change. A *video* mod shifts to `<Video 2>`,
+  since the draft is now the first video.
+
+  Two things it does not do. Audio mods stay out, which is correct: under IC
+  the reference audio goes away with the references and phase 1's audio is
+  frozen as conditioning, so a voice has nothing to do in phase 2. And a
+  **tiled** phase 2 is not covered — Wan2GP rebuilds the reference for each
+  tile from the draft alone, cropped to that tile, and anything added after it
+  is dropped there; the console says so rather than letting it look as though
+  it worked. Turn phase-2 spatial tiling off to use this.
+
+  Worth treating as an experiment: the IC LoRA was trained with one reference,
+  and whether its "enhance this video" bias leaves room for identity transfer
+  from a second one is a question only a comparison can answer. Render the
+  same seed with the choice on and off.
 - **0.38.1-fork.53** — **Updating from inside WanGP works again.** The code is
   fork.52's, unchanged; this release exists because fork.52 reached the
   repository with a `__pycache__` folder alongside it — 20 compiled `.pyc` and
