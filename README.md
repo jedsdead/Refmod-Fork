@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.54** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.55** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -71,12 +71,14 @@ what the fork adds.
   vary more than in Ref2VA.
 - **FL2VA ControlNet-Union.** Its control rows are padded for the mods, which
   would otherwise stop the run with a row-count mismatch.
-- **P-H3-Image** (fork.50) — *MiniMax H3 P-H3-Image 8-Step 20B*, Pruna's
-  still-image model. It runs on FL2VA's transformer but, unlike FL2VA, has
-  reference pictures of its own, so mods travel the ordinary Ref2VA route and
-  use the same encoder your existing mods were made with: no new mod format,
-  nothing to convert. Your own pictures keep `<Picture 1>`, `<Picture 2>`…
-  and the mods number on after them.
+- **The H3 still-image models** — *MiniMax H3-Image 33B* and *H3-Image Pruned
+  20B* (fork.55), and Pruna's *P-H3-Image 20B* (fork.50). Each runs a
+  still-image decoder on an H3 transformer and, unlike FL2VA, has reference
+  pictures of its own, so mods travel the ordinary Ref2VA route. All of them
+  keep H3's VAE *encoder* — H3-Image swaps in a 2D ViT decoder and changes
+  nothing else — so the mods you already have are valid references for them:
+  no new mod format, nothing to convert. Your own pictures keep
+  `<Picture 1>`, `<Picture 2>`… and the mods number on after them.
 
   Three things behave differently from a video model, by design:
 
@@ -87,22 +89,30 @@ what the fork adds.
     VAE, so an audio reference cannot be encoded at all, and a single frame
     has no soundtrack to carry one anyway. The console says which were
     dropped and why.
-  - **Size.** The model is single-phase, so the phase options do nothing and
-    *Fit mods to the output size* never grows a mod towards an 8 MP canvas
+  - **Size.** These models are single-phase, so the phase options do nothing
+    and *Fit mods to the output size* never grows a mod towards the canvas
     (fit only ever shrinks). Mods go in at their own size under their row's
-    *Max size*, which is what this model does with its own references too.
-  - **The prompt.** Wan2GP turns a prompt into `Edit <Picture 1>. …`
-    whenever anything is in the prompt view, and an armed mod counts. Open
-    the prompt with `subject_definitions:` (the Ref2VA form) if you want a
-    picture *generated from* the mod rather than an edit *of* it; this model
-    accepts that opening as well as `Edit <Picture 1>.`.
+    *Max size*, which is what these models do with their own references too.
+    That matters more on H3-Image, whose canvas is about 16 MP: nothing will
+    shrink a large mod for you, so set *Max size* on the row if a mod is
+    costing more memory than it is worth.
+  - **The prompt.** On *P-H3-Image* Wan2GP turns a prompt into
+    `Edit <Picture 1>. …` whenever anything is in the prompt view, and an
+    armed mod counts. Open the prompt with `subject_definitions:` (the Ref2VA
+    form) if you want a picture *generated from* the mod rather than an edit
+    *of* it; that model accepts that opening as well as `Edit <Picture 1>.`.
+    *H3-Image* adds no such prefix: it labels each reference `Picture N:` for
+    its text encoder, and your prompt refers to them as `<Picture N>` as
+    usual, so an armed mod needs nothing special.
 
-  P-H3-Image edits with at most 8 pictures and Wan2GP counts only the ones on
-  the form, so armed mods can take the total past 8. Nothing refuses them —
-  the pipeline has no hard cap — but the console says so when it happens.
-  Mods are still *made* on a Ref2VA model; this model's decoder is
-  single-frame, so it isn't offered in the Extract tab. Set
-  `H3REFMOD_IMAGE=0` to turn this support off.
+  Each model edits with a limited number of pictures — 8 for P-H3-Image, 16
+  for H3-Image — and Wan2GP counts only the ones on the form, so armed mods
+  can take the total past it. Nothing refuses them (the pipeline has no hard
+  cap) but the console says so when it happens, naming that model's own
+  limit, which it reads from the loaded model rather than assuming. Mods are
+  still *made* on a Ref2VA model; these decoders are still-image only, so
+  they are not offered in the Extract tab. Set `H3REFMOD_IMAGE=0` to turn
+  this support off.
 
 ### Making mods (Extract and Library tabs)
 
@@ -190,12 +200,34 @@ of the file for the model switches.
 |---|---|---|
 | `FL2VA_REFMODS` | `True` | Allow mods on FL2VA models. Set the environment variable `H3REFMOD_FL2VA=0` to turn it off without editing code. |
 | `CONTROLNET_REFMODS` | `True` | Allow mods on the FL2VA ControlNet model. `H3REFMOD_CONTROLNET=0` turns it off. |
-| `P_H3_IMAGE_REFMODS` | `True` | Allow mods on P-H3-Image. `H3REFMOD_IMAGE=0` turns it off. |
+| `P_H3_IMAGE_REFMODS` | `True` | Allow mods on the H3 still-image models. `H3REFMOD_IMAGE=0` turns it off. |
 | `FL2VA_PROMPT_LABELS` | `"on"` | Every mod gets its prompt label in FL2VA, as in Ref2VA. `"none"` labels nothing, like the ComfyUI original. |
 | `STABLE_REFMOD_LABELS` | `True` | On windows 2+, picture mods are numbered ahead of the carried-over frame, so their labels match window 1. |
 
 ### Release history
 
+- **0.38.1-fork.55** — **Mods on MiniMax H3-Image 33B and H3-Image Pruned
+  20B**, and a fix for P-H3-Image, which had quietly lost support.
+
+  Wan2GP 19.28 added MiniMax's own image models and, to make room, renamed
+  Pruna's: `minimax_h3_image` used to mean P-H3-Image and now means H3-Image
+  33B, while P-H3-Image became `minimax_p_h3_image`. Forks 50 to 54 matched
+  that one name exactly, so on 19.28 they followed the name rather than the
+  model — mods turned themselves on for a model they had never been tested
+  against and off for the one they were written for. All three architectures
+  are now recognised by name.
+
+  Nothing else had to change: all three keep H3's VAE encoder, so your mods
+  are already valid references, and fork.51's audio guard already covers them
+  (an image model is built with no audio VAE). The one number that did differ
+  is the reference limit — 8 pictures for P-H3-Image, 16 for H3-Image — so the
+  console warning now asks the loaded model which limit applies, through the
+  variant Wan2GP sets on the pipeline rather than the architecture name, which
+  is the thing that moved.
+
+  Worth knowing on H3-Image: its canvas is about 16 MP and *Fit mods to the
+  output size* only ever shrinks, so it will not size a mod down for you
+  there. Use the row's *Max size* if a mod is costing more than it is worth.
 - **0.38.1-fork.54** — **Mods beside the Regenerate 2K IC draft** — a new
   *Mods in phase 2* choice, **Full + the Regenerate 2K IC draft**.
 

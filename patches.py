@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import importlib
 import json
 import math
 import os
@@ -216,11 +217,52 @@ FL2VA_REFMODS = _env_on("H3REFMOD_FL2VA")
 CONTROLNET_REFMODS = _env_on("H3REFMOD_CONTROLNET")
 P_H3_IMAGE_REFMODS = _env_on("H3REFMOD_IMAGE")
 
-# fork.50: P-H3-Image's own limit on reference pictures. Wan2GP checks it
-# against the form's pictures only, so mods go past it unnoticed -- see
+# The H3 still-image models mods can be used with, and how many reference
+# pictures each was trained on. Wan2GP checks that limit against the form's
+# own pictures only, so mods go past it unnoticed -- see
 # _warn_image_reference_cap.
-P_H3_IMAGE_ARCHITECTURE = "minimax_h3_image"
-P_H3_IMAGE_MAX_IMAGES = 8
+#
+# fork.55: 19.28 renamed P-H3-Image's architecture and gave its old name to
+# MiniMax's own image model, so one exact name is not enough -- and fork.50
+# to .54, which matched that one name, followed the name rather than the
+# model:
+#   19.14-19.27   minimax_h3_image        = P-H3-Image 20B (8 pictures)
+#   19.28+        minimax_p_h3_image      = P-H3-Image 20B (8 pictures)
+#                 minimax_h3_image        = H3-Image 33B (16 pictures)
+#                 minimax_h3_image_pruned = H3-Image Pruned 20B (16 pictures)
+H3_IMAGE_ARCHITECTURES = {
+    "minimax_p_h3_image": 8,
+    "minimax_h3_image": 16,
+    "minimax_h3_image_pruned": 16,
+}
+# Which image model the pipeline says it is -> that model's reference cap.
+# Wan2GP sets pipeline.image_model to "p_h3_image" or "h3_image" (and, before
+# 19.28, True for the only image model there was), which identifies the model
+# without depending on the architecture name it was renamed from.
+_IMAGE_VARIANT_CAPS = {"p_h3_image": ("p_h3_image", "P_H3_IMAGE_MAX_IMAGES", 8),
+                       "h3_image": ("h3_image", "H3_IMAGE_MAX_IMAGES", 16)}
+_IMAGE_CAPS: dict = {}
+
+
+def _image_reference_cap(pipeline_self) -> int:
+    """How many reference pictures the loaded image model was trained on, read
+    from Wan2GP's own constant where it can be imported and otherwise from the
+    numbers above. 0 when this is not an image model."""
+    variant = getattr(pipeline_self, "image_model", None)
+    if variant is True:          # before 19.28 the flag was a bool, and
+        variant = "p_h3_image"   # P-H3-Image was the only image model
+    if not isinstance(variant, str) or variant not in _IMAGE_VARIANT_CAPS:
+        return 0
+    if variant in _IMAGE_CAPS:
+        return _IMAGE_CAPS[variant]
+    module_name, cap_attr, cap = _IMAGE_VARIANT_CAPS[variant]
+    try:
+        module = importlib.import_module(f"models.minimax_h3.{module_name}")
+        cap = int(getattr(module, cap_attr, cap) or cap)
+    except Exception:
+        pass
+    _IMAGE_CAPS[variant] = cap
+    return cap
 
 
 def _fl2va_family_prefixes():
@@ -241,24 +283,36 @@ def _resolved_architecture(model_type, get_base_model_type_fn) -> str:
     return model_type
 
 
-def is_p_h3_image(model_type, get_base_model_type_fn=None) -> bool:
-    """fork.50: P-H3-Image, Pruna's still-image model. It runs on FL2VA's
-    transformer but, unlike FL2VA, has reference inputs of its own (the
+def h3_image_architecture(model_type, get_base_model_type_fn=None):
+    """The H3 still-image architecture behind this model, or None.
+
+    fork.50 covered Pruna's P-H3-Image; fork.55 adds MiniMax's own H3-Image
+    33B and its Pruned 20B. All of them run a still-image decoder on an H3
+    transformer and, unlike FL2VA, have reference pictures of their own (the
     pipeline is built with reference_mode=True), so mods travel the ordinary
-    Ref2VA route rather than the FL2VA one -- the same VAE encoder means an
-    existing mod is already a valid latent for it."""
+    Ref2VA route rather than the FL2VA one. All of them keep H3's VAE
+    *encoder* -- H3-Image swaps in a 2D ViT decoder (video_vae.IMAGE_DECODER)
+    and changes nothing else -- so an existing mod is already a valid latent
+    for them, with no conversion."""
     if not P_H3_IMAGE_REFMODS:
-        return False
-    return _resolved_architecture(model_type, get_base_model_type_fn) == P_H3_IMAGE_ARCHITECTURE
+        return None
+    architecture = _resolved_architecture(model_type, get_base_model_type_fn)
+    return architecture if architecture in H3_IMAGE_ARCHITECTURES else None
+
+
+def is_p_h3_image(model_type, get_base_model_type_fn=None) -> bool:
+    """Kept under its fork.50 name for anything that called it."""
+    return h3_image_architecture(model_type, get_base_model_type_fn) is not None
 
 
 def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
     """Models RefMods can be used with: Ref2VA, plus (fork) FL2VA, its
-    finetunes, the FL2VA ControlNet model and P-H3-Image. Resolves finetunes
-    to their architecture exactly as is_minimax_h3_ref2va does."""
+    finetunes, the FL2VA ControlNet model and the H3 still-image models
+    (P-H3-Image, H3-Image 33B, H3-Image Pruned 20B). Resolves finetunes to
+    their architecture exactly as is_minimax_h3_ref2va does."""
     if is_minimax_h3_ref2va(model_type, get_base_model_type_fn):
         return True
-    if is_p_h3_image(model_type, get_base_model_type_fn):
+    if h3_image_architecture(model_type, get_base_model_type_fn) is not None:
         return True
     model_type = str(model_type or "")
     if not FL2VA_REFMODS or not model_type:
@@ -2000,21 +2054,25 @@ def _image_output(pipeline_self, kwargs) -> bool:
 
 
 def _warn_image_reference_cap(pipeline_self, kwargs, added) -> None:
-    """fork.50: P-H3-Image edits with at most 8 pictures, and Wan2GP's
-    pre-flight check counts only the form's own -- mods are added much later,
-    inside this plugin's generate(), so they slip past it. Nothing refuses
-    them here (the pipeline itself has no cap, and a run that works should not
-    be stopped), but each render that goes over says so rather than let a weak
-    result go unexplained."""
+    """An H3 image model edits with at most so many pictures -- 8 for
+    P-H3-Image, 16 for H3-Image -- and Wan2GP's pre-flight check counts only
+    the form's own, because mods are added much later, inside this plugin's
+    generate(). Nothing refuses them here (the pipeline itself has no cap, and
+    a run that works should not be stopped), but each render that goes over
+    says so rather than let a weak result go unexplained.
+
+    fork.55 asks the loaded model which cap applies instead of assuming one,
+    since the two models differ by a factor of two."""
     if not getattr(pipeline_self, "image_model", False) or added <= 0:
         return
     total = len(kwargs.get("input_ref_images") or [])
-    if total <= P_H3_IMAGE_MAX_IMAGES:
+    cap = _image_reference_cap(pipeline_self)
+    if not cap or total <= cap:
         return
     _log(f"warning: this render has {total} reference pictures ({total - added} of its own "
-         f"plus {added} from mods) and P-H3-Image was trained on at most "
-         f"{P_H3_IMAGE_MAX_IMAGES}. It will still run; drop a mod, or send a multi-picture "
-         f"mod as one contact sheet, if the result is poor.")
+         f"plus {added} from mods) and this model was trained on at most {cap}. It will "
+         f"still run; drop a mod, or send a multi-picture mod as one contact sheet, if the "
+         f"result is poor.")
 
 
 def _label_offsets(kwargs, later_window, stable, ref2va):
