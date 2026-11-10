@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.52** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.53** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -196,6 +196,26 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.53** — **Updating from inside WanGP works again.** The code is
+  fork.52's, unchanged; this release exists because fork.52 reached the
+  repository with a `__pycache__` folder alongside it — 20 compiled `.pyc` and
+  `.pyc.stale` files, which are per-install build output and should never have
+  been committed. Python writes its own copies of those files beside the
+  source the first time the plugin runs, so every existing install had them as
+  *untracked* files at exactly the paths the incoming commit wanted to create.
+  Git refuses to overwrite untracked files during a merge, so **Update** in the
+  Plugin Manager failed for everyone who had ever run the plugin:
+
+      git.exc.GitCommandError: Cmd('git') failed due to: exit code(1)
+        cmdline: git pull -v -- origin
+        stderr: 'error: The following untracked working tree files would be
+                 overwritten by merge:'
+
+  They are gone from the repository and a `.gitignore` now keeps them out. An
+  update to fork.53 or later no longer touches those paths, so it goes through
+  without anything to clean up. If an install is still stuck — which takes a
+  clone with local commits of its own — deleting the plugin's `__pycache__`
+  folder and updating again clears it.
 - **0.38.1-fork.52** — **Wan2GP 19.27 compatibility.** 19.27 gave
   `_add_video_reference` a `latent=` argument (the phase-1 draft's, so phase 2
   need not re-encode it). This plugin wraps that method, and its wrapper had a

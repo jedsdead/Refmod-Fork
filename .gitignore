@@ -1,0 +1,6 @@
+# Python leaves these beside the source; WanGP also renames stale ones .pyc.stale.
+# They are per-install build output: in the repo they block every user's
+# `git pull`, because their own copies are untracked files at the same paths.
+__pycache__/
+*.pyc
+*.pyc.stale
