@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.56** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.57** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -206,6 +206,13 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.57** — **Removed *Full + the Regenerate 2K IC draft*** (added
+  in fork.54) and its strength box. Regenerate 2K IC works as it is with
+  *Mods in phase 2* on Full: the mods shape phase 1, and phase 2 enhances that
+  draft under an instruction to change nothing, so the draft itself carries
+  the identity through. Sending the mods in again beside the draft showed no
+  benefit, did not work with a tiled phase 2, and had already caused one crash.
+  A saved selection that still names that choice falls back to Full.
 - **0.38.1-fork.56** — **Fix: phase 2 crashed with *Full + the Regenerate 2K IC
   draft* and a multi-picture mod.** fork.54 rebuilt each reference from the
   whole mod when sending it in beside the draft, so every picture of a stack

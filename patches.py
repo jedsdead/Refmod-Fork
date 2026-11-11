@@ -330,8 +330,7 @@ def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> boo
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent", "hide_ref", "enc", "max_short", "label_first", "sheet",
-                 "mod", "strength", "curve")
+    __slots__ = ("latent", "hide_ref", "enc", "max_short", "label_first", "sheet")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
@@ -340,9 +339,6 @@ class _RefModImageSentinel:
         self.max_short = None     # fork: the row's "Max size" (short edge, px)
         self.label_first = False  # fork: see STABLE_REFMOD_LABELS
         self.sheet = None         # fork.42: (rows, cols, pictures) of a contact sheet
-        # fork.54: the mod and the weighting this latent came from, so phase 2
-        # can ask it for a differently weighted one (see _append_ic_refmods).
-        self.mod = self.strength = self.curve = None
 
     @property
     def dtype(self):
@@ -369,8 +365,7 @@ class _RefModVideoSentinel:
     [C, T, H, W] shape derived from the latent's own dims (undoing the video
     VAE's causal 4:1 temporal compression and 16x spatial downsampling), not
     real pixel data (there is none for a RefMod)."""
-    __slots__ = ("latent", "hide_ref", "enc", "is_stack", "max_short", "picture_encs",
-                 "mod", "strength", "curve")
+    __slots__ = ("latent", "hide_ref", "enc", "is_stack", "max_short", "picture_encs")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
@@ -383,7 +378,6 @@ class _RefModVideoSentinel:
         self.is_stack = False
         self.picture_encs = None  # fork: a stack's per-picture prompt entries
         self.max_short = None     # fork: the row's "Max size" (short edge, px)
-        self.mod = self.strength = self.curve = None   # fork.54, see _append_ic_refmods
 
     @property
     def dtype(self):
@@ -924,13 +918,8 @@ def install_patches() -> Optional[str]:
                                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
             return
         _note_refs(self, refs)
-        result = _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents,
-                                           audio_latents, refs, *extra, **extra_kwargs)
-        # fork.54: Regenerate 2K IC hands the phase-1 draft over here, and this
-        # is the only call it makes -- so the mods go in right behind it.
-        if _ic_draft_call(extra, extra_kwargs):
-            _append_ic_refmods(self, presentation, visual_latents, refs)
-        return result
+        return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents,
+                                         audio_latents, refs, *extra, **extra_kwargs)
 
     if _orig_add_audio_reference is not None and _orig_load_audio_reference is not None:
         @functools.wraps(_orig_load_audio_reference)
@@ -1550,11 +1539,9 @@ def _build_refmod_sentinels(pipeline_self, state_json: str, window_no=None, imag
             audio_group_tokens.append(mod.token_count)
 
         if image_sentinels:
-            image_groups.append([want, mod.name, [_named(s, mod.name, want, mod, eff, curve)
-                                                  for s in image_sentinels]])
+            image_groups.append([want, mod.name, [_named(s, mod.name, want) for s in image_sentinels]])
         if video_sentinels:
-            video_groups.append([want, mod.name, [_named(s, mod.name, want, mod, eff, curve)
-                                                  for s in video_sentinels]])
+            video_groups.append([want, mod.name, [_named(s, mod.name, want) for s in video_sentinels]])
         # Fork: a visual mod's own soundtrack is injected exactly like an
         # audio mod -- its own native audio slot and <Audio N> label -- unless
         # the row's "Include audio" is unticked.
@@ -1647,18 +1634,10 @@ def _row_label(row, key):
     return value if value >= 1 else None
 
 
-def _named(sentinel, name, want, mod=None, strength=None, curve=None):
+def _named(sentinel, name, want):
     """Tag a sentinel's prompt entry with its mod's name and wanted label
     number, so the labels it really got can be reported. The text encoder
-    reads only "type", "frames" and "timestamps"; extra keys are ignored.
-
-    fork.54 also keeps the mod and the weighting this sentinel's latent came
-    from, so phase 2 can ask the mod for a differently weighted latent (see
-    _append_ic_refmods). Weighting blends toward a blurred copy of the mod, so
-    a second strength has to come from the mod and cannot be applied to an
-    already-weighted latent."""
-    if mod is not None and hasattr(sentinel, "mod"):
-        sentinel.mod, sentinel.strength, sentinel.curve = mod, strength, curve
+    reads only "type", "frames" and "timestamps"; extra keys are ignored."""
     if isinstance(getattr(sentinel, "enc", None), dict):
         sentinel.enc["refmod"] = name
         sentinel.enc["want"] = want
@@ -1799,10 +1778,6 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     live_aud = ((kwargs.get("audio_guide") is not None and "A" in audio_prompt_type)
                 + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type)
                 + (kwargs.get("audio_guide3") is not None and "D" in audio_prompt_type))
-
-    # fork.54: phase 2 of a Regenerate 2K IC run needs these again, and gets
-    # no other chance to see them (see _append_ic_refmods).
-    state["ic_mods"] = list(image_sentinels) + list(video_sentinels)
 
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
@@ -2363,10 +2338,6 @@ def _stack_as_pictures(stack):
 # ── Mod sizing: "Max size", "Fit mods to the output size", phase 2 ────────
 
 PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF = "full", "tile", "off"
-# fork.54: Full, and also sent in phase 2 of a Regenerate 2K IC run, where
-# Wan2GP makes the phase-1 draft the only reference and never asks for the
-# generation's own -- so mods reach phase 2 only if this plugin adds them.
-PHASE2_MODS_IC = "ic"
 PHASE1_MODS_FIT, PHASE1_MODS_FULL = "fit", "full"   # fork.30
 SHRINK_REENCODE, SHRINK_FAST = "reencode", "fast"
 
@@ -2635,99 +2606,6 @@ def _has_live_visual_refs(kwargs) -> bool:
     return False
 
 
-def _ic_draft_call(extra, extra_kwargs) -> bool:
-    """Whether this _add_video_reference call is Regenerate 2K IC handing over
-    the phase-1 draft. Wan2GP 19.27 added `latent=` for exactly that call --
-    "a given latent is the video's (a phase-1 draft)" -- and no other caller
-    passes it."""
-    if extra_kwargs.get("latent") is not None:
-        return True
-    return bool(extra) and torch.is_tensor(extra[0])   # the same argument, positionally
-
-
-def _append_ic_refmods(pipeline_self, presentation, visual_latents, refs) -> None:
-    """Send the armed visual mods into phase 2 of a Regenerate 2K IC run.
-
-    Under IC, phase 2 is a Ref2VA task whose one reference is the phase-1
-    draft, named <Video 1>, with a fixed instruction to enhance it and change
-    nothing else. Wan2GP builds that reference and skips the branch that
-    re-adds the generation's own references at the phase-2 size -- the branch
-    this plugin's hooks rely on -- so without this the mods simply are not in
-    phase 2, whatever "Mods in phase 2" says.
-
-    The three lists handed to the hook are phase 2's own reference lists, and
-    Wan2GP extends them in order, so appending here puts the mods after the
-    draft: the draft keeps <Video 1> and, because H3 numbers each kind
-    separately, a picture mod keeps the same <Picture N> it had in phase 1.
-    Nothing has to change in the prompt.
-
-    Each sentinel's own latent is what goes in -- one picture of a stack, a
-    contact sheet, a clip -- exactly as phase 1 was given it before any
-    phase-1 fitting. fork.54 rebuilt it from the whole mod instead, so every
-    picture of a multi-picture mod carried the *entire* stack while being
-    declared as one frame, and the transformer was fed more rows than its
-    layout had (fork.56). The strength beside the draft is a further blend of
-    that latent toward its own blurred copy, the same operation the row
-    strength uses. Audio mods are left out: under IC the reference audio goes
-    away with the references and phase 1's audio is frozen as conditioning, so
-    a voice has nothing to do here.
-    """
-    if _gen_state(pipeline_self)["phase"] != 2:
-        return
-    if getattr(pipeline_self, "_h3_p2_mode", PHASE2_MODS_FULL) != PHASE2_MODS_IC:
-        return
-    sentinels = _gen_state(pipeline_self).get("ic_mods") or []
-    if not sentinels:
-        return
-    if getattr(pipeline_self, "_h3_tiled_p2", False):
-        # Tiled phase 2 rebuilds the reference per tile from phase_2_refs[0]
-        # alone -- the draft, cropped to the tile and carrying the
-        # spatial_context that says where the crop sits. Anything appended
-        # after it is dropped there, so say so rather than appear to work.
-        if not _gen_state(pipeline_self).get("ic_tiled_warned"):
-            _gen_state(pipeline_self)["ic_tiled_warned"] = True
-            _log("Mods in phase 2 beside the Regenerate 2K IC draft: not carried into a "
-                 "*tiled* phase 2 -- Wan2GP rebuilds the reference for each tile from the "
-                 "draft alone. Turn off phase-2 spatial tiling to use this, or leave the "
-                 "mods to phase 1.")
-        return
-    strength_scale = float(getattr(pipeline_self, "_h3_ic_strength", 1.0))
-    canvas = _pass_canvas(pipeline_self, 2)
-    added, skipped = [], []
-    for sentinel in sentinels:
-        mod = getattr(sentinel, "mod", None)
-        name = getattr(mod, "name", None) or (sentinel.enc or {}).get("refmod") or "a mod"
-        if strength_scale <= 0:
-            skipped.append(f"{name} (strength 0)")
-            continue
-        latent = sentinel.latent
-        if strength_scale != 1.0:
-            blurred = core._blur_latent(latent)
-            latent = torch.lerp(blurred.float(), latent.float(), strength_scale).to(latent.dtype)
-        kind = "video" if isinstance(sentinel, _RefModVideoSentinel) else "image"
-        latent = _apply_size_limits(pipeline_self, sentinel, kind, latent, *canvas, pass_no=2)
-        if kind == "image" and latent.shape[2] != 1:
-            # An image reference is declared as one frame; anything else here
-            # would feed rows the layout does not have, so leave it out and say so.
-            skipped.append(f"{name} (an image reference with {latent.shape[2]} frames)")
-            continue
-        _present_refmod(presentation, sentinel, plain=True)
-        visual_latents.append(latent)
-        entry = ({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]}
-                 if kind == "image" else
-                 {"kind": "video", "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
-                  "latent_w": latent.shape[-1], "ref_audio_t": 0})
-        refs.append(entry)
-        added.append(name)
-    if added:
-        counts = collections.Counter(added)
-        added = [n if c == 1 else f"{n} ({c} pictures)" for n, c in counts.items()]
-        _log("Regenerate 2K IC: " + "; ".join(added) + " sent into phase 2 alongside the draft "
-             f"(<Video 1>){'' if strength_scale == 1.0 else f', strength x{strength_scale:.2f}'}")
-    for name in skipped:
-        _log(f"Regenerate 2K IC: {name} left out of phase 2")
-
-
 def _phase2_mods_off(pipeline_self) -> bool:
     """True during phase 2 of a two-phase run when "Mods in phase 2" is Off
     and it is safe to leave them out (see _set_run_options)."""
@@ -2761,17 +2639,9 @@ def _set_run_options(pipeline_self, kwargs, state_json, fl2va) -> None:
                                                   (SHRINK_REENCODE, SHRINK_FAST)) == SHRINK_FAST
     pipeline_self._h3_tiled_p2 = two_phase and _tiling_flag() in str(kwargs.get("video_prompt_type") or "")
     p2_mode = (_state_option(state_json, "phase2_mods", PHASE2_MODS_FULL,
-                             (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF, PHASE2_MODS_IC))
+                             (PHASE2_MODS_FULL, PHASE2_MODS_TILE, PHASE2_MODS_OFF))
                if two_phase else PHASE2_MODS_FULL)
     pipeline_self._h3_p2_mode = p2_mode
-    # fork.54: how strongly a mod goes in beside the Regenerate 2K IC draft,
-    # as a multiplier on each row's own strength. The draft is a whole video
-    # of the scene and a mod is one subject, so the two are not competing on
-    # equal terms; this is the dial for that.
-    try:
-        pipeline_self._h3_ic_strength = max(0.0, float(_state_option(state_json, "phase2_ic_strength", 1.0)))
-    except (TypeError, ValueError):
-        pipeline_self._h3_ic_strength = 1.0
     # fork.49: Fit is the default again (fork.40 took Full from g3n3rativ3's
     # 0.42.0). Phase 1 renders at half the canvas, so a full-size mod there
     # buys detail that phase 1 cannot use.
@@ -3157,7 +3027,7 @@ def _enc_as_still(enc):
     return {"type": "image", "frames": frames[:1].clone()}
 
 
-def _present_refmod(presentation, sentinel, plain=False) -> None:
+def _present_refmod(presentation, sentinel) -> None:
     """Append this mod's prompt entry, so the text encoder sees it and the
     prompt can address it as "<Picture N>" / "<Video N>" / "<Audio N>" --
     exactly what a live reference gets. Without it the mod's latent still
@@ -3167,11 +3037,7 @@ def _present_refmod(presentation, sentinel, plain=False) -> None:
     if not PROMPT_LABELS_FOR_REFMODS or presentation is None or sentinel.enc is None:
         return
     try:
-        # fork.54: `plain` appends with no label bookkeeping. The sliding-window
-        # placement below reasons about one list across windows; phase 2 of a
-        # Regenerate 2K IC run builds a fresh list of its own, where that
-        # bookkeeping would put the entry in the wrong place.
-        if not plain and getattr(sentinel, "label_first", False) and sentinel.enc.get("type") == "image":
+        if getattr(sentinel, "label_first", False) and sentinel.enc.get("type") == "image":
             _place_picture_label(presentation, sentinel.enc, sentinel.label_first)   # fork
             return
         presentation.append(sentinel.enc)

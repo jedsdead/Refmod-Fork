@@ -233,10 +233,6 @@ def _autoarm_summary(config: dict) -> str:
         options.append("phase 1: fit")
     if state.get("phase2_mods") in ("tile", "off"):
         options.append("phase 2: " + ("fit to tile" if state["phase2_mods"] == "tile" else "off"))
-    elif state.get("phase2_mods") == "ic":      # fork.54
-        scale = _ic_strength(state.get("phase2_ic_strength", 1.0))
-        options.append("phase 2: beside the Regenerate IC draft"
-                       + ("" if scale == 1.0 else f" x{scale:g}"))
     if state.get("shrink_method") == "fast":
         options.append("shrink: fast")
     lines = [("**On.** " if config.get("on") else "**Off.** ") + "; ".join(parts)]
@@ -391,14 +387,13 @@ ROW_WIDTH = 6
 # Panel-wide controls after the mod rows: picture mode, N, video mode, N,
 # fit to output, mods in phase 2, shrink method, video mods on sliding windows,
 # mods in phase 1 (fork.30, last so older saved orders still line up).
-STACK_CONTROLS = 10   # fork.54: + the Regenerate IC strength
+STACK_CONTROLS = 9
 
 # Label dropdowns (fork.27): how far each one counts.
 LABEL_MAX = {"image": 20, "video": 9, "audio": 9}
 LABEL_WORDS = {"image": "Picture", "video": "Video", "audio": "Audio"}
 AUTO_LABEL = "auto"
-PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off"),
-                  ("Full + the Regenerate 2K IC draft", "ic")]   # fork.54
+PHASE2_MODS_UI = [("Full", "full"), ("Fit to tile", "tile"), ("Off", "off")]
 PHASE1_MODS_UI = [("Fit to phase 1", "fit"), ("Full size", "full")]   # fork.30; Fit is the default again since fork.49
 SHRINK_METHOD_UI = [("Re-encode (best quality)", "reencode"), ("Fast (resize the stored mod)", "fast")]
 
@@ -509,7 +504,7 @@ def _panel_restore_updates(raw):
                 payload.get("video_frames_n", encframes.MAX_CLIP_FRAMES_SHOWN),
                 bool(payload.get("fit_to_output", True)), payload.get("phase2_mods", "full"),
                 payload.get("shrink_method", "reencode"), payload.get("window_mode", WINDOW_MODE_DEFAULT),
-                payload.get("phase1_mods", "fit"), payload.get("phase2_ic_strength", 1.0)]
+                payload.get("phase1_mods", "fit")]
     restored = sum(len(v) for v in slots.values())
     status = (f"↺ {restored} RefMod(s) restored from the loaded settings." if restored
               else "*No RefMods selected.*")
@@ -634,18 +629,10 @@ def _is_picture_mod(meta):
                                                     meta.get("source", ""))
 
 
-def _ic_strength(value) -> float:
-    """fork.54: the Regenerate IC mod strength, as a sane multiplier."""
-    try:
-        return max(0.0, min(2.0, round(float(value), 4)))
-    except (TypeError, ValueError):
-        return 1.0
-
-
 def _stack_payload(stack_mode, stack_n,
                    video_mode=encframes.STACK_UP_TO_N, video_n=encframes.MAX_CLIP_FRAMES_SHOWN,
                    fit_to_output=True, phase2_mods="full", shrink_method="reencode",
-                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="fit", ic_strength=1.0):
+                   window_mode=WINDOW_MODE_DEFAULT, phase1_mods="fit"):
     """The selection payload's text-encoder fields (see patches.py's
     _build_refmod_sentinels): how many pictures of a mod sent as one video,
     and how many frames of a video mod, the text encoder is shown, plus the
@@ -664,11 +651,8 @@ def _stack_payload(stack_mode, stack_n,
             "video_frames_n": count(video_n, encframes.MAX_CLIP_FRAMES_SHOWN),
             # "Fit mods to the output size" (off by default).
             "fit_to_output": bool(fit_to_output),
-            # "Mods in phase 2": full / tile / off / ic (fork.54).
-            "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off", "ic") else "full",
-            # fork.54: how strongly a mod goes in beside the Regenerate 2K IC
-            # draft, as a multiplier on its row's strength.
-            "phase2_ic_strength": _ic_strength(ic_strength),
+            # "Mods in phase 2": full / tile / off.
+            "phase2_mods": phase2_mods if phase2_mods in ("full", "tile", "off") else "full",
             # "Mods in phase 1": fit / full (fork.30).
             "phase1_mods": phase1_mods if phase1_mods in ("fit", "full") else "fit",
             # "Shrink method": reencode / fast.
@@ -1526,12 +1510,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 info="Fit: shrink to phase 1's half canvas, if phase 1 gets slow.")
             phase2_mods = gr.Dropdown(
                 choices=PHASE2_MODS_UI, value="full", label="Mods in phase 2 (two-phase)", scale=1,
-                info="Off: no visual mods (fastest). Last one: also beside the IC draft.")
-            # fork.54: only the "ic" choice uses this, so it stays hidden until picked.
-            ic_strength = gr.Number(
-                value=1.0, minimum=0.0, maximum=2.0, step=0.05, visible=False, scale=1,
-                label="Mod strength beside the IC draft",
-                info="x each row's strength. The draft is the whole scene, a mod is one subject.")
+                info="Off: no visual mods (fastest).")
         window_mode = gr.Dropdown(
             label="Video mods on sliding windows 2, 3, ...",
             choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
@@ -1632,10 +1611,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         # fork.34: what a restore (outputinfo) needs to refill this panel.
         self._panel_parts = {"folder_dd": folder_dd, "kind_ui": kind_ui_all, "shown": shown_all}
-        phase2_mods.change(fn=lambda mode: gr.update(visible=mode == "ic"),
-                           inputs=[phase2_mods], outputs=[ic_strength], queue=False)
         return mod_rows, (stack_mode, stack_n, video_mode, video_n, fit_to_output, phase2_mods,
-                          shrink_method, window_mode, phase1_mods, ic_strength)
+                          shrink_method, window_mode, phase1_mods)
 
 
     def _build_extract_section(self, api_session, model_dd):
