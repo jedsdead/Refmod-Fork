@@ -1,6 +1,6 @@
 # Refmods For Wan GP
 
-**Version 0.38.1-fork.55** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
+**Version 0.38.1-fork.56** · built on the original port's 0.38.1 · repo: https://github.com/jedsdead/Refmod-Fork
 
 Reference mods for MiniMax H3 and Flux in Wan2GP. In Wan2GP it shows as the
 **Refmods** tab, with the **Refmods: MiniMax H3** and **Refmods: Flux** panels
@@ -206,6 +206,17 @@ of the file for the model switches.
 
 ### Release history
 
+- **0.38.1-fork.56** — **Fix: phase 2 crashed with *Full + the Regenerate 2K IC
+  draft* and a multi-picture mod.** fork.54 rebuilt each reference from the
+  whole mod when sending it in beside the draft, so every picture of a stack
+  carried the *entire* stack (and a contact sheet its un-tiled pictures) while
+  being declared as one frame. The transformer was fed more rows than its
+  layout had and phase 2 stopped with
+  `IndexError: index_copy_(): Number of indices (…) should be equal to
+  source.size(dim) (…)`. Single-picture mods were unaffected, which is how it
+  got through. Each reference now goes in exactly as phase 1 was given it;
+  *Mod strength beside the IC draft* is a further blend of that latent toward
+  its blurred copy, the same operation the row strength uses.
 - **0.38.1-fork.55** — **Mods on MiniMax H3-Image 33B and H3-Image Pruned
   20B**, and a fix for P-H3-Image, which had quietly lost support.
 

@@ -2661,11 +2661,16 @@ def _append_ic_refmods(pipeline_self, presentation, visual_latents, refs) -> Non
     separately, a picture mod keeps the same <Picture N> it had in phase 1.
     Nothing has to change in the prompt.
 
-    A mod is re-weighted from the mod itself rather than reused from phase 1,
-    because weighting blends toward a blurred copy and cannot be applied twice
-    to the same latent. Audio mods are left out: under IC the reference audio
-    goes away with the references and phase 1's audio is frozen as
-    conditioning, so a voice has nothing to do here.
+    Each sentinel's own latent is what goes in -- one picture of a stack, a
+    contact sheet, a clip -- exactly as phase 1 was given it before any
+    phase-1 fitting. fork.54 rebuilt it from the whole mod instead, so every
+    picture of a multi-picture mod carried the *entire* stack while being
+    declared as one frame, and the transformer was fed more rows than its
+    layout had (fork.56). The strength beside the draft is a further blend of
+    that latent toward its own blurred copy, the same operation the row
+    strength uses. Audio mods are left out: under IC the reference audio goes
+    away with the references and phase 1's audio is frozen as conditioning, so
+    a voice has nothing to do here.
     """
     if _gen_state(pipeline_self)["phase"] != 2:
         return
@@ -2691,16 +2696,21 @@ def _append_ic_refmods(pipeline_self, presentation, visual_latents, refs) -> Non
     added, skipped = [], []
     for sentinel in sentinels:
         mod = getattr(sentinel, "mod", None)
-        if mod is None:
-            skipped.append("?")
+        name = getattr(mod, "name", None) or (sentinel.enc or {}).get("refmod") or "a mod"
+        if strength_scale <= 0:
+            skipped.append(f"{name} (strength 0)")
             continue
-        strength = float(sentinel.strength if sentinel.strength is not None else 1.0) * strength_scale
-        latent = _weighted_latent_cached(mod, strength, sentinel.curve) if strength > 0 else None
-        if latent is None:
-            skipped.append(f"{mod.name} (strength 0)")
-            continue
+        latent = sentinel.latent
+        if strength_scale != 1.0:
+            blurred = core._blur_latent(latent)
+            latent = torch.lerp(blurred.float(), latent.float(), strength_scale).to(latent.dtype)
         kind = "video" if isinstance(sentinel, _RefModVideoSentinel) else "image"
         latent = _apply_size_limits(pipeline_self, sentinel, kind, latent, *canvas, pass_no=2)
+        if kind == "image" and latent.shape[2] != 1:
+            # An image reference is declared as one frame; anything else here
+            # would feed rows the layout does not have, so leave it out and say so.
+            skipped.append(f"{name} (an image reference with {latent.shape[2]} frames)")
+            continue
         _present_refmod(presentation, sentinel, plain=True)
         visual_latents.append(latent)
         entry = ({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]}
@@ -2708,8 +2718,10 @@ def _append_ic_refmods(pipeline_self, presentation, visual_latents, refs) -> Non
                  {"kind": "video", "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
                   "latent_w": latent.shape[-1], "ref_audio_t": 0})
         refs.append(entry)
-        added.append(f"{mod.name} x{strength:.2f}")
+        added.append(name)
     if added:
+        counts = collections.Counter(added)
+        added = [n if c == 1 else f"{n} ({c} pictures)" for n, c in counts.items()]
         _log("Regenerate 2K IC: " + "; ".join(added) + " sent into phase 2 alongside the draft "
              f"(<Video 1>){'' if strength_scale == 1.0 else f', strength x{strength_scale:.2f}'}")
     for name in skipped:
